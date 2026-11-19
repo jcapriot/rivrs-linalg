@@ -1,14 +1,27 @@
 //! Scalar types supported by the symmetric solver.
 //!
-//! The numeric core is generic over [`Scalar`], implemented for `f64` (real
-//! symmetric indefinite) and [`c64`](faer::c64) (complex *symmetric*,
-//! A = Aᵀ, **not** Hermitian), plus the single-precision `f32` and
-//! [`c32`](faer::c32). The factorization computed is always
+//! The numeric core is generic over [`Scalar`]: any faer [`ComplexField`]
+//! that is `Copy` and whose real type implements [`Float`] (num-traits,
+//! re-exported by faer as `faer::traits::num_traits`). Today that is `f64` and `f32` (real symmetric
+//! indefinite) and [`c64`] and [`c32`] (complex
+//! *symmetric*, A = Aᵀ, **not** Hermitian). The factorization computed is always
 //! Pᵀ A P = L D Lᵀ with plain transposes; no conjugation is ever applied.
 //!
-//! Pivot magnitudes, thresholds and scaling factors are `f64` for every scalar
-//! type: APTP compares moduli, so the pivoting logic is shared. Single
-//! precision types widen their moduli to `f64` (exact) for those tests.
+//! Pivot magnitudes and stability tests are computed in the scalar's real type
+//! `T::Real`, so single precision factors pivot in single precision. User-facing
+//! thresholds (`AptpOptions::threshold`, `small`) stay `f64` and are converted
+//! once. MC64 matching takes logarithms and always runs in `f64` on |A|.
+//!
+//! # Why these bounds
+//!
+//! - [`ComplexField`] supplies arithmetic (by value and by reference, via its
+//!   `RefOps` supertrait), `Debug`, `PartialEq`, `Send + Sync` and the
+//!   constructors used here.
+//! - `Copy`: the dense kernels index and reuse scalars by value; faer only
+//!   guarantees `Clone`.
+//! - `Real: Float`: logarithms/exponentials for MC64 scaling and `to_f64` for
+//!   reporting statistics. faer's `RealField` provides neither. This excludes
+//!   faer's double-double `fx128`, which does not implement `Float`.
 //!
 //! # References
 //!
@@ -18,101 +31,55 @@
 //! - Amestoy et al. (2001), MUMPS: complex symmetric (SYM=2) LDLᵀ with
 //!   1×1/2×2 pivots selected on moduli.
 
-use std::fmt::Debug;
-use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
-
 use faer::traits::ComplexField;
+use faer::traits::num_traits::Float;
+#[allow(unused_imports)] // c32/c64 are referenced by the docs
 use faer::{c32, c64};
 
 /// Element type of matrices the symmetric solver can factor.
 ///
-/// This is a thin extension of faer's [`ComplexField`]: it adds by-value
-/// arithmetic operators (the dense kernels are written with `a * b` on
-/// values), `Copy + Send + Sync` for rayon, and an `f64` modulus so all APTP
-/// thresholds stay `f64` across precisions. Every method delegates to faer.
-///
-/// Implemented for `f64`, `f32`, `c64` and `c32`. All arithmetic in the solver goes through
-/// the standard operator traits, so any implementor must behave like a field
-/// under `+ - * /`; [`mag`](Scalar::mag) must be a norm (|x| or the complex
-/// modulus) because pivot acceptance tests compare it against `f64` bounds.
-pub trait Scalar:
-    ComplexField
-    + Copy
-    + Send
-    + Sync
-    + Debug
-    + PartialEq
-    + 'static
-    + Add<Output = Self>
-    + Sub<Output = Self>
-    + Mul<Output = Self>
-    + Div<Output = Self>
-    + Neg<Output = Self>
-    + AddAssign
-    + SubAssign
-    + MulAssign
-    + DivAssign
-{
-    /// Whether this is a complex type. Inertia is only defined when `false`.
-    const IS_COMPLEX: bool;
+/// Blanket-implemented for every `Copy` faer [`ComplexField`] whose real type
+/// is a [`Float`]; there is no per-type code. The provided methods are thin
+/// names for faer's `ComplexField` functions.
+pub trait Scalar: ComplexField<Real: Float> + Copy {
+    /// Modulus `|x|` in the real type (complex modulus for complex scalars).
+    #[inline(always)]
+    fn mag(self) -> Self::Real {
+        Self::abs_impl(&self)
+    }
 
-    /// Modulus as `f64`: |x| for reals, hypot(re, im) for complex.
-    fn mag(self) -> f64;
-
-    /// Embed a real number.
-    fn from_f64(x: f64) -> Self;
+    /// Embed a real `f64` constant.
+    #[inline(always)]
+    fn from_f64(x: f64) -> Self {
+        Self::from_f64_impl(x)
+    }
 
     /// Additive identity.
     #[inline(always)]
     fn zero() -> Self {
-        Self::from_f64(0.0)
+        Self::zero_impl()
     }
 
     /// Multiplicative identity.
     #[inline(always)]
     fn one() -> Self {
-        Self::from_f64(1.0)
+        Self::one_impl()
     }
-
-    /// Real part (the value itself for `f64`).
-    fn real_part(self) -> f64;
 }
 
-macro_rules! impl_scalar {
-    ($t:ty, $complex:expr) => {
-        impl Scalar for $t {
-            const IS_COMPLEX: bool = $complex;
+impl<T: ComplexField<Real: Float> + Copy> Scalar for T {}
 
-            #[inline(always)]
-            fn mag(self) -> f64 {
-                <$t as ComplexField>::abs_impl(&self) as f64
-            }
-
-            #[inline(always)]
-            fn from_f64(x: f64) -> Self {
-                <$t as ComplexField>::from_f64_impl(x)
-            }
-
-            #[inline(always)]
-            fn zero() -> Self {
-                <$t as ComplexField>::zero_impl()
-            }
-
-            #[inline(always)]
-            fn one() -> Self {
-                <$t as ComplexField>::one_impl()
-            }
-
-            #[inline(always)]
-            fn real_part(self) -> f64 {
-                <$t as ComplexField>::real_part_impl(&self) as f64
-            }
-        }
-    };
+/// Convert an `f64` threshold or constant to the real type of `T`.
+#[inline(always)]
+pub(crate) fn real<T: Scalar>(x: f64) -> T::Real {
+    <T::Real as ComplexField>::from_f64_impl(x)
 }
 
-// Thin layer over faer's `ComplexField`: values, operators and f64 moduli.
-impl_scalar!(f64, false);
-impl_scalar!(f32, false);
-impl_scalar!(c64, true);
-impl_scalar!(c32, true);
+/// Widen a real value to `f64` for reporting (statistics, MC64 input).
+///
+/// Every `Float` used here (`f32`, `f64`) converts losslessly; a type that
+/// cannot is reported as NaN rather than panicking.
+#[inline(always)]
+pub(crate) fn to_f64<R: Float>(x: R) -> f64 {
+    x.to_f64().unwrap_or(f64::NAN)
+}

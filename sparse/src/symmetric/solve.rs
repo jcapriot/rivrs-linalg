@@ -4,7 +4,7 @@
 //! functions that traverse the assembly tree performing gather/solve/scatter
 //! operations using faer's dense triangular solve and matmul kernels.
 //!
-//! The solve operates in **permuted coordinates** — the caller (SparseLDLT<T>)
+//! The solve operates in **permuted coordinates** — the caller (`SparseLDLT<T>`)
 //! handles permutation (P) and optional scaling (T) around this core.
 //!
 //! # Algorithm

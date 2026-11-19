@@ -27,7 +27,7 @@ use super::solve::{aptp_solve, aptp_solve_scratch};
 use super::symbolic::AptpSymbolic;
 use crate::error::SparseError;
 use crate::ordering::{match_order_metis, metis_ordering};
-use crate::scalar::Scalar;
+use crate::scalar::{Scalar, to_f64};
 
 /// Fill-reducing ordering strategy.
 ///
@@ -281,14 +281,9 @@ impl<T: Scalar> SparseLDLT<T> {
 
         match &options.ordering {
             OrderingStrategy::MatchOrderMetis => {
-                // MC64 needs real weights. For f64 use A directly; for any
-                // other scalar run it on |A| (as MUMPS does for complex).
-                let result = match (matrix as &dyn std::any::Any)
-                    .downcast_ref::<SparseColMat<usize, f64>>()
-                {
-                    Some(real) => match_order_metis(real)?,
-                    None => match_order_metis(&magnitude_matrix(matrix)?)?,
-                };
+                // MC64 takes logarithms of |a_ij|, so it always runs in f64 on
+                // |A| (for f64 input that is the same matching as on A).
+                let result = match_order_metis(&magnitude_matrix(matrix)?)?;
                 let ordering_perm = result.ordering;
                 let symbolic = AptpSymbolic::analyze(
                     matrix.symbolic(),
@@ -528,7 +523,7 @@ impl<T: Scalar> SparseLDLT<T> {
     pub fn inertia(&self) -> Option<Inertia> {
         // Inertia (eigenvalue sign counts) is only defined for real symmetric
         // matrices; a complex symmetric matrix has complex eigenvalues.
-        if T::IS_COMPLEX {
+        if !T::IS_REAL {
             return None;
         }
         self.numeric.as_ref().map(|numeric| {
@@ -584,8 +579,8 @@ impl<T: Scalar> SparseLDLT<T> {
     }
 }
 
-/// Entry-wise modulus of a complex matrix, for orderings/scalings that need
-/// real weights (MC64 matching).
+/// Entry-wise modulus |A| as an `f64` matrix, for MC64 matching (which works
+/// on `log|a_ij|` and so needs `f64` weights whatever the scalar type).
 fn magnitude_matrix<T: Scalar>(
     matrix: &SparseColMat<usize, T>,
 ) -> Result<SparseColMat<usize, f64>, SparseError> {
@@ -595,6 +590,6 @@ fn magnitude_matrix<T: Scalar>(
         .map_err(|e| SparseError::AnalysisFailure {
             reason: format!("{e:?}"),
         })?;
-    let vals = matrix.val().iter().map(|v| v.mag()).collect();
+    let vals = matrix.val().iter().map(|v| to_f64(v.mag())).collect();
     Ok(SparseColMat::new(symbolic, vals))
 }
