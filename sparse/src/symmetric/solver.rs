@@ -543,6 +543,13 @@ impl<T: Scalar> SparseLDLT<T> {
         self.numeric.as_ref().map(|n| n.stats())
     }
 
+    /// Entries held by the retained L factors, allocated vs. minimum.
+    ///
+    /// Returns `None` if [`factor`](Self::factor) has not been called.
+    pub fn factor_storage(&self) -> Option<super::numeric::FactorStorage> {
+        self.numeric.as_ref().map(|n| n.factor_storage())
+    }
+
     /// Get per-supernode diagnostic statistics from the most recent factorization.
     ///
     /// Returns one [`PerSupernodeStats`](super::numeric::PerSupernodeStats) per

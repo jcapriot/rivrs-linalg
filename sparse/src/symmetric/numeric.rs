@@ -778,7 +778,43 @@ impl<T: Scalar> std::fmt::Debug for AptpNumeric<T> {
     }
 }
 
+/// Memory held by the retained factors, in matrix entries.
+///
+/// `l11_allocated` and `l21_allocated` include faer's column-stride padding.
+/// `l11_lower` is what a packed/triangular L11 would need (ne(ne+1)/2 per
+/// supernode); together with `l21_logical` it is the minimum storage for L.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FactorStorage {
+    /// Entries allocated for L11 blocks (column stride × columns).
+    pub l11_allocated: usize,
+    /// Entries in the lower triangle (incl. diagonal) of L11 blocks.
+    pub l11_lower: usize,
+    /// Entries allocated for L21 blocks (column stride × columns).
+    pub l21_allocated: usize,
+    /// Logical L21 entries (rows × columns).
+    pub l21_logical: usize,
+    /// Bytes per entry.
+    pub entry_bytes: usize,
+}
+
 impl<T: Scalar> AptpNumeric<T> {
+    /// Entries and bytes held by the retained L factors.
+    pub fn factor_storage(&self) -> FactorStorage {
+        let mut fs = FactorStorage {
+            entry_bytes: std::mem::size_of::<T>(),
+            ..Default::default()
+        };
+        for ff in &self.front_factors {
+            let (l11, l21) = (ff.l11(), ff.l21());
+            let ne = l11.ncols();
+            fs.l11_allocated += l11.col_stride().unsigned_abs() * ne;
+            fs.l11_lower += ne * (ne + 1) / 2;
+            fs.l21_allocated += l21.col_stride().unsigned_abs() * l21.ncols();
+            fs.l21_logical += l21.nrows() * l21.ncols();
+        }
+        fs
+    }
+
     /// Per-supernode factors, indexed by supernode ID.
     pub fn front_factors(&self) -> &[FrontFactors<T>] {
         &self.front_factors
@@ -2031,6 +2067,11 @@ fn factor_tree_levelset<T: Scalar>(
     let workspace_pool: std::sync::Mutex<Vec<FactorizationWorkspace<T>>> =
         std::sync::Mutex::new(Vec::new());
 
+    #[cfg(feature = "diagnostic")]
+    let mut cb_mem = ContribMemDebug::default();
+    #[cfg(feature = "diagnostic")]
+    cb_mem.observe(&contributions);
+
     // Initial ready set: all leaf supernodes (no children) that are NOT in small-leaf subtrees
     let mut ready: Vec<usize> = (0..n_supernodes)
         .filter(|&s| remaining_children[s] == 0 && !supernodes[s].in_small_leaf)
@@ -2158,9 +2199,82 @@ fn factor_tree_levelset<T: Scalar>(
         }
 
         ready = next_ready;
+        #[cfg(feature = "diagnostic")]
+        cb_mem.observe(&contributions);
     }
 
+    #[cfg(feature = "diagnostic")]
+    cb_mem.report(supernodes, children);
+
     Ok(all_results)
+}
+
+/// Diagnostic accounting of live contribution blocks (feature `diagnostic`).
+///
+/// Records, at each level-set wave boundary, the bytes allocated by live
+/// contribution blocks versus the bytes they logically need (lower triangle of
+/// an nc × nc block), and the per-supernode block sizes so `report` can
+/// simulate the peak of a depth-first postorder traversal for comparison.
+/// Printed to stderr when `RIVRS_MEMDEBUG=1`.
+#[cfg(feature = "diagnostic")]
+#[derive(Default)]
+struct ContribMemDebug {
+    peak_alloc: usize,
+    peak_logical_tri: usize,
+    peak_blocks: usize,
+    cb_rows: Vec<usize>,
+    entry_bytes: usize,
+}
+
+#[cfg(feature = "diagnostic")]
+impl ContribMemDebug {
+    fn observe<T: Scalar>(&mut self, contributions: &[Option<ContributionBlock<T>>]) {
+        self.entry_bytes = std::mem::size_of::<T>();
+        if self.cb_rows.len() < contributions.len() {
+            self.cb_rows.resize(contributions.len(), 0);
+        }
+        let (mut alloc, mut tri, mut blocks) = (0usize, 0usize, 0usize);
+        for (s, cb) in contributions.iter().enumerate() {
+            if let Some(cb) = cb {
+                let nc = cb.row_indices.len();
+                self.cb_rows[s] = nc;
+                alloc += cb.data.col_stride().unsigned_abs() * cb.data.ncols();
+                tri += nc * (nc + 1) / 2;
+                blocks += 1;
+            }
+        }
+        if alloc > self.peak_alloc {
+            self.peak_alloc = alloc;
+            self.peak_logical_tri = tri;
+            self.peak_blocks = blocks;
+        }
+    }
+
+    fn report(&self, supernodes: &[SupernodeInfo], children: &[Vec<usize>]) {
+        if std::env::var("RIVRS_MEMDEBUG").map_or(true, |v| v != "1") {
+            return;
+        }
+        // Depth-first postorder (supernode index order): children's blocks are
+        // freed once the parent is assembled, then the parent's block is pushed.
+        let tri = |nc: usize| nc * (nc + 1) / 2;
+        let (mut live, mut peak) = (0usize, 0usize);
+        for s in 0..supernodes.len() {
+            let own = self.cb_rows.get(s).copied().unwrap_or(0);
+            peak = peak.max(live + tri(own));
+            for &c in &children[s] {
+                live -= tri(self.cb_rows.get(c).copied().unwrap_or(0));
+            }
+            live += tri(own);
+        }
+        let gb = |e: usize| (e * self.entry_bytes) as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "contrib blocks at level-set peak: {} blocks, allocated {:.2} GB, needed (lower tri) {:.2} GB; depth-first postorder peak (lower tri) {:.2} GB",
+            self.peak_blocks,
+            gb(self.peak_alloc),
+            gb(self.peak_logical_tri),
+            gb(peak)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

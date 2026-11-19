@@ -40,5 +40,7 @@ pub use factor::{
     AptpStatistics, FailedPivotMethod, aptp_factor, aptp_factor_in_place,
 };
 
-pub use numeric::{AptpNumeric, FactorizationStats, FrontFactors, PerSupernodeStats};
+pub use numeric::{
+    AptpNumeric, FactorStorage, FactorizationStats, FrontFactors, PerSupernodeStats,
+};
 pub use solver::{AnalyzeOptions, FactorOptions, OrderingStrategy, SolverOptions, SparseLDLT};
