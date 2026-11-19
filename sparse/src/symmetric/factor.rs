@@ -112,6 +112,9 @@ pub struct AptpOptions {
     /// Front-size threshold for small-leaf subtree fast path. Default: 256.
     /// Set to 0 to disable.
     pub small_leaf_threshold: usize,
+    /// Largest front inside a parallel L0 subtree. Default: 4096.
+    /// See `FactorOptions::l0_max_front`.
+    pub l0_max_front: usize,
 }
 
 impl Default for AptpOptions {
@@ -126,6 +129,7 @@ impl Default for AptpOptions {
             par: Par::Seq,
             nemin: 32,
             small_leaf_threshold: 256,
+            l0_max_front: 4096,
         }
     }
 }

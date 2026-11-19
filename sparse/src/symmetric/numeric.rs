@@ -183,24 +183,6 @@ impl<T: Scalar> FactorizationWorkspace<T> {
 /// do not benefit from parallel BLAS (overhead exceeds computation).
 pub(crate) const INTRA_NODE_THRESHOLD: usize = 256;
 
-/// Compute an upper bound on the maximum front size across all supernodes.
-///
-/// The front size for a supernode is `owned_cols + delayed_cols + pattern.len()`.
-/// Since delayed columns depend on the actual factorization, we estimate using
-/// `owned_cols + pattern.len()` (front size without delays) and add a safety
-/// factor. If delayed columns cause a front to exceed this estimate, the
-/// workspace will be resized at that point.
-fn estimate_max_front_size(supernodes: &[SupernodeInfo]) -> usize {
-    supernodes
-        .iter()
-        .map(|sn| {
-            let owned: usize = sn.owned_ranges.iter().map(|r| r.len()).sum();
-            owned + sn.pattern.len()
-        })
-        .max()
-        .unwrap_or(0)
-}
-
 // ---------------------------------------------------------------------------
 // Assembly maps (precomputed scatter indices)
 // ---------------------------------------------------------------------------
@@ -451,8 +433,8 @@ pub(crate) struct SupernodeInfo {
 /// A classified small-leaf subtree eligible for the fast-path factorization.
 ///
 /// Produced by [`classify_small_leaf_subtrees`] after amalgamation and consumed
-/// by `factor_small_leaf_subtree` during the pre-pass before the main level-set
-/// loop. All supernodes in the subtree have front_size < `small_leaf_threshold`,
+/// by `factor_small_leaf_subtree` when the traversal in `factor_tree` reaches the
+/// subtree root. All supernodes in the subtree have front_size < `small_leaf_threshold`,
 /// enabling a streamlined code path with a single small reusable workspace.
 ///
 /// # Invariants
@@ -477,7 +459,9 @@ pub(crate) struct SmallLeafSubtree {
     /// Maximum front size across all nodes in the subtree.
     pub max_front_size: usize,
     /// Parent supernode outside the subtree that receives the root's contribution,
-    /// or `None` if the subtree root is also a tree root.
+    /// or `None` if the subtree root is also a tree root. Used by tests for
+    /// invariant verification.
+    #[allow(dead_code)]
     pub parent_of_root: Option<usize>,
 }
 
@@ -923,10 +907,10 @@ impl<T: Scalar> AptpNumeric<T> {
         #[cfg(feature = "diagnostic")]
         let _factor_loop_guard = session.enter_section("factor_loop");
 
-        // Iterative level-set factorization: process all ready (leaf) nodes first,
-        // then propagate upward. No recursion — avoids stack overflow on deep
+        // Depth-first factorization with an L0 layer of parallel subtrees (see
+        // `factor_tree`). Traversals are iterative — no stack overflow on deep
         // elimination trees (e.g., c-71 with 76K supernodes on rayon's 2MB stacks).
-        let all_node_results = factor_tree_levelset(
+        let all_node_results = factor_tree(
             &supernodes,
             &children,
             matrix,
@@ -1974,24 +1958,68 @@ fn factor_small_leaf_subtree<T: Scalar>(
     Ok(results)
 }
 
-/// Iterative level-set factorization of the assembly tree.
+/// Shared read-only inputs for a tree traversal.
+struct TreeCtx<'a, T: Scalar> {
+    supernodes: &'a [SupernodeInfo],
+    children: &'a [Vec<usize>],
+    matrix: &'a SparseColMat<usize, T>,
+    perm_fwd: &'a [usize],
+    perm_inv: &'a [usize],
+    options: &'a AptpOptions,
+    scaling: Option<&'a [f64]>,
+    n: usize,
+    assembly_maps: &'a AssemblyMaps,
+    small_leaf_subtrees: &'a [SmallLeafSubtree],
+    /// `small_leaf_of_root[s] = Some(i)` if `s` is the root of small-leaf subtree `i`.
+    small_leaf_of_root: &'a [Option<usize>],
+    #[cfg(feature = "diagnostic")]
+    cb_mem: &'a ContribMemDebug,
+}
+
+/// Per-worker state for phase A: a workspace plus a full-length slot vector
+/// for contribution blocks waiting for their parent.
+struct WorkerState<T: Scalar> {
+    ws: FactorizationWorkspace<T>,
+    pending: Vec<Option<ContributionBlock<T>>>,
+}
+
+/// Results of factoring one L0 subtree.
+struct SubtreeOutput<T: Scalar> {
+    root: usize,
+    results: Vec<(usize, FrontFactors<T>, PerSupernodeStats)>,
+    contribution: Option<ContributionBlock<T>>,
+}
+
+/// Factor the assembly tree depth-first, with memory-bounded parallelism.
 ///
-/// Processes supernodes bottom-up: first all leaves (in parallel if enabled),
-/// then all nodes whose children are complete, and so on up to the roots.
-/// This avoids deep recursion that overflows rayon's 2MB worker stacks on
-/// matrices with deep elimination trees (e.g., c-71 with 76K supernodes).
+/// The tree is split into an *L0 layer* of independent subtrees and the *top*
+/// part above it, following the "L0-OpenMP" scheme of MUMPS 5:
 ///
-/// The parallelism is "level-set" style: at each wave, all ready nodes are
-/// independent (their children are already factored) and can be processed
-/// concurrently. This provides the same tree-level parallelism as the
-/// recursive approach but without stack depth concerns.
+/// - **Phase A** (parallel only): L0 subtrees are factored concurrently, one
+///   subtree per task, each traversed depth-first by one worker with its own
+///   workspace. No L0 subtree contains a front of `options.l0_max_front` or more,
+///   which bounds every worker's frontal buffer.
+/// - **Phase B**: the top part is factored depth-first, one supernode at a
+///   time, with intra-node (BLAS-level) parallelism inside each front, in a
+///   single workspace.
+///
+/// With `Par::Seq` the layer is empty and the whole tree is phase B.
+///
+/// Depth-first postorder keeps alive only the contribution blocks of
+/// completed siblings along the current root path (Liu 1986), rather than
+/// every block of a level-set wave. Traversals use explicit stacks, so deep
+/// elimination trees cannot overflow rayon's worker stacks.
 ///
 /// # References
 ///
-/// - Liu (1992), Section 5: level-set scheduling for multifrontal methods
-/// - Duff & Reid (1983): assembly tree parallelism
+/// - Liu (1986), "On the storage requirement in the out-of-core multifrontal
+///   method for sparse factorization", ACM TOMS 12(3): depth-first stack
+/// - Geist & Ng (1989), "Task scheduling for parallel sparse Cholesky
+///   factorization", IJPP 18(4): subtree-to-processor layer selection
+/// - L'Excellent & Sid-Lakhdar (2014), "A study of shared-memory parallelism
+///   in a multifrontal solver", Parallel Computing 40(3-4): the L0 layer
 #[allow(clippy::too_many_arguments)]
-fn factor_tree_levelset<T: Scalar>(
+fn factor_tree<T: Scalar>(
     supernodes: &[SupernodeInfo],
     children: &[Vec<usize>],
     matrix: &SparseColMat<usize, T>,
@@ -2004,275 +2032,341 @@ fn factor_tree_levelset<T: Scalar>(
     small_leaf_subtrees: &[SmallLeafSubtree],
 ) -> Result<Vec<(usize, FrontFactors<T>, PerSupernodeStats)>, SparseError> {
     let n_supernodes = supernodes.len();
-
-    // Track contributions from completed children
-    let mut contributions: Vec<Option<ContributionBlock<T>>> =
-        (0..n_supernodes).map(|_| None).collect();
-
-    // Track how many children remain unprocessed for each supernode
-    let mut remaining_children: Vec<usize> = children.iter().map(|c| c.len()).collect();
-
-    // Collect all results
-    let mut all_results: Vec<(usize, FrontFactors<T>, PerSupernodeStats)> =
-        Vec::with_capacity(n_supernodes);
-
-    // --- Small-leaf subtree pre-pass (rectangular workspace fast path) ---
-    // Factor all classified small-leaf subtrees before the main level-set loop.
-    // Each subtree uses a rectangular m×k L storage kernel instead of the general
-    // m×m frontal matrix, eliminating the large square allocation, frontal zeroing,
-    // and extract_front_factors copy for every node.
-    for subtree in small_leaf_subtrees {
-        let subtree_results = factor_small_leaf_subtree(
-            subtree,
-            supernodes,
-            children,
-            matrix,
-            perm_fwd,
-            perm_inv,
-            options,
-            scaling,
-            n,
-            &mut contributions,
-            assembly_maps,
-        )?;
-        all_results.extend(subtree_results);
-
-        // Decrement remaining_children for the subtree root's parent
-        if let Some(parent) = subtree.parent_of_root {
-            remaining_children[parent] -= 1;
-        }
+    let mut small_leaf_of_root: Vec<Option<usize>> = vec![None; n_supernodes];
+    for (i, st) in small_leaf_subtrees.iter().enumerate() {
+        small_leaf_of_root[st.root] = Some(i);
     }
-
-    let is_parallel = !matches!(options.par, Par::Seq);
-    let max_front = estimate_max_front_size(supernodes);
-
-    // Sequential mode: pre-allocate a single workspace at max_front to avoid
-    // repeated reallocations as the postorder traversal encounters progressively
-    // larger fronts. No pool needed — only one workspace exists.
-    //
-    // Parallel mode: use a pool of grow-on-demand workspaces. Pre-allocating
-    // a separate shared_workspace alongside the pool would waste max_front²×8
-    // bytes (685 MB for H2O) during parallel waves when only the pool is used.
-    // Single-node batches (sequential fallback near the tree root) pop from
-    // the pool instead.
-    //
-    // The pool is dropped when factor_tree_levelset returns, freeing all
-    // workspace memory (unlike thread_local! which leaks for the lifetime
-    // of the rayon thread pool).
-    let mut seq_workspace = if !is_parallel {
-        FactorizationWorkspace::new(max_front, n)
-    } else {
-        FactorizationWorkspace::empty()
-    };
-    let workspace_pool: std::sync::Mutex<Vec<FactorizationWorkspace<T>>> =
-        std::sync::Mutex::new(Vec::new());
-
     #[cfg(feature = "diagnostic")]
-    let mut cb_mem = ContribMemDebug::default();
-    #[cfg(feature = "diagnostic")]
-    cb_mem.observe(&contributions);
-
-    // Initial ready set: all leaf supernodes (no children) that are NOT in small-leaf subtrees
-    let mut ready: Vec<usize> = (0..n_supernodes)
-        .filter(|&s| remaining_children[s] == 0 && !supernodes[s].in_small_leaf)
-        .collect();
-
-    while !ready.is_empty() {
-        // Collect child contributions for each ready node. Children of different
-        // ready nodes are disjoint (tree structure), so each contribution is
-        // taken exactly once.
-        let mut batch_inputs: Vec<(usize, Vec<Option<ContributionBlock<T>>>)> =
-            Vec::with_capacity(ready.len());
-        for &s in &ready {
-            let child_contribs: Vec<Option<ContributionBlock<T>>> = children[s]
-                .iter()
-                .map(|&c| contributions[c].take())
-                .collect();
-            batch_inputs.push((s, child_contribs));
-        }
-
-        // Factor all ready nodes (parallel if enabled and batch > 1)
-        let batch_results: Vec<SupernodeResult<T>> = if !is_parallel {
-            // Pure sequential: use the pre-allocated workspace (no pool
-            // overhead, no reallocations during postorder traversal).
-            batch_inputs
-                .into_iter()
-                .map(|(s, contribs)| {
-                    factor_single_supernode(
-                        s,
-                        &supernodes[s],
-                        contribs,
-                        matrix,
-                        perm_fwd,
-                        perm_inv,
-                        options,
-                        scaling,
-                        &mut seq_workspace,
-                        assembly_maps,
-                    )
-                })
-                .collect::<Result<_, _>>()?
-        } else if batch_inputs.len() == 1 {
-            // Parallel mode, single-node batch (near tree root): pop a
-            // workspace from the pool. Drop remaining pool workspaces to
-            // free memory before processing large supernodes.
-            let mut pool = workspace_pool.lock().unwrap();
-            let mut ws = pool.pop().unwrap_or_else(FactorizationWorkspace::empty);
-            pool.clear();
-            drop(pool);
-            ws.ensure_g2l(n);
-            let results = batch_inputs
-                .into_iter()
-                .map(|(s, contribs)| {
-                    factor_single_supernode(
-                        s,
-                        &supernodes[s],
-                        contribs,
-                        matrix,
-                        perm_fwd,
-                        perm_inv,
-                        options,
-                        scaling,
-                        &mut ws,
-                        assembly_maps,
-                    )
-                })
-                .collect::<Result<_, _>>();
-            workspace_pool.lock().unwrap().push(ws);
-            results?
-        } else {
-            // Parallel: take workspaces from the caller-owned pool so each
-            // rayon worker gets exclusive ownership during factorization.
-            // The pool is reused across level-set waves and dropped when
-            // factor_tree_levelset returns (unlike thread_local! which leaks
-            // for the lifetime of the rayon thread pool).
-            //
-            // If rayon work-steals another par_iter task onto the same thread
-            // (due to nested Par::rayon BLAS), that task takes a separate
-            // workspace from the pool — no aliasing.
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            batch_inputs
-                .into_par_iter()
-                .map(|(s, contribs)| {
-                    // Poisoned mutex means a worker panicked — already fatal.
-                    let mut ws = workspace_pool
-                        .lock()
-                        .unwrap()
-                        .pop()
-                        .unwrap_or_else(FactorizationWorkspace::empty);
-                    // Only ensure global_to_local is sized; frontal_data
-                    // grows on demand in factor_single_supernode. Avoids
-                    // eagerly allocating max_front² per thread (OOM on
-                    // large-front matrices like H2O: 9258² × 8 = 685 MB).
-                    ws.ensure_g2l(n);
-                    let result = factor_single_supernode(
-                        s,
-                        &supernodes[s],
-                        contribs,
-                        matrix,
-                        perm_fwd,
-                        perm_inv,
-                        options,
-                        scaling,
-                        &mut ws,
-                        assembly_maps,
-                    );
-                    // Poisoned mutex means a worker panicked — already fatal.
-                    workspace_pool.lock().unwrap().push(ws);
-                    result
-                })
-                .collect::<Result<_, _>>()?
-        };
-
-        // Store results and determine next ready set
-        let mut next_ready = Vec::new();
-        for (result, &s) in batch_results.into_iter().zip(ready.iter()) {
-            contributions[s] = result.contribution;
-            all_results.push((s, result.ff, result.stats));
-
-            if let Some(parent) = supernodes[s].parent {
-                remaining_children[parent] -= 1;
-                if remaining_children[parent] == 0 {
-                    next_ready.push(parent);
-                }
-            }
-        }
-
-        ready = next_ready;
+    let cb_mem = ContribMemDebug::default();
+    let ctx = TreeCtx {
+        supernodes,
+        children,
+        matrix,
+        perm_fwd,
+        perm_inv,
+        options,
+        scaling,
+        n,
+        assembly_maps,
+        small_leaf_subtrees,
+        small_leaf_of_root: &small_leaf_of_root,
         #[cfg(feature = "diagnostic")]
-        cb_mem.observe(&contributions);
+        cb_mem: &cb_mem,
+    };
+
+    let threads = options.par.degree();
+    let layer = if threads > 1 {
+        select_l0_layer(supernodes, children, threads, options.l0_max_front)
+    } else {
+        Vec::new()
+    };
+    let mut is_layer_root = vec![false; n_supernodes];
+    for &r in &layer {
+        is_layer_root[r] = true;
+    }
+
+    let mut all_results = Vec::with_capacity(n_supernodes);
+    let mut pending: Vec<Option<ContributionBlock<T>>> = (0..n_supernodes).map(|_| None).collect();
+
+    #[cfg(feature = "diagnostic")]
+    let phase_a_start = std::time::Instant::now();
+
+    // Phase A: L0 subtrees in parallel, largest first (LPT order).
+    if !layer.is_empty() {
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+        let pool: std::sync::Mutex<Vec<WorkerState<T>>> = std::sync::Mutex::new(Vec::new());
+        let outputs: Vec<SubtreeOutput<T>> = layer
+            .par_iter()
+            .map(|&root| {
+                // Poisoned mutex means a worker panicked — already fatal.
+                let popped = pool.lock().unwrap().pop();
+                let mut st = popped.unwrap_or_else(|| WorkerState {
+                    ws: FactorizationWorkspace::empty(),
+                    pending: (0..n_supernodes).map(|_| None).collect(),
+                });
+                st.ws.ensure_g2l(n);
+                let order = dfs_postorder(&[root], children, |_| true);
+                let results = factor_in_order(&ctx, &order, &mut st.ws, &mut st.pending);
+                let contribution = st.pending[root].take();
+                pool.lock().unwrap().push(st);
+                results.map(|results| SubtreeOutput {
+                    root,
+                    results,
+                    contribution,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        // Free phase-A workspaces before allocating phase B's large one.
+        drop(pool);
+        for out in outputs {
+            pending[out.root] = out.contribution;
+            all_results.extend(out.results);
+        }
     }
 
     #[cfg(feature = "diagnostic")]
-    cb_mem.report(supernodes, children);
+    let phase_b_start = std::time::Instant::now();
+
+    // Phase B: the top part, depth-first, one front at a time.
+    let roots: Vec<usize> = (0..n_supernodes)
+        .filter(|&s| supernodes[s].parent.is_none())
+        .collect();
+    let order = dfs_postorder(&roots, children, |s| !is_layer_root[s]);
+    let max_front = order
+        .iter()
+        .map(|&s| front_dims(&supernodes[s]).1)
+        .max()
+        .unwrap_or(0);
+    let mut ws = FactorizationWorkspace::new(max_front, n);
+    all_results.extend(factor_in_order(&ctx, &order, &mut ws, &mut pending)?);
+
+    #[cfg(feature = "diagnostic")]
+    if std::env::var("RIVRS_MEMDEBUG").is_ok_and(|v| v == "1") {
+        let top_flops: f64 = order
+            .iter()
+            .map(|&s| {
+                let (k, m) = front_dims(&supernodes[s]);
+                k as f64 * m as f64 * m as f64
+            })
+            .sum();
+        eprintln!(
+            "phases: A {:.2} s ({} subtrees), B {:.2} s ({} top nodes, {:.2e} est. k*m^2, max front {})",
+            (phase_b_start - phase_a_start).as_secs_f64(),
+            layer.len(),
+            phase_b_start.elapsed().as_secs_f64(),
+            order.len(),
+            top_flops,
+            max_front
+        );
+    }
+    #[cfg(feature = "diagnostic")]
+    cb_mem.report(layer.len());
 
     Ok(all_results)
 }
 
-/// Diagnostic accounting of live contribution blocks (feature `diagnostic`).
+/// Factor supernodes in the given order (children before parents), taking
+/// child contribution blocks from `pending` and storing each node's own.
 ///
-/// Records, at each level-set wave boundary, the bytes allocated by live
-/// contribution blocks versus the bytes they logically need (lower triangle of
-/// an nc × nc block), and the per-supernode block sizes so `report` can
-/// simulate the peak of a depth-first postorder traversal for comparison.
-/// Printed to stderr when `RIVRS_MEMDEBUG=1`.
+/// Small-leaf subtree members are skipped until the subtree root is reached,
+/// where the whole subtree is factored by the fast path.
+fn factor_in_order<T: Scalar>(
+    ctx: &TreeCtx<'_, T>,
+    order: &[usize],
+    ws: &mut FactorizationWorkspace<T>,
+    pending: &mut [Option<ContributionBlock<T>>],
+) -> Result<Vec<(usize, FrontFactors<T>, PerSupernodeStats)>, SparseError> {
+    let mut out = Vec::with_capacity(order.len());
+    for &s in order {
+        let sn = &ctx.supernodes[s];
+        if sn.in_small_leaf {
+            if let Some(i) = ctx.small_leaf_of_root[s] {
+                out.extend(factor_small_leaf_subtree(
+                    &ctx.small_leaf_subtrees[i],
+                    ctx.supernodes,
+                    ctx.children,
+                    ctx.matrix,
+                    ctx.perm_fwd,
+                    ctx.perm_inv,
+                    ctx.options,
+                    ctx.scaling,
+                    ctx.n,
+                    pending,
+                    ctx.assembly_maps,
+                )?);
+                #[cfg(feature = "diagnostic")]
+                if let Some(cb) = &pending[s] {
+                    ctx.cb_mem.add(cb);
+                }
+            }
+            continue;
+        }
+        let contribs: Vec<Option<ContributionBlock<T>>> =
+            ctx.children[s].iter().map(|&c| pending[c].take()).collect();
+        #[cfg(feature = "diagnostic")]
+        for cb in contribs.iter().flatten() {
+            ctx.cb_mem.sub(cb);
+        }
+        let result = factor_single_supernode(
+            s,
+            sn,
+            contribs,
+            ctx.matrix,
+            ctx.perm_fwd,
+            ctx.perm_inv,
+            ctx.options,
+            ctx.scaling,
+            ws,
+            ctx.assembly_maps,
+        )?;
+        #[cfg(feature = "diagnostic")]
+        if let Some(cb) = &result.contribution {
+            ctx.cb_mem.add(cb);
+        }
+        pending[s] = result.contribution;
+        out.push((s, result.ff, result.stats));
+    }
+    Ok(out)
+}
+
+/// Fully-summed column count `k` and front size `m` of a supernode, before
+/// any delayed columns from children.
+fn front_dims(sn: &SupernodeInfo) -> (usize, usize) {
+    let k: usize = sn.owned_ranges.iter().map(|r| r.len()).sum();
+    (k, k + sn.pattern.len())
+}
+
+/// Depth-first postorder of the subtrees rooted at `roots`, visiting only
+/// nodes for which `include` holds (an excluded node's subtree is skipped).
+fn dfs_postorder(
+    roots: &[usize],
+    children: &[Vec<usize>],
+    include: impl Fn(usize) -> bool,
+) -> Vec<usize> {
+    let mut order = Vec::new();
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for &r in roots {
+        if !include(r) {
+            continue;
+        }
+        stack.push((r, 0));
+        while let Some(top) = stack.last_mut() {
+            let (s, i) = *top;
+            if i < children[s].len() {
+                top.1 += 1;
+                let c = children[s][i];
+                if include(c) {
+                    stack.push((c, 0));
+                }
+            } else {
+                order.push(s);
+                stack.pop();
+            }
+        }
+    }
+    order
+}
+
+/// Choose the L0 layer: roots of independent subtrees for phase A.
+///
+/// Starting from the tree roots, any node whose subtree contains a front of
+/// `l0_max_front` or more is moved to the top part (replaced by its
+/// children). Then, Geist–Ng style, the most expensive subtree is split while
+/// it exceeds `1/threads` of the layer's total cost, so the greedy (largest
+/// first) assignment of subtrees to threads stays balanced. Small-leaf
+/// subtrees are never split. Cost is approximated by `k·m²` per front.
+///
+/// Returns layer roots sorted by decreasing subtree cost.
+fn select_l0_layer(
+    supernodes: &[SupernodeInfo],
+    children: &[Vec<usize>],
+    threads: usize,
+    l0_max_front: usize,
+) -> Vec<usize> {
+    let n = supernodes.len();
+    let mut cost = vec![0.0f64; n];
+    let mut max_front = vec![0usize; n];
+    // Postorder (parent > child): every child is final before its parent.
+    for s in 0..n {
+        let (k, m) = front_dims(&supernodes[s]);
+        cost[s] += k as f64 * m as f64 * m as f64;
+        max_front[s] = max_front[s].max(m);
+        if let Some(p) = supernodes[s].parent {
+            cost[p] += cost[s];
+            max_front[p] = max_front[p].max(max_front[s]);
+        }
+    }
+
+    // Memory rule: no L0 subtree may contain a large front.
+    let mut work: Vec<usize> = (0..n).filter(|&s| supernodes[s].parent.is_none()).collect();
+    let mut layer = Vec::new();
+    while let Some(r) = work.pop() {
+        if max_front[r] >= l0_max_front && !supernodes[r].in_small_leaf {
+            work.extend(children[r].iter().copied());
+        } else {
+            layer.push(r);
+        }
+    }
+
+    // Load-balance rule: split the largest subtree while it dominates.
+    let max_layer = 32 * threads;
+    while !layer.is_empty() && layer.len() < max_layer {
+        let total: f64 = layer.iter().map(|&r| cost[r]).sum();
+        let (idx, r) = layer
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|a, b| cost[a.1].total_cmp(&cost[b.1]))
+            .unwrap_or((0, layer[0]));
+        let splittable = !children[r].is_empty() && !supernodes[r].in_small_leaf;
+        if !splittable || cost[r] * threads as f64 <= total {
+            break;
+        }
+        layer.swap_remove(idx);
+        layer.extend(children[r].iter().copied());
+    }
+
+    layer.sort_by(|a, b| cost[*b].total_cmp(&cost[*a]));
+    layer
+}
+
+/// Live contribution-block accounting (feature `diagnostic`).
+///
+/// Tracks bytes allocated by contribution blocks waiting for their parent
+/// and the bytes they logically need (lower triangle), with peaks. Printed to
+/// stderr at the end of factorization when `RIVRS_MEMDEBUG=1`.
 #[cfg(feature = "diagnostic")]
 #[derive(Default)]
 struct ContribMemDebug {
-    peak_alloc: usize,
-    peak_logical_tri: usize,
-    peak_blocks: usize,
-    cb_rows: Vec<usize>,
-    entry_bytes: usize,
+    live_alloc: std::sync::atomic::AtomicUsize,
+    live_tri: std::sync::atomic::AtomicUsize,
+    live_blocks: std::sync::atomic::AtomicUsize,
+    peak_alloc: std::sync::atomic::AtomicUsize,
+    peak_tri: std::sync::atomic::AtomicUsize,
+    peak_blocks: std::sync::atomic::AtomicUsize,
+    entry_bytes: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(feature = "diagnostic")]
 impl ContribMemDebug {
-    fn observe<T: Scalar>(&mut self, contributions: &[Option<ContributionBlock<T>>]) {
-        self.entry_bytes = std::mem::size_of::<T>();
-        if self.cb_rows.len() < contributions.len() {
-            self.cb_rows.resize(contributions.len(), 0);
-        }
-        let (mut alloc, mut tri, mut blocks) = (0usize, 0usize, 0usize);
-        for (s, cb) in contributions.iter().enumerate() {
-            if let Some(cb) = cb {
-                let nc = cb.row_indices.len();
-                self.cb_rows[s] = nc;
-                alloc += cb.data.col_stride().unsigned_abs() * cb.data.ncols();
-                tri += nc * (nc + 1) / 2;
-                blocks += 1;
-            }
-        }
-        if alloc > self.peak_alloc {
-            self.peak_alloc = alloc;
-            self.peak_logical_tri = tri;
-            self.peak_blocks = blocks;
-        }
+    fn sizes<T: Scalar>(cb: &ContributionBlock<T>) -> (usize, usize) {
+        let nc = cb.row_indices.len();
+        let alloc = cb.data.col_stride().unsigned_abs() * cb.data.ncols();
+        (alloc, nc * (nc + 1) / 2)
     }
 
-    fn report(&self, supernodes: &[SupernodeInfo], children: &[Vec<usize>]) {
+    fn add<T: Scalar>(&self, cb: &ContributionBlock<T>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (a, t) = Self::sizes(cb);
+        self.entry_bytes.store(std::mem::size_of::<T>(), Relaxed);
+        let la = self.live_alloc.fetch_add(a, Relaxed) + a;
+        let lt = self.live_tri.fetch_add(t, Relaxed) + t;
+        let lb = self.live_blocks.fetch_add(1, Relaxed) + 1;
+        self.peak_alloc.fetch_max(la, Relaxed);
+        self.peak_tri.fetch_max(lt, Relaxed);
+        self.peak_blocks.fetch_max(lb, Relaxed);
+    }
+
+    fn sub<T: Scalar>(&self, cb: &ContributionBlock<T>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (a, t) = Self::sizes(cb);
+        self.live_alloc.fetch_sub(a, Relaxed);
+        self.live_tri.fetch_sub(t, Relaxed);
+        self.live_blocks.fetch_sub(1, Relaxed);
+    }
+
+    fn report(&self, layer_len: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
         if std::env::var("RIVRS_MEMDEBUG").map_or(true, |v| v != "1") {
             return;
         }
-        // Depth-first postorder (supernode index order): children's blocks are
-        // freed once the parent is assembled, then the parent's block is pushed.
-        let tri = |nc: usize| nc * (nc + 1) / 2;
-        let (mut live, mut peak) = (0usize, 0usize);
-        for s in 0..supernodes.len() {
-            let own = self.cb_rows.get(s).copied().unwrap_or(0);
-            peak = peak.max(live + tri(own));
-            for &c in &children[s] {
-                live -= tri(self.cb_rows.get(c).copied().unwrap_or(0));
-            }
-            live += tri(own);
-        }
-        let gb = |e: usize| (e * self.entry_bytes) as f64 / (1u64 << 30) as f64;
+        let eb = self.entry_bytes.load(Relaxed);
+        let gb = |e: usize| (e * eb) as f64 / (1u64 << 30) as f64;
         eprintln!(
-            "contrib blocks at level-set peak: {} blocks, allocated {:.2} GB, needed (lower tri) {:.2} GB; depth-first postorder peak (lower tri) {:.2} GB",
-            self.peak_blocks,
-            gb(self.peak_alloc),
-            gb(self.peak_logical_tri),
-            gb(peak)
+            "contrib blocks (L0 layer: {layer_len} subtrees): peak allocated {:.2} GB, peak needed (lower tri) {:.2} GB, peak live blocks {}",
+            gb(self.peak_alloc.load(Relaxed)),
+            gb(self.peak_tri.load(Relaxed)),
+            self.peak_blocks.load(Relaxed)
         );
     }
 }

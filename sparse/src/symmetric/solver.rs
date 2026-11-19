@@ -100,6 +100,15 @@ pub struct FactorOptions {
     /// independent but share the same default because fronts below 256 benefit
     /// from neither parallel BLAS nor the general-path overhead.
     pub small_leaf_threshold: usize,
+    /// Largest front size allowed inside a parallel subtree. Default: 4096.
+    ///
+    /// With `par` set to more than one thread, independent subtrees whose
+    /// fronts are all smaller than this are factored concurrently, each by one
+    /// worker with its own frontal buffer (at most `l0_max_front²` entries).
+    /// Larger fronts, near the root, are factored one at a time using all
+    /// threads inside the front. Raising it trades memory for tree-level
+    /// parallelism. Ignored for `Par::Seq`.
+    pub l0_max_front: usize,
 }
 
 impl Default for FactorOptions {
@@ -112,6 +121,7 @@ impl Default for FactorOptions {
             par: Par::Seq,
             nemin: 32,
             small_leaf_threshold: 256,
+            l0_max_front: 4096,
         }
     }
 }
@@ -133,6 +143,9 @@ pub struct SolverOptions {
     /// Front-size threshold for small-leaf subtree fast path.
     /// Default: 256. Set to 0 to disable. See [`FactorOptions::small_leaf_threshold`].
     pub small_leaf_threshold: usize,
+    /// Largest front inside a parallel subtree. Default: 4096.
+    /// See [`FactorOptions::l0_max_front`].
+    pub l0_max_front: usize,
 }
 
 impl Default for SolverOptions {
@@ -144,6 +157,7 @@ impl Default for SolverOptions {
             par: Par::Seq,
             nemin: 32,
             small_leaf_threshold: 256,
+            l0_max_front: 4096,
         }
     }
 }
@@ -314,6 +328,7 @@ impl<T: Scalar> SparseLDLT<T> {
             par: options.par,
             nemin: options.nemin,
             small_leaf_threshold: options.small_leaf_threshold,
+            l0_max_front: options.l0_max_front,
             ..AptpOptions::default()
         };
 
@@ -489,6 +504,7 @@ impl<T: Scalar> SparseLDLT<T> {
             par: options.par,
             nemin: options.nemin,
             small_leaf_threshold: options.small_leaf_threshold,
+            l0_max_front: options.l0_max_front,
             ..FactorOptions::default()
         };
 
