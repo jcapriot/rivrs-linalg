@@ -1348,30 +1348,89 @@ fn apply_and_check<T: Scalar>(
         .submatrix_mut(panel_start, col_start, panel_rows, block_nelim);
     triangular_solve::solve_unit_lower_triangular_in_place(l11_ref, panel.transpose_mut(), par);
 
-    // Step 2: Scale by D^{-1}
-    // For 1×1 pivot at column j: L21[:, j] /= D[j]
-    // For 2×2 pivot at columns (j, j+1): solve the 2×2 system
+    // Steps 2+3, fused and split across row blocks: scale by D^{-1}, then
+    // find the first pivot (1x1 or 2x2 group) whose column has an entry with
+    // |l| >= 1/u. Rows are independent, so each block reports its own first
+    // failing pivot and the minimum over blocks is the answer.
+    let stability_bound = real::<T>(1.0) / threshold;
+    let panel = a
+        .rb_mut()
+        .submatrix_mut(panel_start, col_start, panel_rows, block_nelim);
+    let first_fail = scale_and_check_rows(panel, d, block_nelim, stability_bound, par);
+    first_fail.unwrap_or(block_nelim)
+}
+
+/// Rows per task below which [`scale_and_check_rows`] stays sequential.
+const SCALE_CHECK_PAR_MIN_ROWS: usize = 1024;
+
+/// Scale panel rows by D^{-1} (1x1 and 2x2 pivots) and return the start of
+/// the first pivot group with any |entry| >= `bound` in these rows, if any.
+fn scale_and_check_rows<T: Scalar>(
+    mut panel: MatMut<'_, T>,
+    d: &MixedDiagonal<T>,
+    nelim: usize,
+    bound: T::Real,
+    par: Par,
+) -> Option<usize> {
+    let rows = panel.nrows();
+    if par.degree() > 1 && rows >= 2 * SCALE_CHECK_PAR_MIN_ROWS {
+        let mid = rows / 2;
+        let (top, bot) = panel.split_at_row_mut(mid);
+        let (a, b) = rayon::join(
+            || scale_and_check_rows(top, d, nelim, bound, par),
+            || scale_and_check_rows(bot, d, nelim, bound, par),
+        );
+        return match (a, b) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, y) => x.or(y),
+        };
+    }
+
+    let exceeds = |col: &[T]| col.iter().any(|v| v.mag() >= bound);
+    let mut first_fail: Option<usize> = None;
     let mut col = 0;
-    while col < block_nelim {
+    while col < nelim {
         match d.pivot_type(col) {
             PivotType::OneByOne => {
-                let d_val = d.diagonal_1x1(col);
-                let inv_d = T::one() / d_val;
-                for i in 0..panel_rows {
-                    a[(panel_start + i, col_start + col)] *= inv_d;
+                let inv_d = T::one() / d.diagonal_1x1(col);
+                let mut c = panel.rb_mut().col_mut(col);
+                for i in 0..rows {
+                    c[i] *= inv_d;
+                }
+                if first_fail.is_none() {
+                    let fail = match panel.rb().col(col).try_as_col_major() {
+                        Some(x) => exceeds(x.as_slice()),
+                        None => (0..rows).any(|i| panel[(i, col)].mag() >= bound),
+                    };
+                    if fail {
+                        first_fail = Some(col);
+                    }
                 }
                 col += 1;
             }
             PivotType::TwoByTwo { partner } if partner > col => {
+                debug_assert!(
+                    col + 1 < nelim,
+                    "2x2 pivot at {col} straddles nelim {nelim}"
+                );
                 let block = d.diagonal_2x2(col);
-                let det = block.a * block.c - block.b * block.b;
-                let inv_det = T::one() / det;
-                for i in 0..panel_rows {
-                    let x1 = a[(panel_start + i, col_start + col)];
-                    let x2 = a[(panel_start + i, col_start + col + 1)];
-                    a[(panel_start + i, col_start + col)] = (x1 * block.c - x2 * block.b) * inv_det;
-                    a[(panel_start + i, col_start + col + 1)] =
-                        (x2 * block.a - x1 * block.b) * inv_det;
+                let inv_det = T::one() / (block.a * block.c - block.b * block.b);
+                for i in 0..rows {
+                    let x1 = panel[(i, col)];
+                    let x2 = panel[(i, col + 1)];
+                    panel[(i, col)] = (x1 * block.c - x2 * block.b) * inv_det;
+                    panel[(i, col + 1)] = (x2 * block.a - x1 * block.b) * inv_det;
+                }
+                if first_fail.is_none() {
+                    let fail = (col..(col + 2).min(nelim)).any(|c| {
+                        match panel.rb().col(c).try_as_col_major() {
+                            Some(x) => exceeds(x.as_slice()),
+                            None => (0..rows).any(|i| panel[(i, c)].mag() >= bound),
+                        }
+                    });
+                    if fail {
+                        first_fail = Some(col);
+                    }
                 }
                 col += 2;
             }
@@ -1380,42 +1439,7 @@ fn apply_and_check<T: Scalar>(
             }
         }
     }
-
-    // Step 3: Threshold scan — find first failing column
-    let stability_bound = real::<T>(1.0) / threshold;
-    let mut effective_nelim = block_nelim;
-
-    let mut scan_col = 0;
-    while scan_col < block_nelim {
-        let pivot_width = match d.pivot_type(scan_col) {
-            PivotType::TwoByTwo { partner } if partner > scan_col => 2,
-            _ => 1,
-        };
-
-        let mut col_ok = true;
-        for c in scan_col..scan_col + pivot_width {
-            if c >= block_nelim {
-                break;
-            }
-            for i in 0..panel_rows {
-                if a[(panel_start + i, col_start + c)].mag() >= stability_bound {
-                    col_ok = false;
-                    break;
-                }
-            }
-            if !col_ok {
-                break;
-            }
-        }
-
-        if !col_ok {
-            effective_nelim = scan_col;
-            break;
-        }
-        scan_col += pivot_width;
-    }
-
-    effective_nelim
+    first_fail
 }
 
 /// Rank-nelim Schur complement update on the trailing submatrix via GEMM.
