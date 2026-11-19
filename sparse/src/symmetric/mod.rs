@@ -35,6 +35,8 @@ pub use inertia::Inertia;
 pub use pivot::{Block2x2, PivotType};
 pub use symbolic::{AptpSymbolic, SymbolicStatistics};
 
+#[cfg(feature = "diagnostic")]
+pub use factor::take_kernel_profile;
 pub use factor::{
     AptpFactorResult, AptpFactorization, AptpFallback, AptpOptions, AptpPivotRecord,
     AptpStatistics, FailedPivotMethod, aptp_factor, aptp_factor_in_place,

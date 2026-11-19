@@ -1931,14 +1931,29 @@ fn factor_inner<T: Scalar>(
         let block_size = (end_pos - k).min(ib);
         let block_end = k + block_size;
 
+        #[cfg(feature = "diagnostic")]
+        kernel_profile::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostic")]
+        let t = std::time::Instant::now();
+
         // 1. BACKUP: save a[k..m, k..k+block_size] before factoring
         let backup = BlockBackup::create(a.as_ref(), k, block_size, m, &mut kernel_ws.backup);
+
+        #[cfg(feature = "diagnostic")]
+        kernel_profile::add(0, t);
+        #[cfg(feature = "diagnostic")]
+        let t = std::time::Instant::now();
 
         // 2. FACTOR: complete pivoting on the block_size×block_size diagonal block
         //    Block-scoped swaps: only rows/columns within [0..block_end] are permuted.
         //    Panel rows [block_end..m] are NOT touched.
         let (block_d, block_perm, block_nelim, block_stats, block_log) =
             factor_block_diagonal(a.rb_mut(), k, block_size, small, block_end);
+
+        #[cfg(feature = "diagnostic")]
+        kernel_profile::add(1, t);
+        #[cfg(feature = "diagnostic")]
+        let t = std::time::Instant::now();
 
         if block_nelim == 0 {
             // Entire block is singular — restore and delay all columns
@@ -2010,6 +2025,11 @@ fn factor_inner<T: Scalar>(
             col_order[k + i] = col_order_buf[block_perm[i]];
         }
 
+        #[cfg(feature = "diagnostic")]
+        kernel_profile::add(2, t);
+        #[cfg(feature = "diagnostic")]
+        let t = std::time::Instant::now();
+
         // 7. APPLY: TRSM on panel below + threshold check
         let mut effective_nelim = apply_and_check(
             a.rb_mut(),
@@ -2022,6 +2042,11 @@ fn factor_inner<T: Scalar>(
             options.par,
             &mut kernel_ws.l11_buf,
         );
+
+        #[cfg(feature = "diagnostic")]
+        kernel_profile::add(3, t);
+        #[cfg(feature = "diagnostic")]
+        let t = std::time::Instant::now();
 
         // 8. ADJUST: don't split 2×2 pivot across block boundary
         effective_nelim = adjust_for_2x2_boundary(effective_nelim, &block_d);
@@ -2040,6 +2065,9 @@ fn factor_inner<T: Scalar>(
             );
         }
 
+        #[cfg(feature = "diagnostic")]
+        kernel_profile::add(4, t);
+
         // Use effective_nelim as the number of passed columns for all subsequent steps.
         let nelim = effective_nelim;
 
@@ -2050,6 +2078,8 @@ fn factor_inner<T: Scalar>(
         //     b. Failed×failed: A[k+e..k+bs, k+e..k+bs] -= L_blk * D * L_blk^T
         //     c. Trailing×failed: A[ts..m, k+e..k+bs] -= L_panel * D * L_blk^T
         if nelim > 0 {
+            #[cfg(feature = "diagnostic")]
+            let t = std::time::Instant::now();
             update_trailing(
                 a.rb_mut(),
                 k,
@@ -2062,6 +2092,10 @@ fn factor_inner<T: Scalar>(
                 &mut kernel_ws.ld_buf,
                 &mut kernel_ws.copy_buf,
             );
+            #[cfg(feature = "diagnostic")]
+            kernel_profile::add(5, t);
+            #[cfg(feature = "diagnostic")]
+            let t = std::time::Instant::now();
             update_cross_terms(
                 a.rb_mut(),
                 k,
@@ -2072,6 +2106,8 @@ fn factor_inner<T: Scalar>(
                 &mut kernel_ws.ld_buf,
                 &mut kernel_ws.copy_buf,
             );
+            #[cfg(feature = "diagnostic")]
+            kernel_profile::add(6, t);
         }
 
         // 11. ACCUMULATE D entries for passed columns
@@ -2167,6 +2203,44 @@ fn factor_inner<T: Scalar>(
         stats,
         pivot_log,
     })
+}
+
+/// Wall-clock totals for the steps of `factor_inner`, accumulated across all
+/// calls (feature `diagnostic`). Read and reset with [`take_kernel_profile`].
+#[cfg(feature = "diagnostic")]
+pub(crate) mod kernel_profile {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub(crate) const NAMES: [&str; 7] = [
+        "backup",
+        "factor diag block",
+        "permute panel + rows",
+        "apply_and_check (TRSM)",
+        "restore failed",
+        "update_trailing (rank-ib)",
+        "update_cross_terms",
+    ];
+    pub(crate) static NANOS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    pub(crate) static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub(crate) fn add(i: usize, t: std::time::Instant) {
+        NANOS[i].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    }
+}
+
+/// Take and reset the accumulated `factor_inner` step timings as
+/// `(step name, seconds)`, plus the number of inner blocks processed
+/// (feature `diagnostic`).
+#[cfg(feature = "diagnostic")]
+pub fn take_kernel_profile() -> (Vec<(&'static str, f64)>, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let steps = kernel_profile::NAMES
+        .iter()
+        .zip(kernel_profile::NANOS.iter())
+        .map(|(n, a)| (*n, a.swap(0, Relaxed) as f64 * 1e-9))
+        .collect();
+    (steps, kernel_profile::CALLS.swap(0, Relaxed))
 }
 
 /// Two-level outer block loop for large frontal matrices.
