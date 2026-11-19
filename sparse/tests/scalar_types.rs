@@ -312,3 +312,38 @@ fn f64_and_c64_agree_on_real_matrix() {
         "forward errors differ: {fe_r:e} vs {fe_c:e}"
     );
 }
+
+#[test]
+fn metis_ordering_is_deterministic_under_concurrency() {
+    // METIS has global state; concurrent analyze calls must still give the
+    // same ordering as a single-threaded call.
+    use rivrs_sparse::ordering::metis_ordering;
+    let a = kkt::<f64>(300, 80, 9);
+    let reference = metis_ordering(a.symbolic())
+        .expect("metis")
+        .arrays()
+        .0
+        .to_vec();
+    let mismatches = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..4 {
+            sc.spawn(|| {
+                for _ in 0..25 {
+                    let p = metis_ordering(a.symbolic())
+                        .expect("metis")
+                        .arrays()
+                        .0
+                        .to_vec();
+                    if p != reference {
+                        mismatches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(
+        mismatches.into_inner(),
+        0,
+        "concurrent METIS orderings differ"
+    );
+}

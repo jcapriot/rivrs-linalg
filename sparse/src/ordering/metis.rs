@@ -561,6 +561,15 @@ fn call_metis_node_nd(
     xadj: &mut [i32],
     adjncy: &mut [i32],
 ) -> Result<(Vec<i32>, Vec<i32>), SparseError> {
+    // METIS keeps process-global state (its random number generator), so
+    // concurrent calls race: orderings differ from run to run and the C code
+    // has a data race. Serialize all calls. A poisoned lock only means another
+    // caller panicked; METIS state is reinitialised on every call, so continue.
+    static METIS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = METIS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let mut options = [0i32; metis_sys::METIS_NOPTIONS as usize];
     unsafe {
         metis_sys::METIS_SetDefaultOptions(options.as_mut_ptr());
