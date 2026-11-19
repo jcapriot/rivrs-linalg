@@ -49,6 +49,8 @@ use crate::error::SparseError;
 
 #[cfg(feature = "diagnostic")]
 use crate::profiling::{FinishedSession, ProfileSession};
+#[allow(unused_imports)]
+use crate::scalar::{Mag, S, s, zero};
 
 /// Sentinel value indicating a global column is not part of the current front.
 const NOT_IN_FRONT: usize = usize::MAX;
@@ -75,7 +77,7 @@ const NOT_IN_FRONT: usize = usize::MAX;
 /// - Liu (1992), Section 4: multifrontal workspace management
 pub(crate) struct FactorizationWorkspace {
     /// Dense buffer, max_front × max_front. Reused as each supernode's frontal matrix.
-    frontal_data: Mat<f64>,
+    frontal_data: Mat<S>,
     /// Buffer for frontal matrix row indices, capacity max_front.
     frontal_row_indices: Vec<usize>,
     /// Buffer for collecting delayed columns from children.
@@ -86,11 +88,11 @@ pub(crate) struct FactorizationWorkspace {
     /// deferred contribution GEMM output. Reused across supernodes via swap protocol:
     /// final GEMM writes here → buffer moved into ContributionBlock → parent's
     /// extend-add recycles buffer back.
-    contrib_buffer: Mat<f64>,
+    contrib_buffer: Mat<S>,
     /// Pre-allocated L·D product workspace for `compute_contribution_gemm`.
     /// Sized nfs × ne (grows on demand). Eliminates per-supernode allocation
     /// in the hot loop.
-    ld_workspace: Mat<f64>,
+    ld_workspace: Mat<S>,
 }
 
 impl Default for FactorizationWorkspace {
@@ -109,16 +111,16 @@ impl FactorizationWorkspace {
     pub(crate) fn new(max_front: usize, n: usize) -> Self {
         if max_front == 0 {
             return Self {
-                frontal_data: Mat::zeros(0, 0),
+                frontal_data: Mat::<S>::zeros(0, 0),
                 frontal_row_indices: Vec::new(),
                 delayed_cols_buf: Vec::new(),
                 global_to_local: vec![NOT_IN_FRONT; n],
-                contrib_buffer: Mat::zeros(0, 0),
+                contrib_buffer: Mat::<S>::zeros(0, 0),
                 ld_workspace: Mat::new(),
             };
         }
         Self {
-            frontal_data: Mat::zeros(max_front, max_front),
+            frontal_data: Mat::<S>::zeros(max_front, max_front),
             frontal_row_indices: Vec::with_capacity(max_front),
             delayed_cols_buf: Vec::with_capacity(max_front),
             global_to_local: vec![NOT_IN_FRONT; n],
@@ -161,7 +163,7 @@ impl FactorizationWorkspace {
         // col_as_slice_mut gives a contiguous &mut [f64] for each column of the
         // owned Mat, so fill(0.0) compiles to memset — much faster than indexed writes.
         for j in 0..m {
-            self.frontal_data.col_as_slice_mut(j)[j..m].fill(0.0);
+            self.frontal_data.col_as_slice_mut(j)[j..m].fill(zero());
         }
     }
 
@@ -264,7 +266,7 @@ pub(crate) struct AssemblyMaps {
 fn build_assembly_maps(
     supernodes: &[SupernodeInfo],
     children: &[Vec<usize>],
-    matrix: &SparseColMat<usize, f64>,
+    matrix: &SparseColMat<usize, S>,
     perm_fwd: &[usize],
     perm_inv: &[usize],
     n: usize,
@@ -495,7 +497,7 @@ pub(crate) struct SmallLeafSubtree {
 /// where `k = num_fully_summed` and `m = data.nrows()`.
 pub(crate) struct FrontalMatrix<'a> {
     /// Dense m × m storage (lower triangle used). Borrows from workspace.
-    pub data: MatMut<'a, f64>,
+    pub data: MatMut<'a, S>,
     /// Global permuted column indices for each local row (length m).
     /// Used by callers that need index mapping (e.g., scatter maps).
     #[allow(dead_code)]
@@ -515,7 +517,7 @@ pub(crate) struct FrontalMatrix<'a> {
 /// - Positions `num_delayed..size`: non-fully-summed rows with Schur complement
 pub(crate) struct ContributionBlock {
     /// Dense (m - ne) × (m - ne) trailing submatrix from factored frontal matrix.
-    pub data: Mat<f64>,
+    pub data: Mat<S>,
     /// Global permuted column indices for rows/columns of the contribution.
     pub row_indices: Vec<usize>,
     /// Number of delayed columns at the start of this block.
@@ -542,11 +544,11 @@ pub(crate) struct ContributionBlock {
 #[derive(Debug)]
 pub struct FrontFactors {
     /// Unit lower triangular factor (ne × ne).
-    pub(crate) l11: Mat<f64>,
+    pub(crate) l11: Mat<S>,
     /// Block diagonal with 1x1 and 2x2 pivots (ne entries).
     pub(crate) d11: MixedDiagonal,
     /// Subdiagonal factor block (r × ne).
-    pub(crate) l21: Mat<f64>,
+    pub(crate) l21: Mat<S>,
     /// APTP local pivot permutation (length k). Maps factored position to
     /// original front-local column.
     pub(crate) local_perm: Vec<usize>,
@@ -560,7 +562,7 @@ pub struct FrontFactors {
 
 impl FrontFactors {
     /// Unit lower triangular factor L11 (ne × ne).
-    pub fn l11(&self) -> &Mat<f64> {
+    pub fn l11(&self) -> &Mat<S> {
         &self.l11
     }
 
@@ -570,7 +572,7 @@ impl FrontFactors {
     }
 
     /// Subdiagonal factor block L21 (r × ne).
-    pub fn l21(&self) -> &Mat<f64> {
+    pub fn l21(&self) -> &Mat<S> {
         &self.l21
     }
 
@@ -722,7 +724,7 @@ pub struct FactorizationStats {
 #[cfg(feature = "diagnostic")]
 pub struct ExportedFrontal {
     /// Dense m x m frontal matrix (lower triangle populated).
-    pub data: Mat<f64>,
+    pub data: Mat<S>,
     /// Total front size.
     pub front_size: usize,
     /// Number of fully-summed columns.
@@ -843,7 +845,7 @@ impl AptpNumeric {
     ///   Threshold Pivoting"
     pub fn factor(
         symbolic: &AptpSymbolic,
-        matrix: &SparseColMat<usize, f64>,
+        matrix: &SparseColMat<usize, S>,
         options: &AptpOptions,
         scaling: Option<&[f64]>,
     ) -> Result<Self, SparseError> {
@@ -988,7 +990,7 @@ impl AptpNumeric {
         for ff in &front_factors {
             for (_, entry) in ff.d11().iter_pivots() {
                 if let PivotEntry::OneByOne(val) = entry {
-                    if val == 0.0 {
+                    if val == zero() {
                         stats.zero_pivots += 1;
                     }
                 }
@@ -1041,7 +1043,7 @@ impl AptpNumeric {
     #[cfg(feature = "diagnostic")]
     pub fn export_assembled_frontal(
         symbolic: &AptpSymbolic,
-        matrix: &SparseColMat<usize, f64>,
+        matrix: &SparseColMat<usize, S>,
         options: &AptpOptions,
         scaling: Option<&[f64]>,
         target_snode: Option<usize>,
@@ -1124,7 +1126,7 @@ impl AptpNumeric {
             }
 
             // 4. Assemble frontal matrix (owned data — diagnostic path)
-            let mut frontal_data = Mat::zeros(m, m);
+            let mut frontal_data = Mat::<S>::zeros(m, m);
             {
                 let mut frontal = FrontalMatrix {
                     data: frontal_data.as_mut(),
@@ -1169,9 +1171,9 @@ impl AptpNumeric {
 
             if sn.parent.is_some() && ne < m {
                 let nfs = m - k;
-                let mut cb = Mat::zeros(m, m);
+                let mut cb = Mat::<S>::zeros(m, m);
                 if nfs > 0 {
-                    let mut ld_ws = Mat::zeros(m, ne.max(1));
+                    let mut ld_ws = Mat::<S>::zeros(m, ne.max(1));
                     compute_contribution_gemm(
                         &frontal_data,
                         k,
@@ -1227,7 +1229,7 @@ fn factor_single_supernode(
     s: usize,
     sn: &SupernodeInfo,
     child_contributions: Vec<Option<ContributionBlock>>,
-    matrix: &SparseColMat<usize, f64>,
+    matrix: &SparseColMat<usize, S>,
     perm_fwd: &[usize],
     perm_inv: &[usize],
     options: &AptpOptions,
@@ -1264,7 +1266,7 @@ fn factor_single_supernode(
     // 3. Ensure workspace capacity and zero frontal data for this supernode
     // If delayed columns make this front larger than estimated, grow the workspace
     if m > workspace.frontal_data.nrows() {
-        workspace.frontal_data = Mat::zeros(m, m);
+        workspace.frontal_data = Mat::<S>::zeros(m, m);
     }
 
     #[cfg(feature = "diagnostic")]
@@ -1415,7 +1417,7 @@ fn factor_single_supernode(
     if sn.parent.is_some() && ne < m && nfs > 0 {
         // Ensure contrib_buffer is large enough (rare: delayed cascades may exceed estimate)
         if workspace.contrib_buffer.nrows() < m || workspace.contrib_buffer.ncols() < m {
-            workspace.contrib_buffer = Mat::zeros(m, m);
+            workspace.contrib_buffer = Mat::<S>::zeros(m, m);
         }
         compute_contribution_gemm(
             &workspace.frontal_data,
@@ -1563,7 +1565,7 @@ fn factor_small_leaf_subtree(
     subtree: &SmallLeafSubtree,
     supernodes: &[SupernodeInfo],
     children: &[Vec<usize>],
-    matrix: &SparseColMat<usize, f64>,
+    matrix: &SparseColMat<usize, S>,
     perm_fwd: &[usize],
     perm_inv: &[usize],
     options: &AptpOptions,
@@ -1582,10 +1584,10 @@ fn factor_small_leaf_subtree(
     // - ld_workspace: for L·D product in contribution GEMM
     // - frontal_row_indices: reusable buffer for building front structure
     // - delayed_cols_buf: reusable buffer for collecting child delays
-    let mut l_storage = Mat::<f64>::zeros(max_front, max_front);
+    let mut l_storage = Mat::<S>::zeros(max_front, max_front);
     let mut global_to_local = vec![NOT_IN_FRONT; n];
-    let mut contrib_buffer = Mat::<f64>::new();
-    let mut ld_workspace = Mat::<f64>::new();
+    let mut contrib_buffer = Mat::<S>::new();
+    let mut ld_workspace = Mat::<S>::new();
     let mut frontal_row_indices = Vec::<usize>::with_capacity(max_front);
     let mut delayed_cols_buf = Vec::<usize>::new();
 
@@ -1623,11 +1625,11 @@ fn factor_small_leaf_subtree(
         let zero_start = std::time::Instant::now();
 
         if m > l_storage.nrows() || k > l_storage.ncols() {
-            l_storage = Mat::zeros(m, k.max(l_storage.ncols()));
+            l_storage = Mat::<S>::zeros(m, k.max(l_storage.ncols()));
         }
         // Zero only the m×k rectangle (smaller than m×m for NFS nodes)
         for j in 0..k {
-            l_storage.col_as_slice_mut(j)[0..m].fill(0.0);
+            l_storage.col_as_slice_mut(j)[0..m].fill(zero());
         }
 
         #[cfg(feature = "diagnostic")]
@@ -1660,13 +1662,13 @@ fn factor_small_leaf_subtree(
         let has_nfs = nfs > 0 && sn.parent.is_some();
         if has_nfs {
             if contrib_buffer.nrows() < nfs || contrib_buffer.ncols() < nfs {
-                contrib_buffer = Mat::zeros(
+                contrib_buffer = Mat::<S>::zeros(
                     nfs.max(contrib_buffer.nrows()),
                     nfs.max(contrib_buffer.ncols()),
                 );
             }
             for j in 0..nfs {
-                contrib_buffer.col_as_slice_mut(j)[0..nfs].fill(0.0);
+                contrib_buffer.col_as_slice_mut(j)[0..nfs].fill(zero());
             }
         }
 
@@ -1772,7 +1774,7 @@ fn factor_small_leaf_subtree(
                         let lj = global_to_local[gj];
                         debug_assert!(lj != NOT_IN_FRONT, "child col {} not in parent", gj);
                         let val = cb.data[(i, j)];
-                        if val != 0.0 {
+                        if val != zero() {
                             let (li, lj) = if li >= lj { (li, lj) } else { (lj, li) };
                             if lj < k {
                                 // FS column → l_storage
@@ -1817,7 +1819,7 @@ fn factor_small_leaf_subtree(
             if contrib_buffer.nrows() < m || contrib_buffer.ncols() < m {
                 // Grow if delayed columns expanded the need
                 let new_size = m.max(contrib_buffer.nrows());
-                let mut new_buf = Mat::zeros(new_size, new_size);
+                let mut new_buf = Mat::<S>::zeros(new_size, new_size);
                 // Preserve NFS×NFS data already assembled
                 if nfs > 0 {
                     for j in 0..nfs {
@@ -1957,7 +1959,7 @@ fn factor_small_leaf_subtree(
 fn factor_tree_levelset(
     supernodes: &[SupernodeInfo],
     children: &[Vec<usize>],
-    matrix: &SparseColMat<usize, f64>,
+    matrix: &SparseColMat<usize, S>,
     perm_fwd: &[usize],
     perm_inv: &[usize],
     options: &AptpOptions,
@@ -2375,7 +2377,7 @@ fn classify_small_leaf_subtrees(
 /// deduplication across ranges.
 fn scatter_original_entries_multi(
     frontal: &mut FrontalMatrix<'_>,
-    matrix: &SparseColMat<usize, f64>,
+    matrix: &SparseColMat<usize, S>,
     perm_fwd: &[usize],
     perm_inv: &[usize],
     global_to_local: &[usize],
@@ -2446,7 +2448,7 @@ pub(crate) fn extend_add(
     parent: &mut FrontalMatrix<'_>,
     child: ContributionBlock,
     global_to_local: &[usize],
-) -> Mat<f64> {
+) -> Mat<S> {
     let cb_size = child.row_indices.len();
     // Column-oriented iteration: for each child column j, scatter the
     // lower-triangle entries (rows j..cb_size) into the parent. Source
@@ -2464,7 +2466,7 @@ pub(crate) fn extend_add(
         let row_indices = &child.row_indices[j..cb_size];
 
         for (&val, &gi) in child_col.iter().zip(row_indices) {
-            if val != 0.0 {
+            if val != zero() {
                 let li = global_to_local[gi];
                 debug_assert!(
                     li != NOT_IN_FRONT,
@@ -2508,7 +2510,7 @@ fn extend_add_mapped(
     parent: &mut FrontalMatrix<'_>,
     child: ContributionBlock,
     ea_row_map: &[u32],
-) -> Mat<f64> {
+) -> Mat<S> {
     let cb_size = child.row_indices.len();
     debug_assert!(
         ea_row_map.len() >= cb_size,
@@ -2550,7 +2552,7 @@ fn extend_add_mapped(
 
 /// Scatter a single extend-add value into the parent's lower triangle.
 #[inline(always)]
-fn ea_scatter_one(parent: &mut MatMut<'_, f64>, li: usize, lj: usize, val: f64) {
+fn ea_scatter_one(parent: &mut MatMut<'_, S>, li: usize, lj: usize, val: S) {
     if li >= lj {
         parent[(li, lj)] += val;
     } else {
@@ -2577,7 +2579,7 @@ fn ea_scatter_one(parent: &mut MatMut<'_, f64>, li: usize, lj: usize, val: f64) 
 /// - `frontal_row_indices`: Global permuted column indices for each local row (length >= m).
 /// - `result`: APTP factorization result (pivot types, permutation, etc.).
 pub(crate) fn extract_front_factors(
-    frontal_data: &Mat<f64>,
+    frontal_data: &Mat<S>,
     m: usize,
     k: usize,
     frontal_row_indices: &[usize],
@@ -2590,10 +2592,10 @@ pub(crate) fn extract_front_factors(
     // Uses per-column slice copies for 1x1 pivot columns where the L entries
     // form a contiguous segment.
     let l11 = if ne > 0 {
-        let mut l = Mat::zeros(ne, ne);
+        let mut l = Mat::<S>::zeros(ne, ne);
         let mut col = 0;
         while col < ne {
-            l[(col, col)] = 1.0; // unit diagonal
+            l[(col, col)] = s(1.0); // unit diagonal
             match result.d.pivot_type(col) {
                 PivotType::OneByOne => {
                     // L entries: rows (col+1)..ne — contiguous in both source and dest
@@ -2605,7 +2607,7 @@ pub(crate) fn extract_front_factors(
                     col += 1;
                 }
                 PivotType::TwoByTwo { partner } if partner > col => {
-                    l[(col + 1, col + 1)] = 1.0; // unit diagonal for partner
+                    l[(col + 1, col + 1)] = s(1.0); // unit diagonal for partner
                     // a[(col+1, col)] is D off-diagonal, skip it
                     // L entries for both columns start at row col+2
                     let n_entries = ne - (col + 2);
@@ -2629,7 +2631,7 @@ pub(crate) fn extract_front_factors(
         }
         l
     } else {
-        Mat::zeros(0, 0)
+        Mat::<S>::zeros(0, 0)
     };
 
     // Build truncated D11 (first ne pivots from result.d)
@@ -2669,14 +2671,14 @@ pub(crate) fn extract_front_factors(
     // These two functions MUST be consistent in their row treatment.
     let r = m - ne;
     let l21 = if ne > 0 && r > 0 {
-        let mut l = Mat::zeros(r, ne);
+        let mut l = Mat::<S>::zeros(r, ne);
         for j in 0..ne {
             let src = &frontal_data.col_as_slice(j)[ne..m];
             l.col_as_slice_mut(j)[..r].copy_from_slice(src);
         }
         l
     } else {
-        Mat::zeros(r, ne)
+        Mat::<S>::zeros(r, ne)
     };
 
     // Local permutation (maps factored position to original front-local column)
@@ -2737,12 +2739,12 @@ pub(crate) fn extract_front_factors(
 ///   in `[0..nfs, 0..nfs]` (from deferred GEMM). Moved in; becomes the
 ///   `ContributionBlock.data`.
 pub(crate) fn extract_contribution(
-    frontal_data: &Mat<f64>,
+    frontal_data: &Mat<S>,
     m: usize,
     k: usize,
     frontal_row_indices: &[usize],
     result: &AptpFactorResult,
-    mut contrib_buffer: Mat<f64>,
+    mut contrib_buffer: Mat<S>,
 ) -> ContributionBlock {
     let ne = result.num_eliminated;
     let size = m - ne;
@@ -2758,7 +2760,7 @@ pub(crate) fn extract_contribution(
         //
         // Strategy: allocate a new buffer of the correct size, copy delayed regions
         // from workspace, and NFS×NFS from contrib_buffer.
-        let mut data = Mat::zeros(size, size);
+        let mut data = Mat::<S>::zeros(size, size);
 
         // Copy delayed × delayed from workspace: frontal_data[ne..k, ne..k]
         // These positions are in the APTP-permuted order. The delayed columns

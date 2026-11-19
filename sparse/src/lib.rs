@@ -167,6 +167,7 @@ use serde::{Deserialize, Serialize};
 pub mod error;
 pub mod io;
 pub mod ordering;
+pub mod scalar;
 pub mod symmetric;
 pub mod validate;
 

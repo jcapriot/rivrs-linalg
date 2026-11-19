@@ -27,6 +27,8 @@ use super::solve::{aptp_solve, aptp_solve_scratch};
 use super::symbolic::AptpSymbolic;
 use crate::error::SparseError;
 use crate::ordering::{match_order_metis, metis_ordering};
+#[allow(unused_imports)]
+use crate::scalar::{Mag, S, s, zero};
 
 /// Fill-reducing ordering strategy.
 ///
@@ -259,14 +261,18 @@ impl SparseLDLT {
     /// matching on the numeric matrix to compute scaling factors and
     /// a fill-reducing ordering. Other orderings delegate to [`analyze`](Self::analyze).
     pub fn analyze_with_matrix(
-        matrix: &SparseColMat<usize, f64>,
+        matrix: &SparseColMat<usize, S>,
         options: &AnalyzeOptions,
     ) -> Result<Self, SparseError> {
         let n = matrix.nrows();
 
         match &options.ordering {
             OrderingStrategy::MatchOrderMetis => {
+                #[cfg(not(feature = "complex"))]
                 let result = match_order_metis(matrix)?;
+                // Complex symmetric: run MC64 on |A| (real), as MUMPS does.
+                #[cfg(feature = "complex")]
+                let result = match_order_metis(&magnitude_matrix(matrix)?)?;
                 let ordering_perm = result.ordering;
                 let symbolic = AptpSymbolic::analyze(
                     matrix.symbolic(),
@@ -295,7 +301,7 @@ impl SparseLDLT {
     /// - `SparseError::DimensionMismatch` if matrix dimensions differ from analysis
     pub fn factor(
         &mut self,
-        matrix: &SparseColMat<usize, f64>,
+        matrix: &SparseColMat<usize, S>,
         options: &FactorOptions,
     ) -> Result<(), SparseError> {
         let aptp_options = AptpOptions {
@@ -334,7 +340,7 @@ impl SparseLDLT {
     /// Equivalent to calling [`factor`](Self::factor) again.
     pub fn refactor(
         &mut self,
-        matrix: &SparseColMat<usize, f64>,
+        matrix: &SparseColMat<usize, S>,
         options: &FactorOptions,
     ) -> Result<(), SparseError> {
         self.factor(matrix, options)
@@ -350,10 +356,10 @@ impl SparseLDLT {
     /// - `SparseError::DimensionMismatch` if rhs length != matrix dimension
     pub fn solve(
         &self,
-        rhs: &Col<f64>,
+        rhs: &Col<S>,
         stack: &mut MemStack,
         par: Par,
-    ) -> Result<Col<f64>, SparseError> {
+    ) -> Result<Col<S>, SparseError> {
         let mut result = rhs.to_owned();
         self.solve_in_place(&mut result, stack, par)?;
         Ok(result)
@@ -369,7 +375,7 @@ impl SparseLDLT {
     /// - `SparseError::DimensionMismatch` if rhs length != matrix dimension
     pub fn solve_in_place(
         &self,
-        rhs: &mut Col<f64>,
+        rhs: &mut Col<S>,
         stack: &mut MemStack,
         par: Par,
     ) -> Result<(), SparseError> {
@@ -397,7 +403,7 @@ impl SparseLDLT {
 
         // 1. Permute: rhs_perm[new] = rhs[perm_fwd[new]]
         //    perm_fwd[new] = old, so this gathers original RHS into permuted order.
-        let mut rhs_perm = vec![0.0f64; n];
+        let mut rhs_perm = vec![crate::scalar::zero(); n];
         for new in 0..n {
             rhs_perm[new] = rhs[perm_fwd[new]];
         }
@@ -468,10 +474,10 @@ impl SparseLDLT {
     /// assert!((x[0] - 1.0).abs() < 1e-12);
     /// ```
     pub fn solve_full(
-        matrix: &SparseColMat<usize, f64>,
-        rhs: &Col<f64>,
+        matrix: &SparseColMat<usize, S>,
+        rhs: &Col<S>,
         options: &SolverOptions,
-    ) -> Result<Col<f64>, SparseError> {
+    ) -> Result<Col<S>, SparseError> {
         let analyze_opts = AnalyzeOptions {
             ordering: options.ordering.clone(),
         };
@@ -546,4 +552,16 @@ impl SparseLDLT {
     pub fn n(&self) -> usize {
         self.symbolic.nrows()
     }
+}
+
+/// Entry-wise modulus of a complex matrix, for orderings/scalings that need
+/// real weights (MC64 matching).
+#[cfg(feature = "complex")]
+fn magnitude_matrix(matrix: &SparseColMat<usize, S>) -> Result<SparseColMat<usize, f64>, SparseError> {
+    let symbolic = matrix
+        .symbolic()
+        .to_owned()
+        .map_err(|e| SparseError::AnalysisFailure { reason: format!("{e:?}") })?;
+    let vals = matrix.val().iter().map(|v| v.mag()).collect();
+    Ok(SparseColMat::new(symbolic, vals))
 }

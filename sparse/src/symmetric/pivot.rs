@@ -5,6 +5,8 @@
 //! decisions made during the A Posteriori Threshold Pivoting algorithm described
 //! in Hogg, Duff & Lopez (2020), "A New Sparse LDL^T Solver Using A Posteriori
 //! Threshold Pivoting", SIAM J. Sci. Comput. 42(4).
+#[allow(unused_imports)]
+use crate::scalar::{Mag, S, s, zero};
 
 /// Classification of a single column's pivot decision during APTP factorization.
 ///
@@ -47,21 +49,21 @@ pub struct Block2x2 {
     /// Index of the first (lower-indexed) column of the 2x2 block.
     pub first_col: usize,
     /// Top-left element: `D[i, i]`.
-    pub a: f64,
+    pub a: S,
     /// Off-diagonal element: `D[i, i+1] = D[i+1, i]`.
-    pub b: f64,
+    pub b: S,
     /// Bottom-right element: `D[i+1, i+1]`.
-    pub c: f64,
+    pub c: S,
 }
 
 impl Block2x2 {
     /// Determinant of the 2x2 block: `ac - b²`.
-    pub fn determinant(&self) -> f64 {
+    pub fn determinant(&self) -> S {
         self.a * self.c - self.b * self.b
     }
 
     /// Trace of the 2x2 block: `a + c`.
-    pub fn trace(&self) -> f64 {
+    pub fn trace(&self) -> S {
         self.a + self.c
     }
 }

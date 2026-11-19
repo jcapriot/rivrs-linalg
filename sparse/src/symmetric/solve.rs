@@ -32,6 +32,8 @@ use faer::{Accum, Conj, Par};
 use super::numeric::{AptpNumeric, FrontFactors, INTRA_NODE_THRESHOLD};
 use super::symbolic::AptpSymbolic;
 use crate::error::SparseError;
+#[allow(unused_imports)]
+use crate::scalar::{Mag, S, s, zero};
 
 /// Per-supernode triangular solve through the multifrontal factor structure.
 ///
@@ -57,7 +59,7 @@ use crate::error::SparseError;
 pub fn aptp_solve(
     symbolic: &AptpSymbolic,
     numeric: &AptpNumeric,
-    rhs: &mut [f64],
+    rhs: &mut [S],
     _stack: &mut faer::dyn_stack::MemStack,
     par: Par,
 ) -> Result<(), SparseError> {
@@ -82,8 +84,8 @@ pub fn aptp_solve(
     // sequentially, we reuse these buffers. The diagonal solve allocates per-task
     // workspace when parallel.
     let max_size = numeric.stats().max_front_size;
-    let mut work = vec![0.0f64; max_size];
-    let mut work2 = vec![0.0f64; max_size];
+    let mut work = vec![crate::scalar::zero(); max_size];
+    let mut work2 = vec![crate::scalar::zero(); max_size];
 
     // 1. Forward solve (postorder = index order)
     // Sequential: data dependencies through rhs (scatter modifies entries read by later supernodes)
@@ -111,7 +113,7 @@ pub fn aptp_solve(
             .collect();
 
         // Gather all needed rhs values into per-supernode buffers
-        let mut per_sn_values: Vec<Vec<f64>> = tasks
+        let mut per_sn_values: Vec<Vec<S>> = tasks
             .iter()
             .map(|(_, cols, ne)| cols[..*ne].iter().map(|&c| rhs[c]).collect())
             .collect();
@@ -149,7 +151,7 @@ pub fn aptp_solve(
 /// Size is determined by `max_front_size` from factorization stats.
 pub fn aptp_solve_scratch(numeric: &AptpNumeric, rhs_ncols: usize) -> StackReq {
     let max_size = numeric.stats().max_front_size;
-    temp_mat_scratch::<f64>(max_size, rhs_ncols)
+    temp_mat_scratch::<S>(max_size, rhs_ncols)
 }
 
 /// Forward solve for a single supernode.
@@ -160,9 +162,9 @@ pub fn aptp_solve_scratch(numeric: &AptpNumeric, rhs_ncols: usize) -> StackReq {
 /// 4. Scatter: rhs[row_indices[j]] -= (L21 * work)[j]
 pub(crate) fn forward_solve_supernode(
     ff: &FrontFactors,
-    rhs: &mut [f64],
-    work: &mut [f64],
-    work2: &mut [f64],
+    rhs: &mut [S],
+    work: &mut [S],
+    work2: &mut [S],
     par: Par,
 ) {
     let ne = ff.num_eliminated();
@@ -206,7 +208,7 @@ pub(crate) fn forward_solve_supernode(
     if r > 0 {
         let local = MatRef::from_column_major_slice(&work[..ne], ne, 1);
         let tmp = &mut work2[..r];
-        tmp.fill(0.0);
+        tmp.fill(zero());
         let mut tmp_mat = MatMut::from_column_major_slice_mut(tmp, r, 1);
         matmul_with_conj(
             tmp_mat.as_mut(),
@@ -215,7 +217,7 @@ pub(crate) fn forward_solve_supernode(
             Conj::No,
             local,
             Conj::No,
-            1.0,
+            s(1.0),
             effective_par,
         );
         for j in 0..r {
@@ -229,7 +231,7 @@ pub(crate) fn forward_solve_supernode(
 /// 1. Gather rhs[col_indices[i]] → work buffer
 /// 2. D11.solve_in_place(work) (handles 1x1, 2x2, and zero pivots)
 /// 3. Write work → rhs[col_indices[i]]
-pub(crate) fn diagonal_solve_supernode(ff: &FrontFactors, rhs: &mut [f64], work: &mut [f64]) {
+pub(crate) fn diagonal_solve_supernode(ff: &FrontFactors, rhs: &mut [S], work: &mut [S]) {
     let ne = ff.num_eliminated();
     if ne == 0 {
         return;
@@ -260,9 +262,9 @@ pub(crate) fn diagonal_solve_supernode(ff: &FrontFactors, rhs: &mut [f64], work:
 /// 5. Write work → rhs[col_indices[i]]
 pub(crate) fn backward_solve_supernode(
     ff: &FrontFactors,
-    rhs: &mut [f64],
-    work: &mut [f64],
-    work2: &mut [f64],
+    rhs: &mut [S],
+    work: &mut [S],
+    work2: &mut [S],
     par: Par,
 ) {
     let ne = ff.num_eliminated();
@@ -303,7 +305,7 @@ pub(crate) fn backward_solve_supernode(
             Conj::No,
             tmp,
             Conj::No,
-            -1.0,
+            s(-1.0),
             effective_par,
         );
     }

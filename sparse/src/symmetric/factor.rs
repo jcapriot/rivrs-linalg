@@ -45,6 +45,8 @@ use super::diagonal::MixedDiagonal;
 use super::pivot::{Block2x2, PivotType};
 use crate::error::SparseError;
 use crate::ordering::perm_from_forward;
+#[allow(unused_imports)]
+use crate::scalar::{Mag, S, s, zero};
 
 /// Bunch-Kaufman α parameter for 2×2 determinant condition: |det| ≥ α × |a₂₁|².
 const BUNCH_KAUFMAN_ALPHA: f64 = 0.5;
@@ -177,13 +179,13 @@ pub enum FailedPivotMethod {
 /// - SPRAL `NumericSubtree.hxx:75-81`: per-thread workspace pattern
 pub(crate) struct AptpKernelWorkspace {
     /// Block backup for restore-on-failure, max_front × inner_block_size.
-    backup: Mat<f64>,
+    backup: Mat<S>,
     /// Copy of L11 block for TRSM aliasing avoidance, inner_block_size × inner_block_size.
-    l11_buf: Mat<f64>,
+    l11_buf: Mat<S>,
     /// L·D product workspace for update_trailing/cross_terms, max_front × inner_block_size.
-    ld_buf: Mat<f64>,
+    ld_buf: Mat<S>,
     /// Copy buffer for L21/L_panel aliasing avoidance, max_front × inner_block_size.
-    copy_buf: Mat<f64>,
+    copy_buf: Mat<S>,
 }
 
 impl AptpKernelWorkspace {
@@ -191,10 +193,10 @@ impl AptpKernelWorkspace {
     /// inner block dimensions.
     pub(crate) fn new(max_front: usize, inner_block_size: usize) -> Self {
         Self {
-            backup: Mat::zeros(max_front, inner_block_size),
-            l11_buf: Mat::zeros(inner_block_size, inner_block_size),
-            ld_buf: Mat::zeros(max_front, inner_block_size),
-            copy_buf: Mat::zeros(max_front, inner_block_size),
+            backup: Mat::<S>::zeros(max_front, inner_block_size),
+            l11_buf: Mat::<S>::zeros(inner_block_size, inner_block_size),
+            ld_buf: Mat::<S>::zeros(max_front, inner_block_size),
+            copy_buf: Mat::<S>::zeros(max_front, inner_block_size),
         }
     }
 }
@@ -227,7 +229,7 @@ pub struct AptpFactorResult {
 #[derive(Debug)]
 pub struct AptpFactorization {
     /// Unit lower triangular factor (extracted from in-place result).
-    pub l: Mat<f64>,
+    pub l: Mat<S>,
     /// Block diagonal D factor with mixed 1x1/2x2 blocks.
     pub d: MixedDiagonal,
     /// Column permutation as faer Perm type.
@@ -299,7 +301,7 @@ pub struct AptpPivotRecord {
 /// Implements the APTP strategy from Duff, Hogg & Lopez (2020).
 /// Single-level (column-by-column) variant.
 pub fn aptp_factor_in_place(
-    mut a: MatMut<'_, f64>,
+    mut a: MatMut<'_, S>,
     num_fully_summed: usize,
     options: &AptpOptions,
 ) -> Result<AptpFactorResult, SparseError> {
@@ -415,7 +417,7 @@ pub fn aptp_factor_in_place(
 /// matrices in multifrontal factorization, use
 /// [`aptp_factor_in_place`] directly to avoid the copy.
 pub fn aptp_factor(
-    a: MatRef<'_, f64>,
+    a: MatRef<'_, S>,
     options: &AptpOptions,
 ) -> Result<AptpFactorization, SparseError> {
     let n = a.nrows();
@@ -449,7 +451,7 @@ pub fn aptp_factor(
 /// This performs a simultaneous row-and-column permutation on a symmetric
 /// matrix stored in the lower triangle, so that the data at position i
 /// moves to position j and vice versa.
-fn swap_symmetric(mut a: MatMut<'_, f64>, i: usize, j: usize) {
+fn swap_symmetric(mut a: MatMut<'_, S>, i: usize, j: usize) {
     let m = a.nrows();
     swap_symmetric_block(a.rb_mut(), i, j, 0, m);
 }
@@ -463,7 +465,7 @@ fn swap_symmetric(mut a: MatMut<'_, f64>, i: usize, j: usize) {
 /// (0..col_start) and panel rows (row_limit..m) untouched.
 // SPRAL Equivalent: `swap_cols(p, t, BLOCK_SIZE, a, lda, ...)` in `block_ldlt.hxx:68` (BSD-3).
 fn swap_symmetric_block(
-    mut a: MatMut<'_, f64>,
+    mut a: MatMut<'_, S>,
     i: usize,
     j: usize,
     col_start: usize,
@@ -507,14 +509,14 @@ fn swap_symmetric_block(
 /// Rank-1 Schur complement update after eliminating a 1x1 pivot at column `col`.
 #[cfg(test)]
 #[allow(dead_code)] // Used by complete_pivoting_factor (also #[cfg(test)])
-fn update_schur_1x1(mut a: MatMut<'_, f64>, col: usize, d_value: f64) {
+fn update_schur_1x1(mut a: MatMut<'_, S>, col: usize, d_value: f64) {
     let m = a.nrows();
     let n_trail = m - col - 1;
     if n_trail == 0 {
         return;
     }
 
-    let l_col: Vec<f64> = (0..n_trail).map(|i| a[(col + 1 + i, col)]).collect();
+    let l_col: Vec<S> = (0..n_trail).map(|i| a[(col + 1 + i, col)]).collect();
 
     for j in 0..n_trail {
         let ldlj = l_col[j] * d_value;
@@ -528,7 +530,7 @@ fn update_schur_1x1(mut a: MatMut<'_, f64>, col: usize, d_value: f64) {
 /// Rank-2 Schur complement update after eliminating a 2x2 pivot.
 #[cfg(test)]
 #[allow(dead_code)] // Used by complete_pivoting_factor (also #[cfg(test)])
-fn update_schur_2x2(mut a: MatMut<'_, f64>, col: usize, partner: usize, block: &Block2x2) {
+fn update_schur_2x2(mut a: MatMut<'_, S>, col: usize, partner: usize, block: &Block2x2) {
     let m = a.nrows();
     let start = col.max(partner) + 1;
     let n_trail = m - start;
@@ -536,8 +538,8 @@ fn update_schur_2x2(mut a: MatMut<'_, f64>, col: usize, partner: usize, block: &
         return;
     }
 
-    let l1: Vec<f64> = (0..n_trail).map(|i| a[(start + i, col)]).collect();
-    let l2: Vec<f64> = (0..n_trail).map(|i| a[(start + i, partner)]).collect();
+    let l1: Vec<S> = (0..n_trail).map(|i| a[(start + i, col)]).collect();
+    let l2: Vec<S> = (0..n_trail).map(|i| a[(start + i, partner)]).collect();
 
     let d_a = block.a;
     let d_b = block.b;
@@ -559,12 +561,12 @@ fn update_schur_2x2(mut a: MatMut<'_, f64>, col: usize, partner: usize, block: &
 /// Uses the D factor to identify 2x2 pivot blocks, where `a[(k+1, k)]`
 /// contains the D off-diagonal (not an L entry). For 2x2 pivots at
 /// positions (k, k+1), L entries start at row k+2.
-fn extract_l(a: MatRef<'_, f64>, d: &MixedDiagonal, num_eliminated: usize) -> Mat<f64> {
+fn extract_l(a: MatRef<'_, S>, d: &MixedDiagonal, num_eliminated: usize) -> Mat<S> {
     let n = a.nrows();
-    let mut l = Mat::zeros(n, n);
+    let mut l = Mat::<S>::zeros(n, n);
 
     for i in 0..n {
-        l[(i, i)] = 1.0;
+        l[(i, i)] = s(1.0);
     }
 
     let mut col = 0;
@@ -616,7 +618,7 @@ fn extract_l(a: MatRef<'_, f64>, d: &MixedDiagonal, num_eliminated: usize) -> Ma
 /// - The Schur complement is updated in-place in the trailing submatrix
 // SPRAL Equivalent: `block_ldlt()` in `spral/src/ssids/cpu/kernels/ldlt_app.cxx` (BSD-3).
 #[cfg(test)]
-fn complete_pivoting_factor(mut a: MatMut<'_, f64>, small: f64) -> AptpFactorResult {
+fn complete_pivoting_factor(mut a: MatMut<'_, S>, small: f64) -> AptpFactorResult {
     let n = a.nrows();
     debug_assert_eq!(
         n,
@@ -639,7 +641,7 @@ fn complete_pivoting_factor(mut a: MatMut<'_, f64>, small: f64) -> AptpFactorRes
         let mut max_col = k;
         for j in k..n {
             for i in j..n {
-                let v = a[(i, j)].abs();
+                let v = a[(i, j)].mag();
                 if v > max_val {
                     max_val = v;
                     max_row = i;
@@ -680,7 +682,7 @@ fn complete_pivoting_factor(mut a: MatMut<'_, f64>, small: f64) -> AptpFactorRes
             for i in (k + 1)..n {
                 let l_ik = a[(i, k)] * inv_d;
                 a[(i, k)] = l_ik;
-                let abs_l = l_ik.abs();
+                let abs_l = l_ik.mag();
                 if abs_l > max_l {
                     max_l = abs_l;
                 }
@@ -718,7 +720,7 @@ fn complete_pivoting_factor(mut a: MatMut<'_, f64>, small: f64) -> AptpFactorRes
                 // Only one column left, must use 1×1 (shouldn't normally reach here
                 // since max_row == max_col for single element, but guard anyway)
                 let d_kk = a[(k, k)];
-                if d_kk.abs() < small {
+                if d_kk.mag() < small {
                     stats.num_delayed += 1;
                     pivot_log.push(AptpPivotRecord {
                         col: col_order[k],
@@ -738,7 +740,7 @@ fn complete_pivoting_factor(mut a: MatMut<'_, f64>, small: f64) -> AptpFactorRes
                 continue;
             }
 
-            if delta.abs() >= BUNCH_KAUFMAN_ALPHA * a_tm * a_tm {
+            if delta.mag() >= BUNCH_KAUFMAN_ALPHA * a_tm.mag() * a_tm.mag() {
                 // 2×2 pivot using (t, m)
                 // Swap m → k and t → k+1
                 if m != k {
@@ -775,11 +777,11 @@ fn complete_pivoting_factor(mut a: MatMut<'_, f64>, small: f64) -> AptpFactorRes
                     let l_i2 = (ai2 * a11 - ai1 * a21) * inv_det;
                     a[(i, k)] = l_i1;
                     a[(i, k + 1)] = l_i2;
-                    if l_i1.abs() > max_l {
-                        max_l = l_i1.abs();
+                    if l_i1.mag() > max_l {
+                        max_l = l_i1.mag();
                     }
-                    if l_i2.abs() > max_l {
-                        max_l = l_i2.abs();
+                    if l_i2.mag() > max_l {
+                        max_l = l_i2.mag();
                     }
                 }
 
@@ -810,7 +812,7 @@ fn complete_pivoting_factor(mut a: MatMut<'_, f64>, small: f64) -> AptpFactorRes
                 k += 2;
             } else {
                 // Failed 2×2 determinant condition → use 1×1 on max(|a_mm|, |a_tt|)
-                let pivot_pos = if a_mm.abs() >= a_tt.abs() { m } else { t };
+                let pivot_pos = if a_mm.mag() >= a_tt.mag() { m } else { t };
                 if pivot_pos != k {
                     swap_symmetric(a.rb_mut(), k, pivot_pos);
                     col_order.swap(k, pivot_pos);
@@ -823,7 +825,7 @@ fn complete_pivoting_factor(mut a: MatMut<'_, f64>, small: f64) -> AptpFactorRes
                 for i in (k + 1)..n {
                     let l_ik = a[(i, k)] * inv_d;
                     a[(i, k)] = l_ik;
-                    let abs_l = l_ik.abs();
+                    let abs_l = l_ik.mag();
                     if abs_l > max_l {
                         max_l = abs_l;
                     }
@@ -889,7 +891,7 @@ fn complete_pivoting_factor(mut a: MatMut<'_, f64>, small: f64) -> AptpFactorRes
 /// - `pivot_log`: per-pivot diagnostic records
 // SPRAL Equivalent: `block_ldlt()` in `spral/src/ssids/cpu/kernels/block_ldlt.hxx` (BSD-3).
 fn factor_block_diagonal(
-    mut a: MatMut<'_, f64>,
+    mut a: MatMut<'_, S>,
     col_start: usize,
     block_size: usize,
     small: f64,
@@ -920,7 +922,7 @@ fn factor_block_diagonal(
         let mut max_col = cur;
         for j in cur..search_end {
             for i in j..search_end {
-                let v = a[(i, j)].abs();
+                let v = a[(i, j)].mag();
                 if v > max_val {
                     max_val = v;
                     max_row = i;
@@ -960,7 +962,7 @@ fn factor_block_diagonal(
             for i in (cur + 1)..block_end {
                 let l_ik = a[(i, cur)] * inv_d;
                 a[(i, cur)] = l_ik;
-                let abs_l = l_ik.abs();
+                let abs_l = l_ik.mag();
                 if abs_l > max_l {
                     max_l = abs_l;
                 }
@@ -971,7 +973,8 @@ fn factor_block_diagonal(
                 let l_j = a[(j, cur)];
                 let ldl_j = l_j * d_kk;
                 for i in j..block_end {
-                    a[(i, j)] -= a[(i, cur)] * ldl_j;
+                    let __v = a[(i, cur)] * ldl_j;
+                    a[(i, j)] -= __v;
                 }
             }
 
@@ -999,13 +1002,13 @@ fn factor_block_diagonal(
 
             if remaining < 2 {
                 // Only one column left, use 1×1 on max diagonal
-                let pivot_pos = if a_mm.abs() >= a_tt.abs() { m_idx } else { t };
+                let pivot_pos = if a_mm.mag() >= a_tt.mag() { m_idx } else { t };
                 if pivot_pos != cur {
                     swap_symmetric_block(a.rb_mut(), cur, pivot_pos, col_start, row_limit);
                     local_perm.swap(k, pivot_pos - col_start);
                 }
                 let d_kk = a[(cur, cur)];
-                if d_kk.abs() < small {
+                if d_kk.mag() < small {
                     stats.num_delayed += 1;
                     pivot_log.push(AptpPivotRecord {
                         col: local_perm[k],
@@ -1025,7 +1028,7 @@ fn factor_block_diagonal(
                 continue;
             }
 
-            if delta.abs() >= BUNCH_KAUFMAN_ALPHA * a_tm * a_tm {
+            if delta.mag() >= BUNCH_KAUFMAN_ALPHA * a_tm.mag() * a_tm.mag() {
                 // 2×2 pivot: swap m_idx → cur, t → cur+1
                 if m_idx != cur {
                     swap_symmetric_block(a.rb_mut(), cur, m_idx, col_start, row_limit);
@@ -1060,11 +1063,11 @@ fn factor_block_diagonal(
                     let l_i2 = (ai2 * a11 - ai1 * a21) * inv_det;
                     a[(i, cur)] = l_i1;
                     a[(i, cur + 1)] = l_i2;
-                    if l_i1.abs() > max_l {
-                        max_l = l_i1.abs();
+                    if l_i1.mag() > max_l {
+                        max_l = l_i1.mag();
                     }
-                    if l_i2.abs() > max_l {
-                        max_l = l_i2.abs();
+                    if l_i2.mag() > max_l {
+                        max_l = l_i2.mag();
                     }
                 }
 
@@ -1105,7 +1108,7 @@ fn factor_block_diagonal(
                 k += 2;
             } else {
                 // Failed Δ → 1×1 on max diagonal
-                let pivot_pos = if a_mm.abs() >= a_tt.abs() { m_idx } else { t };
+                let pivot_pos = if a_mm.mag() >= a_tt.mag() { m_idx } else { t };
                 if pivot_pos != cur {
                     swap_symmetric_block(a.rb_mut(), cur, pivot_pos, col_start, row_limit);
                     local_perm.swap(k, pivot_pos - col_start);
@@ -1118,7 +1121,7 @@ fn factor_block_diagonal(
                 for i in (cur + 1)..block_end {
                     let l_ik = a[(i, cur)] * inv_d;
                     a[(i, cur)] = l_ik;
-                    let abs_l = l_ik.abs();
+                    let abs_l = l_ik.mag();
                     if abs_l > max_l {
                         max_l = abs_l;
                     }
@@ -1128,7 +1131,8 @@ fn factor_block_diagonal(
                     let l_j = a[(j, cur)];
                     let ldl_j = l_j * d_kk;
                     for i in j..block_end {
-                        a[(i, j)] -= a[(i, cur)] * ldl_j;
+                        let __v = a[(i, cur)] * ldl_j;
+                        a[(i, j)] -= __v;
                     }
                 }
 
@@ -1181,18 +1185,18 @@ fn adjust_for_2x2_boundary(effective_nelim: usize, d: &MixedDiagonal) -> usize {
 /// factoring, so it can be restored if the Apply step's threshold check
 /// reduces nelim.
 struct BlockBackup<'a> {
-    data: MatMut<'a, f64>,
+    data: MatMut<'a, S>,
 }
 
 impl<'a> BlockBackup<'a> {
     /// Create a backup of the block column starting at `col_start` with `block_cols` columns.
     /// Backs up `a[col_start.., col_start..col_start+block_cols]` into the provided buffer.
     fn create(
-        a: MatRef<'_, f64>,
+        a: MatRef<'_, S>,
         col_start: usize,
         block_cols: usize,
         m: usize,
-        buf: &'a mut Mat<f64>,
+        buf: &'a mut Mat<S>,
     ) -> Self {
         let rows = m - col_start;
         let mut data = buf.as_mut().submatrix_mut(0, 0, rows, block_cols);
@@ -1208,7 +1212,7 @@ impl<'a> BlockBackup<'a> {
     /// Columns 0..nelim are left untouched (successfully factored).
     fn restore_failed(
         &self,
-        mut a: MatMut<'_, f64>,
+        mut a: MatMut<'_, S>,
         col_start: usize,
         nelim: usize,
         block_cols: usize,
@@ -1236,7 +1240,7 @@ impl<'a> BlockBackup<'a> {
     // SPRAL Equivalent: `CopyBackup::restore_part_with_sym_perm` (`ldlt_app.cxx:562-574`) (BSD-3).
     fn restore_diagonal_with_perm(
         &self,
-        mut a: MatMut<'_, f64>,
+        mut a: MatMut<'_, S>,
         col_start: usize,
         nelim: usize,
         block_cols: usize,
@@ -1293,7 +1297,7 @@ impl<'a> BlockBackup<'a> {
 /// 3. Scan L21 column-by-column; find first column where any entry exceeds 1/threshold
 #[allow(clippy::too_many_arguments)]
 fn apply_and_check(
-    mut a: MatMut<'_, f64>,
+    mut a: MatMut<'_, S>,
     col_start: usize,
     block_nelim: usize,
     block_cols: usize,
@@ -1301,7 +1305,7 @@ fn apply_and_check(
     d: &MixedDiagonal,
     threshold: f64,
     par: Par,
-    l11_buf: &mut Mat<f64>,
+    l11_buf: &mut Mat<S>,
 ) -> usize {
     if block_nelim == 0 {
         return 0;
@@ -1387,7 +1391,7 @@ fn apply_and_check(
                 break;
             }
             for i in 0..panel_rows {
-                if a[(panel_start + i, col_start + c)].abs() >= stability_bound {
+                if a[(panel_start + i, col_start + c)].mag() >= stability_bound {
                     col_ok = false;
                     break;
                 }
@@ -1416,7 +1420,7 @@ fn apply_and_check(
 /// Uses explicit W = L21 * D11 workspace, then A -= W * L21^T (GEMM).
 #[allow(clippy::too_many_arguments)]
 fn update_trailing(
-    mut a: MatMut<'_, f64>,
+    mut a: MatMut<'_, S>,
     col_start: usize,
     nelim: usize,
     block_cols: usize,
@@ -1424,8 +1428,8 @@ fn update_trailing(
     num_fully_summed: usize,
     d: &MixedDiagonal,
     par: Par,
-    ld_buf: &mut Mat<f64>,
-    copy_buf: &mut Mat<f64>,
+    ld_buf: &mut Mat<S>,
+    copy_buf: &mut Mat<S>,
 ) {
     if nelim == 0 {
         return;
@@ -1498,7 +1502,7 @@ fn update_trailing(
             l21_fs.transpose(),
             BlockStructure::Rectangular,
             Conj::No,
-            -1.0,
+            s(-1.0),
             par,
         );
     }
@@ -1517,7 +1521,7 @@ fn update_trailing(
             Conj::No,
             l21_fs.transpose(),
             Conj::No,
-            -1.0,
+            s(-1.0),
             par,
         );
     }
@@ -1533,7 +1537,7 @@ fn update_trailing(
 ///
 // SPRAL Equivalent: `calcLD<OP_N>` in `spral/src/ssids/cpu/kernels/calc_ld.hxx:41+` (BSD-3).
 /// Writes into `dst[0..nrows, 0..nelim]`. The destination is overwritten, not zeroed first.
-fn compute_ld_into(l: MatRef<'_, f64>, d: &MixedDiagonal, nelim: usize, mut dst: MatMut<'_, f64>) {
+fn compute_ld_into(l: MatRef<'_, S>, d: &MixedDiagonal, nelim: usize, mut dst: MatMut<'_, S>) {
     let nrows = l.nrows();
     let mut col = 0;
     while col < nelim {
@@ -1588,13 +1592,13 @@ fn compute_ld_into(l: MatRef<'_, f64>, d: &MixedDiagonal, nelim: usize, mut dst:
 /// - Liu (1992), Section 4: Schur complement in multifrontal method
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_contribution_gemm(
-    frontal_data: &Mat<f64>,
+    frontal_data: &Mat<S>,
     num_fully_summed: usize,
     num_eliminated: usize,
     m: usize,
     d: &MixedDiagonal,
-    contrib_buffer: &mut Mat<f64>,
-    ld_workspace: &mut Mat<f64>,
+    contrib_buffer: &mut Mat<S>,
+    ld_workspace: &mut Mat<S>,
     par: Par,
 ) {
     let p = num_fully_summed;
@@ -1629,10 +1633,10 @@ pub(crate) fn compute_contribution_gemm(
     // Use caller-provided workspace to avoid per-supernode allocation.
     // Resize if needed (rare: delayed cascades may exceed initial estimate).
     if ld_workspace.nrows() < nfs || ld_workspace.ncols() < ne {
-        *ld_workspace = Mat::zeros(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
+        *ld_workspace = Mat::<S>::zeros(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
     }
     let mut w = ld_workspace.as_mut().submatrix_mut(0, 0, nfs, ne);
-    w.fill(0.0);
+    w.fill(zero());
     compute_ld_into(l21_nfs, d, ne, w.rb_mut());
 
     // Step 3: Symmetric rank-ne update: contrib -= W * L21_NFS^T (lower triangle)
@@ -1646,7 +1650,7 @@ pub(crate) fn compute_contribution_gemm(
         l21_nfs.transpose(),
         BlockStructure::Rectangular,
         Conj::No,
-        -1.0,
+        s(-1.0),
         par,
     );
 }
@@ -1667,14 +1671,14 @@ pub(crate) fn compute_contribution_gemm(
 // SPRAL Equivalent: `Block::update` with rfrom/cfrom skip (`ldlt_app.cxx:1082-1153`) (BSD-3).
 #[allow(clippy::too_many_arguments)]
 fn update_cross_terms(
-    mut a: MatMut<'_, f64>,
+    mut a: MatMut<'_, S>,
     col_start: usize,
     nelim: usize,
     block_cols: usize,
     m: usize,
     d: &MixedDiagonal,
-    ld_buf: &mut Mat<f64>,
-    copy_buf: &mut Mat<f64>,
+    ld_buf: &mut Mat<S>,
+    copy_buf: &mut Mat<S>,
 ) {
     if nelim == 0 || nelim >= block_cols {
         return; // No failed columns → no cross-term updates
@@ -1712,7 +1716,7 @@ fn update_cross_terms(
         let w_blk = ld_buf.as_ref().submatrix(0, 0, n_failed, nelim);
         for j in 0..n_failed {
             for i in j..n_failed {
-                let mut sum = 0.0;
+                let mut sum = zero();
                 for c in 0..nelim {
                     sum += w_blk[(i, c)] * l_blk[(j, c)];
                 }
@@ -1755,7 +1759,7 @@ fn update_cross_terms(
 
         for j in 0..n_failed {
             for i in 0..trailing_size {
-                let mut sum = 0.0;
+                let mut sum = zero();
                 for c in 0..nelim {
                     sum += w_panel[(i, c)] * l_blk[(j, c)];
                 }
@@ -1809,7 +1813,7 @@ fn update_cross_terms(
 /// - SPRAL: `run_elim_pivoted_notasks` in `ldlt_app.cxx:1585-1713`
 /// - Duff, Hogg & Lopez (2020), Algorithm 3.1
 fn factor_inner(
-    mut a: MatMut<'_, f64>,
+    mut a: MatMut<'_, S>,
     num_fully_summed: usize,
     nfs_boundary: usize,
     options: &AptpOptions,
@@ -1830,8 +1834,8 @@ fn factor_inner(
 
     // Pre-allocated buffers reused across block iterations to avoid
     // per-block allocations in the hot loop.
-    let mut panel_perm_buf = vec![0.0f64; ib];
-    let mut row_perm_buf = vec![0.0f64; ib];
+    let mut panel_perm_buf = vec![crate::scalar::zero(); ib];
+    let mut row_perm_buf = vec![crate::scalar::zero(); ib];
     let mut col_order_buf = vec![0usize; ib];
 
     // BLAS-3 Factor/Apply/Update loop with ib-sized inner blocks.
@@ -1905,7 +1909,7 @@ fn factor_inner(
             while bc < block_nelim {
                 match block_d.pivot_type(bc) {
                     PivotType::TwoByTwo { partner } if partner > bc => {
-                        a[(k + bc + 1, k + bc)] = 0.0;
+                        a[(k + bc + 1, k + bc)] = zero();
                         bc += 2;
                     }
                     _ => {
@@ -2029,7 +2033,7 @@ fn factor_inner(
         // Check panel L entries for max_l_entry (passed columns only)
         for c in 0..nelim {
             for i in panel_start..m {
-                let v = a[(i, k + c)].abs();
+                let v = a[(i, k + c)].mag();
                 if v > stats.max_l_entry {
                     stats.max_l_entry = v;
                 }
@@ -2106,7 +2110,7 @@ fn factor_inner(
 /// # References
 /// - Duff, Hogg & Lopez (2020), Algorithm 3.1: two-level outer loop
 fn two_level_factor(
-    mut a: MatMut<'_, f64>,
+    mut a: MatMut<'_, S>,
     num_fully_summed: usize,
     options: &AptpOptions,
     kernel_ws: &mut AptpKernelWorkspace,
@@ -2160,7 +2164,7 @@ fn two_level_factor(
         // L entries across all blocks.
         if col_start > 0 {
             let block_perm = &block_result.perm;
-            let mut temp = vec![0.0f64; block_cols];
+            let mut temp = vec![crate::scalar::zero(); block_cols];
             for c in 0..col_start {
                 // Gather: temp[i] = row that ended up at local position i
                 for i in 0..block_cols {
@@ -2266,14 +2270,14 @@ fn two_level_factor(
 /// Returns `Some((a11, a21, a22))` (D values, NOT D^{-1}) on success.
 // SPRAL Equivalent: `test_2x2()` in `spral/src/ssids/cpu/kernels/ldlt_tpp.cxx` (BSD-3).
 fn tpp_test_2x2(
-    a: MatRef<'_, f64>,
+    a: MatRef<'_, S>,
     t: usize,
     p: usize,
     maxt: f64,
     maxp: f64,
     u: f64,
     small: f64,
-) -> Option<(f64, f64, f64)> {
+) -> Option<(S, S, S)> {
     debug_assert!(t < p, "tpp_test_2x2 requires t < p");
 
     let a11 = a[(t, t)];
@@ -2281,7 +2285,7 @@ fn tpp_test_2x2(
     let a22 = a[(p, p)];
 
     // 1. Non-zero pivot block
-    let maxpiv = a11.abs().max(a21.abs()).max(a22.abs());
+    let maxpiv = a11.mag().max(a21.mag()).max(a22.mag());
     if maxpiv < small {
         return None;
     }
@@ -2291,7 +2295,7 @@ fn tpp_test_2x2(
     let detpiv0 = (a11 * detscale) * a22;
     let detpiv1 = (a21 * detscale) * a21;
     let detpiv = detpiv0 - detpiv1;
-    if detpiv.abs() < small.max((detpiv0 / 2.0).abs()).max((detpiv1 / 2.0).abs()) {
+    if detpiv.mag() < small.max((detpiv0 / 2.0).mag()).max((detpiv1 / 2.0).mag()) {
         return None;
     }
 
@@ -2305,8 +2309,8 @@ fn tpp_test_2x2(
         return Some((a11, a21, a22));
     }
 
-    let x1 = d_inv_11.abs() * maxt + d_inv_12.abs() * maxp;
-    let x2 = d_inv_12.abs() * maxt + d_inv_22.abs() * maxp;
+    let x1 = d_inv_11.mag() * maxt + d_inv_12.mag() * maxp;
+    let x2 = d_inv_12.mag() * maxt + d_inv_22.mag() * maxp;
     if u * x1.max(x2) < 1.0 {
         Some((a11, a21, a22))
     } else {
@@ -2333,7 +2337,7 @@ fn tpp_test_2x2(
 /// - Duff, Hogg & Lopez (2020), Section 3: TPP as fallback after APTP
 #[allow(clippy::too_many_arguments)]
 fn tpp_factor(
-    mut a: MatMut<'_, f64>,
+    mut a: MatMut<'_, S>,
     start_col: usize,
     num_fully_summed: usize,
     col_order: &mut [usize],
@@ -2353,7 +2357,7 @@ fn tpp_factor(
         // Check if current column is effectively zero
         if tpp_is_col_small(a.as_ref(), nelim, nelim, m, small) {
             // Zero pivot: record and advance
-            global_d.set_1x1(nelim, 0.0);
+            global_d.set_1x1(nelim, zero());
             stats.num_1x1 += 1;
             pivot_log.push(AptpPivotRecord {
                 col: col_order[nelim],
@@ -2363,7 +2367,7 @@ fn tpp_factor(
             });
             // Zero the column entries
             for r in (nelim + 1)..m {
-                a[(r, nelim)] = 0.0;
+                a[(r, nelim)] = zero();
             }
             nelim += 1;
             continue;
@@ -2379,7 +2383,7 @@ fn tpp_factor(
                     swap_symmetric(a.rb_mut(), p, nelim);
                     col_order.swap(p, nelim);
                 }
-                global_d.set_1x1(nelim, 0.0);
+                global_d.set_1x1(nelim, zero());
                 stats.num_1x1 += 1;
                 pivot_log.push(AptpPivotRecord {
                     col: col_order[nelim],
@@ -2388,7 +2392,7 @@ fn tpp_factor(
                     was_fallback: true,
                 });
                 for r in (nelim + 1)..m {
-                    a[(r, nelim)] = 0.0;
+                    a[(r, nelim)] = zero();
                 }
                 nelim += 1;
                 found = true;
@@ -2454,8 +2458,8 @@ fn tpp_factor(
 
             // Try p as 1x1 pivot
             // maxp should include |a(p, t)| for the off-diagonal contribution
-            let maxp_with_t = maxp.max(tpp_sym_entry(a.as_ref(), p, t).abs());
-            if a[(p, p)].abs() >= u * maxp_with_t {
+            let maxp_with_t = maxp.max(tpp_sym_entry(a.as_ref(), p, t).mag());
+            if a[(p, p)].mag() >= u * maxp_with_t {
                 // Accept 1x1 pivot: swap p→nelim
                 if p != nelim {
                     swap_symmetric(a.rb_mut(), p, nelim);
@@ -2482,7 +2486,7 @@ fn tpp_factor(
         if !found {
             // Last resort: try column nelim as 1x1 (we started searching at nelim+1)
             let maxp = tpp_find_rc_abs_max_exclude(a.as_ref(), nelim, nelim, m, usize::MAX);
-            if a[(nelim, nelim)].abs() >= u * maxp {
+            if a[(nelim, nelim)].mag() >= u * maxp {
                 let max_l = tpp_apply_1x1(a.rb_mut(), nelim, m, n);
 
                 global_d.set_1x1(nelim, a[(nelim, nelim)]);
@@ -2518,7 +2522,7 @@ fn tpp_factor(
 /// Unlike `swap_symmetric` which operates on an m×m square matrix, this limits
 /// column operations to 0..n. Row swaps span the full column range 0..n.
 // SPRAL Equivalent: `swap_cols(col1, col2, m, n, ...)` in `ldlt_tpp.cxx:44-72` (BSD-3).
-fn swap_rect(mut a: MatMut<'_, f64>, i: usize, j: usize) {
+fn swap_rect(mut a: MatMut<'_, S>, i: usize, j: usize) {
     if i == j {
         return;
     }
@@ -2574,7 +2578,7 @@ fn swap_rect(mut a: MatMut<'_, f64>, i: usize, j: usize) {
 /// For row < col with col < n: reads `a[(col, row)]` (symmetric reflection).
 /// Panics if both row and col are >= n (no data stored there).
 #[inline]
-fn tpp_sym_entry(a: MatRef<'_, f64>, row: usize, col: usize) -> f64 {
+fn tpp_sym_entry(a: MatRef<'_, S>, row: usize, col: usize) -> S {
     let n = a.ncols();
     if col < n && row >= col {
         a[(row, col)]
@@ -2592,7 +2596,7 @@ fn tpp_sym_entry(a: MatRef<'_, f64>, row: usize, col: usize) -> f64 {
 /// Works with both square (m×m) and rectangular (m×n, m ≥ n) matrices.
 ///
 /// Returns the maximum absolute L entry.
-fn tpp_apply_1x1(mut a: MatMut<'_, f64>, nelim: usize, m: usize, num_fully_summed: usize) -> f64 {
+fn tpp_apply_1x1(mut a: MatMut<'_, S>, nelim: usize, m: usize, num_fully_summed: usize) -> f64 {
     let d = a[(nelim, nelim)];
     let inv_d = 1.0 / d;
     let p = num_fully_summed;
@@ -2602,7 +2606,7 @@ fn tpp_apply_1x1(mut a: MatMut<'_, f64>, nelim: usize, m: usize, num_fully_summe
     for i in (nelim + 1)..m {
         let l_ik = a[(i, nelim)] * inv_d;
         a[(i, nelim)] = l_ik;
-        max_l = max_l.max(l_ik.abs());
+        max_l = max_l.max(l_ik.mag());
     }
 
     // Rank-1 Schur complement update: only FS columns (< p),
@@ -2611,7 +2615,8 @@ fn tpp_apply_1x1(mut a: MatMut<'_, f64>, nelim: usize, m: usize, num_fully_summe
     for j in (nelim + 1)..schur_col_end {
         let ldlj = a[(j, nelim)] * d;
         for i in j..m {
-            a[(i, j)] -= a[(i, nelim)] * ldlj;
+            let __v = a[(i, nelim)] * ldlj;
+            a[(i, j)] -= __v;
         }
     }
 
@@ -2625,7 +2630,7 @@ fn tpp_apply_1x1(mut a: MatMut<'_, f64>, nelim: usize, m: usize, num_fully_summe
 /// (m×m) and rectangular (m×n, m ≥ n) matrices.
 ///
 /// Returns the maximum absolute L entry.
-fn tpp_apply_2x2(mut a: MatMut<'_, f64>, nelim: usize, m: usize, num_fully_summed: usize) -> f64 {
+fn tpp_apply_2x2(mut a: MatMut<'_, S>, nelim: usize, m: usize, num_fully_summed: usize) -> f64 {
     let a11 = a[(nelim, nelim)];
     let a21 = a[(nelim + 1, nelim)];
     let a22 = a[(nelim + 1, nelim + 1)];
@@ -2643,7 +2648,7 @@ fn tpp_apply_2x2(mut a: MatMut<'_, f64>, nelim: usize, m: usize, num_fully_summe
         let l_i2 = (ai2 * a11 - ai1 * a21) * inv_det;
         a[(i, nelim)] = l_i1;
         a[(i, nelim + 1)] = l_i2;
-        max_l = max_l.max(l_i1.abs()).max(l_i2.abs());
+        max_l = max_l.max(l_i1.mag()).max(l_i2.mag());
     }
 
     // Rank-2 Schur complement update: only FS columns (< p),
@@ -2653,12 +2658,13 @@ fn tpp_apply_2x2(mut a: MatMut<'_, f64>, nelim: usize, m: usize, num_fully_summe
         let wj1 = a[(j, nelim)] * a11 + a[(j, nelim + 1)] * a21;
         let wj2 = a[(j, nelim)] * a21 + a[(j, nelim + 1)] * a22;
         for i in j..m {
-            a[(i, j)] -= a[(i, nelim)] * wj1 + a[(i, nelim + 1)] * wj2;
+            let __v = a[(i, nelim)] * wj1 + a[(i, nelim + 1)] * wj2;
+            a[(i, j)] -= __v;
         }
     }
 
     // Zero D off-diagonal for extract_front_factors convention
-    a[(nelim + 1, nelim)] = 0.0;
+    a[(nelim + 1, nelim)] = zero();
 
     max_l
 }
@@ -2667,18 +2673,18 @@ fn tpp_apply_2x2(mut a: MatMut<'_, f64>, nelim: usize, m: usize, num_fully_summe
 /// smaller than `small` in absolute value. Works with both square (m×m) and
 /// rectangular (m×n, m ≥ n) matrices.
 // SPRAL Equivalent: `check_col_small()` in `spral/src/ssids/cpu/kernels/ldlt_tpp.cxx` (BSD-3).
-fn tpp_is_col_small(a: MatRef<'_, f64>, idx: usize, from: usize, to: usize, small: f64) -> bool {
+fn tpp_is_col_small(a: MatRef<'_, S>, idx: usize, from: usize, to: usize, small: f64) -> bool {
     let n = a.ncols();
     // Row entries: a[(idx, c)] for c < idx (lower triangle: idx > c), limited to ncols
     for c in from..idx.min(n) {
-        if a[(idx, c)].abs() >= small {
+        if a[(idx, c)].mag() >= small {
             return false;
         }
     }
     // Column entries: a[(r, idx)] for r >= idx, if idx < n
     if idx < n {
         for r in idx..to {
-            if a[(r, idx)].abs() >= small {
+            if a[(r, idx)].mag() >= small {
                 return false;
             }
         }
@@ -2689,14 +2695,14 @@ fn tpp_is_col_small(a: MatRef<'_, f64>, idx: usize, from: usize, to: usize, smal
 /// Find the column index with largest absolute entry in row `p`, scanning
 /// columns `from..to`. Works with both square and rectangular storage.
 // SPRAL Equivalent: `find_row_abs_max()` in `spral/src/ssids/cpu/kernels/ldlt_tpp.cxx` (BSD-3).
-fn tpp_find_row_abs_max(a: MatRef<'_, f64>, p: usize, from: usize, to: usize) -> usize {
+fn tpp_find_row_abs_max(a: MatRef<'_, S>, p: usize, from: usize, to: usize) -> usize {
     if from >= to {
         return from;
     }
     let mut best_idx = from;
-    let mut best_val = tpp_sym_entry(a, p, from).abs();
+    let mut best_val = tpp_sym_entry(a, p, from).mag();
     for c in (from + 1)..to {
-        let v = tpp_sym_entry(a, p, c).abs();
+        let v = tpp_sym_entry(a, p, c).mag();
         if v > best_val {
             best_idx = c;
             best_val = v;
@@ -2709,7 +2715,7 @@ fn tpp_find_row_abs_max(a: MatRef<'_, f64>, p: usize, from: usize, to: usize) ->
 /// excluding one index and the diagonal. Works with both square and rectangular storage.
 // SPRAL Equivalent: `find_rc_abs_max_exclude()` in `spral/src/ssids/cpu/kernels/ldlt_tpp.cxx` (BSD-3).
 fn tpp_find_rc_abs_max_exclude(
-    a: MatRef<'_, f64>,
+    a: MatRef<'_, S>,
     col: usize,
     nelim: usize,
     m: usize,
@@ -2722,7 +2728,7 @@ fn tpp_find_rc_abs_max_exclude(
         if c == exclude {
             continue;
         }
-        best = best.max(a[(col, c)].abs());
+        best = best.max(a[(col, c)].mag());
     }
     // Column part: a[(r, col)] for r in col+1..m (if col < n)
     if col < n {
@@ -2730,7 +2736,7 @@ fn tpp_find_rc_abs_max_exclude(
             if r == exclude {
                 continue;
             }
-            best = best.max(a[(r, col)].abs());
+            best = best.max(a[(r, col)].mag());
         }
     }
     best
@@ -2759,7 +2765,7 @@ fn tpp_find_rc_abs_max_exclude(
 // SPRAL Equivalent: `ldlt_tpp_factor(m, n, perm, lcol, ldl, d, ld, ...)`
 // in `spral/src/ssids/cpu/kernels/ldlt_tpp.cxx` (BSD-3).
 pub(super) fn tpp_factor_rect(
-    mut a: MatMut<'_, f64>,
+    mut a: MatMut<'_, S>,
     num_fully_summed: usize,
     options: &AptpOptions,
 ) -> Result<AptpFactorResult, SparseError> {
@@ -2787,7 +2793,7 @@ pub(super) fn tpp_factor_rect(
     while nelim < n {
         // Check if current column is effectively zero
         if tpp_is_col_small(a.as_ref(), nelim, nelim, m, small) {
-            d.set_1x1(nelim, 0.0);
+            d.set_1x1(nelim, zero());
             stats.num_1x1 += 1;
             pivot_log.push(AptpPivotRecord {
                 col: col_order[nelim],
@@ -2797,7 +2803,7 @@ pub(super) fn tpp_factor_rect(
             });
             if nelim < a.ncols() {
                 for r in (nelim + 1)..m {
-                    a[(r, nelim)] = 0.0;
+                    a[(r, nelim)] = zero();
                 }
             }
             nelim += 1;
@@ -2813,7 +2819,7 @@ pub(super) fn tpp_factor_rect(
                     swap_rect(a.rb_mut(), p, nelim);
                     col_order.swap(p, nelim);
                 }
-                d.set_1x1(nelim, 0.0);
+                d.set_1x1(nelim, zero());
                 stats.num_1x1 += 1;
                 pivot_log.push(AptpPivotRecord {
                     col: col_order[nelim],
@@ -2822,7 +2828,7 @@ pub(super) fn tpp_factor_rect(
                     was_fallback: false,
                 });
                 for r in (nelim + 1)..m {
-                    a[(r, nelim)] = 0.0;
+                    a[(r, nelim)] = zero();
                 }
                 nelim += 1;
                 found = true;
@@ -2885,8 +2891,8 @@ pub(super) fn tpp_factor_rect(
             }
 
             // Try p as 1x1 pivot
-            let maxp_with_t = maxp.max(tpp_sym_entry(a.as_ref(), p, t).abs());
-            if a[(p, p)].abs() >= u * maxp_with_t {
+            let maxp_with_t = maxp.max(tpp_sym_entry(a.as_ref(), p, t).mag());
+            if a[(p, p)].mag() >= u * maxp_with_t {
                 if p != nelim {
                     swap_rect(a.rb_mut(), p, nelim);
                     col_order.swap(p, nelim);
@@ -2912,7 +2918,7 @@ pub(super) fn tpp_factor_rect(
         if !found {
             // Last resort: try column nelim as 1x1
             let maxp = tpp_find_rc_abs_max_exclude(a.as_ref(), nelim, nelim, m, usize::MAX);
-            if a[(nelim, nelim)].abs() >= u * maxp {
+            if a[(nelim, nelim)].mag() >= u * maxp {
                 let max_l = tpp_apply_1x1(a.rb_mut(), nelim, m, n);
 
                 d.set_1x1(nelim, a[(nelim, nelim)]);
@@ -2963,13 +2969,13 @@ pub(super) fn tpp_factor_rect(
 /// - `par`: Parallelism control.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn compute_contribution_gemm_rect(
-    l_storage: &Mat<f64>,
+    l_storage: &Mat<S>,
     num_fully_summed: usize,
     num_eliminated: usize,
     m: usize,
     d: &MixedDiagonal,
-    contrib_buffer: &mut Mat<f64>,
-    ld_workspace: &mut Mat<f64>,
+    contrib_buffer: &mut Mat<S>,
+    ld_workspace: &mut Mat<S>,
     par: Par,
 ) {
     let p = num_fully_summed;
@@ -2985,10 +2991,10 @@ pub(super) fn compute_contribution_gemm_rect(
 
     // Use caller-provided workspace
     if ld_workspace.nrows() < nfs || ld_workspace.ncols() < ne {
-        *ld_workspace = Mat::zeros(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
+        *ld_workspace = Mat::<S>::zeros(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
     }
     let mut w = ld_workspace.as_mut().submatrix_mut(0, 0, nfs, ne);
-    w.fill(0.0);
+    w.fill(zero());
     compute_ld_into(l21_nfs, d, ne, w.rb_mut());
 
     // Symmetric rank-ne update: contrib -= W * L21_NFS^T (lower triangle)
@@ -3002,7 +3008,7 @@ pub(super) fn compute_contribution_gemm_rect(
         l21_nfs.transpose(),
         BlockStructure::Rectangular,
         Conj::No,
-        -1.0,
+        s(-1.0),
         par,
     );
 }
@@ -3013,7 +3019,7 @@ pub(super) fn compute_contribution_gemm_rect(
 /// in a rectangular m×k matrix instead of a square m×m frontal matrix.
 /// The L11, D11, L21 extraction logic is identical; only the source layout differs.
 pub(super) fn extract_front_factors_rect(
-    l_storage: &Mat<f64>,
+    l_storage: &Mat<S>,
     m: usize,
     k: usize,
     frontal_row_indices: &[usize],
@@ -3023,10 +3029,10 @@ pub(super) fn extract_front_factors_rect(
 
     // Extract L11 (ne × ne)
     let l11 = if ne > 0 {
-        let mut l = Mat::zeros(ne, ne);
+        let mut l = Mat::<S>::zeros(ne, ne);
         let mut col = 0;
         while col < ne {
-            l[(col, col)] = 1.0;
+            l[(col, col)] = s(1.0);
             match result.d.pivot_type(col) {
                 PivotType::OneByOne => {
                     let n_entries = ne - (col + 1);
@@ -3037,7 +3043,7 @@ pub(super) fn extract_front_factors_rect(
                     col += 1;
                 }
                 PivotType::TwoByTwo { partner } if partner > col => {
-                    l[(col + 1, col + 1)] = 1.0;
+                    l[(col + 1, col + 1)] = s(1.0);
                     let n_entries = ne - (col + 2);
                     if n_entries > 0 {
                         let src0 = &l_storage.col_as_slice(col)[col + 2..ne];
@@ -3057,7 +3063,7 @@ pub(super) fn extract_front_factors_rect(
         }
         l
     } else {
-        Mat::zeros(0, 0)
+        Mat::<S>::zeros(0, 0)
     };
 
     // Build truncated D11
@@ -3088,14 +3094,14 @@ pub(super) fn extract_front_factors_rect(
     // Extract L21 (r × ne) where r = m - ne
     let r = m - ne;
     let l21 = if ne > 0 && r > 0 {
-        let mut l = Mat::zeros(r, ne);
+        let mut l = Mat::<S>::zeros(r, ne);
         for j in 0..ne {
             let src = &l_storage.col_as_slice(j)[ne..m];
             l.col_as_slice_mut(j)[..r].copy_from_slice(src);
         }
         l
     } else {
-        Mat::zeros(r, ne)
+        Mat::<S>::zeros(r, ne)
     };
 
     // Local permutation and indices
@@ -3129,12 +3135,12 @@ pub(super) fn extract_front_factors_rect(
 /// Delayed column data (if any) is read from `l_storage[ne..k, ne..k]` and
 /// `l_storage[k..m, ne..k]`.
 pub(super) fn extract_contribution_rect(
-    l_storage: &Mat<f64>,
+    l_storage: &Mat<S>,
     m: usize,
     k: usize,
     frontal_row_indices: &[usize],
     result: &AptpFactorResult,
-    mut contrib_buffer: Mat<f64>,
+    mut contrib_buffer: Mat<S>,
 ) -> super::numeric::ContributionBlock {
     let ne = result.num_eliminated;
     let size = m - ne;
@@ -3142,7 +3148,7 @@ pub(super) fn extract_contribution_rect(
     let nfs = m - k;
 
     if num_delayed > 0 {
-        let mut data = Mat::zeros(size, size);
+        let mut data = Mat::<S>::zeros(size, size);
 
         // Copy delayed × delayed from l_storage[ne..k, ne..k]
         for j in 0..num_delayed {

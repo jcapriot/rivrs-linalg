@@ -10,12 +10,14 @@
 
 use super::inertia::Inertia;
 use super::pivot::{Block2x2, PivotType};
+#[allow(unused_imports)]
+use crate::scalar::{Mag, S, re, s, zero};
 
 /// A single pivot entry from a [`MixedDiagonal`], yielded by [`MixedDiagonal::iter_pivots`].
 #[derive(Debug, Clone)]
 pub enum PivotEntry {
     /// 1x1 pivot with scalar diagonal value.
-    OneByOne(f64),
+    OneByOne(S),
     /// 2x2 Bunch-Kaufman pivot block (yielded only at the lower-indexed column).
     TwoByTwo(Block2x2),
     /// Unresolved pivot.
@@ -48,8 +50,8 @@ pub enum PivotEntry {
 #[derive(Debug)]
 pub struct MixedDiagonal {
     pivot_map: Vec<PivotType>,
-    diag: Vec<f64>,
-    off_diag: Vec<f64>,
+    diag: Vec<S>,
+    off_diag: Vec<S>,
     n: usize,
 }
 
@@ -60,8 +62,8 @@ impl MixedDiagonal {
     pub fn new(n: usize) -> Self {
         Self {
             pivot_map: vec![PivotType::Delayed; n],
-            diag: vec![0.0; n],
-            off_diag: vec![0.0; n],
+            diag: vec![zero(); n],
+            off_diag: vec![zero(); n],
             n,
         }
     }
@@ -72,7 +74,7 @@ impl MixedDiagonal {
     ///
     /// - `col >= n` (bounds check)
     /// - Column is not currently [`PivotType::Delayed`] (cannot overwrite a set pivot)
-    pub fn set_1x1(&mut self, col: usize, value: f64) {
+    pub fn set_1x1(&mut self, col: usize, value: S) {
         debug_assert!(
             col < self.n,
             "set_1x1: col {} out of bounds (n = {})",
@@ -149,7 +151,7 @@ impl MixedDiagonal {
     /// # Panics (debug only)
     ///
     /// Column is not [`PivotType::OneByOne`].
-    pub fn diagonal_1x1(&self, col: usize) -> f64 {
+    pub fn diagonal_1x1(&self, col: usize) -> S {
         debug_assert!(
             self.pivot_map[col] == PivotType::OneByOne,
             "diagonal_1x1: col {} is not OneByOne ({:?})",
@@ -201,8 +203,8 @@ impl MixedDiagonal {
     pub fn grow(&mut self, new_n: usize) {
         if new_n > self.n {
             self.pivot_map.resize(new_n, PivotType::Delayed);
-            self.diag.resize(new_n, 0.0);
-            self.off_diag.resize(new_n, 0.0);
+            self.diag.resize(new_n, zero());
+            self.off_diag.resize(new_n, zero());
             self.n = new_n;
         }
     }
@@ -309,7 +311,7 @@ impl MixedDiagonal {
     ///
     /// - Cramer's rule for 2x2 symmetric systems
     /// - Hogg, Duff & Lopez (2020), Section 3: D-solve in APTP context
-    pub fn solve_in_place(&self, x: &mut [f64]) {
+    pub fn solve_in_place(&self, x: &mut [S]) {
         debug_assert_eq!(
             x.len(),
             self.n,
@@ -328,9 +330,9 @@ impl MixedDiagonal {
             match self.pivot_map[col] {
                 PivotType::OneByOne => {
                     let d = self.diag[col];
-                    if d == 0.0 {
+                    if d == zero() {
                         // Zero pivot: set solution component to zero
-                        x[col] = 0.0;
+                        x[col] = zero();
                     } else {
                         x[col] /= d;
                     }
@@ -342,10 +344,10 @@ impl MixedDiagonal {
                         let b = self.off_diag[col];
                         let c = self.diag[partner];
                         let det = a * c - b * b;
-                        if det == 0.0 {
+                        if det == zero() {
                             // Zero-determinant 2x2 block: set both components to zero
-                            x[col] = 0.0;
-                            x[partner] = 0.0;
+                            x[col] = zero();
+                            x[partner] = zero();
                         } else {
                             let r1 = x[col];
                             let r2 = x[partner];
@@ -404,9 +406,9 @@ impl MixedDiagonal {
             match self.pivot_map[col] {
                 PivotType::OneByOne => {
                     let d = self.diag[col];
-                    if d > 0.0 {
+                    if re(d) > 0.0 {
                         positive += 1;
-                    } else if d < 0.0 {
+                    } else if re(d) < 0.0 {
                         negative += 1;
                     } else {
                         zero += 1;
@@ -422,22 +424,22 @@ impl MixedDiagonal {
                         let det = a * c - b * b;
                         let trace = a + c;
 
-                        if det > 0.0 {
-                            if trace > 0.0 {
+                        if re(det) > 0.0 {
+                            if re(trace) > 0.0 {
                                 positive += 2;
                             } else {
                                 // trace < 0 (trace == 0 impossible with det > 0 for real symmetric)
                                 negative += 2;
                             }
-                        } else if det < 0.0 {
+                        } else if re(det) < 0.0 {
                             positive += 1;
                             negative += 1;
                         } else {
                             // det == 0
-                            if trace > 0.0 {
+                            if re(trace) > 0.0 {
                                 positive += 1;
                                 zero += 1;
-                            } else if trace < 0.0 {
+                            } else if re(trace) < 0.0 {
                                 negative += 1;
                                 zero += 1;
                             } else {
