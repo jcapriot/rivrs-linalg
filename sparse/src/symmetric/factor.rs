@@ -39,13 +39,15 @@ use faer::linalg::matmul::triangular::{self as tri_matmul, BlockStructure};
 use faer::linalg::triangular_solve;
 use faer::perm::Perm;
 use faer::prelude::*;
+use faer::traits::num_traits::Float;
 use faer::{Accum, Conj, Mat, MatMut, MatRef};
 
 use super::diagonal::MixedDiagonal;
 use super::pivot::{Block2x2, PivotType};
 use crate::error::SparseError;
 use crate::ordering::perm_from_forward;
-use crate::scalar::Scalar;
+
+use crate::scalar::{Scalar, real, to_f64};
 
 /// Bunch-Kaufman α parameter for 2×2 determinant condition: |det| ≥ α × |a₂₁|².
 const BUNCH_KAUFMAN_ALPHA: f64 = 0.5;
@@ -622,7 +624,10 @@ fn extract_l<T: Scalar>(a: MatRef<'_, T>, d: &MixedDiagonal<T>, num_eliminated: 
 /// - The Schur complement is updated in-place in the trailing submatrix
 // SPRAL Equivalent: `block_ldlt()` in `spral/src/ssids/cpu/kernels/ldlt_app.cxx` (BSD-3).
 #[cfg(test)]
-fn complete_pivoting_factor<T: Scalar>(mut a: MatMut<'_, T>, small: f64) -> AptpFactorResult<T> {
+fn complete_pivoting_factor<T: Scalar>(
+    mut a: MatMut<'_, T>,
+    small: T::Real,
+) -> AptpFactorResult<T> {
     let n = a.nrows();
     debug_assert_eq!(
         n,
@@ -640,7 +645,7 @@ fn complete_pivoting_factor<T: Scalar>(mut a: MatMut<'_, T>, small: f64) -> Aptp
         let remaining = n - k;
 
         // 1. Find (t, m_idx) = argmax |a[i,j]| over all uneliminated entries (lower triangle)
-        let mut max_val = 0.0_f64;
+        let mut max_val = real::<T>(0.0);
         let mut max_row = k;
         let mut max_col = k;
         for j in k..n {
@@ -682,7 +687,7 @@ fn complete_pivoting_factor<T: Scalar>(mut a: MatMut<'_, T>, small: f64) -> Aptp
             let inv_d = T::one() / d_kk;
 
             // Compute L column
-            let mut max_l = 0.0_f64;
+            let mut max_l = real::<T>(0.0);
             for i in (k + 1)..n {
                 let l_ik = a[(i, k)] * inv_d;
                 a[(i, k)] = l_ik;
@@ -697,13 +702,13 @@ fn complete_pivoting_factor<T: Scalar>(mut a: MatMut<'_, T>, small: f64) -> Aptp
 
             d.set_1x1(k, d_kk);
             stats.num_1x1 += 1;
-            if max_l > stats.max_l_entry {
-                stats.max_l_entry = max_l;
+            if to_f64(max_l) > stats.max_l_entry {
+                stats.max_l_entry = to_f64(max_l);
             }
             pivot_log.push(AptpPivotRecord {
                 col: col_order[k],
                 pivot_type: PivotType::OneByOne,
-                max_l_entry: max_l,
+                max_l_entry: to_f64(max_l),
                 was_fallback: false,
             });
             k += 1;
@@ -744,7 +749,7 @@ fn complete_pivoting_factor<T: Scalar>(mut a: MatMut<'_, T>, small: f64) -> Aptp
                 continue;
             }
 
-            if delta.mag() >= BUNCH_KAUFMAN_ALPHA * a_tm.mag() * a_tm.mag() {
+            if delta.mag() >= real::<T>(BUNCH_KAUFMAN_ALPHA) * a_tm.mag() * a_tm.mag() {
                 // 2×2 pivot using (t, m)
                 // Swap m → k and t → k+1
                 if m != k {
@@ -772,7 +777,7 @@ fn complete_pivoting_factor<T: Scalar>(mut a: MatMut<'_, T>, small: f64) -> Aptp
                 };
 
                 // Compute L columns for 2×2 pivot
-                let mut max_l = 0.0_f64;
+                let mut max_l = real::<T>(0.0);
                 let rows_start = k + 2;
                 for i in rows_start..n {
                     let ai1 = a[(i, k)];
@@ -794,15 +799,15 @@ fn complete_pivoting_factor<T: Scalar>(mut a: MatMut<'_, T>, small: f64) -> Aptp
 
                 d.set_2x2(block);
                 stats.num_2x2 += 1;
-                if max_l > stats.max_l_entry {
-                    stats.max_l_entry = max_l;
+                if to_f64(max_l) > stats.max_l_entry {
+                    stats.max_l_entry = to_f64(max_l);
                 }
                 pivot_log.push(AptpPivotRecord {
                     col: col_order[k],
                     pivot_type: PivotType::TwoByTwo {
                         partner: col_order[k + 1],
                     },
-                    max_l_entry: max_l,
+                    max_l_entry: to_f64(max_l),
                     was_fallback: false,
                 });
                 pivot_log.push(AptpPivotRecord {
@@ -810,7 +815,7 @@ fn complete_pivoting_factor<T: Scalar>(mut a: MatMut<'_, T>, small: f64) -> Aptp
                     pivot_type: PivotType::TwoByTwo {
                         partner: col_order[k],
                     },
-                    max_l_entry: max_l,
+                    max_l_entry: to_f64(max_l),
                     was_fallback: false,
                 });
                 k += 2;
@@ -825,7 +830,7 @@ fn complete_pivoting_factor<T: Scalar>(mut a: MatMut<'_, T>, small: f64) -> Aptp
                 let d_kk = a[(k, k)];
                 let inv_d = T::one() / d_kk;
 
-                let mut max_l = 0.0_f64;
+                let mut max_l = real::<T>(0.0);
                 for i in (k + 1)..n {
                     let l_ik = a[(i, k)] * inv_d;
                     a[(i, k)] = l_ik;
@@ -839,13 +844,13 @@ fn complete_pivoting_factor<T: Scalar>(mut a: MatMut<'_, T>, small: f64) -> Aptp
 
                 d.set_1x1(k, d_kk);
                 stats.num_1x1 += 1;
-                if max_l > stats.max_l_entry {
-                    stats.max_l_entry = max_l;
+                if to_f64(max_l) > stats.max_l_entry {
+                    stats.max_l_entry = to_f64(max_l);
                 }
                 pivot_log.push(AptpPivotRecord {
                     col: col_order[k],
                     pivot_type: PivotType::OneByOne,
-                    max_l_entry: max_l,
+                    max_l_entry: to_f64(max_l),
                     was_fallback: true, // fell back from 2×2
                 });
                 k += 1;
@@ -898,7 +903,7 @@ fn factor_block_diagonal<T: Scalar>(
     mut a: MatMut<'_, T>,
     col_start: usize,
     block_size: usize,
-    small: f64,
+    small: T::Real,
     row_limit: usize,
 ) -> (
     MixedDiagonal<T>,
@@ -921,7 +926,7 @@ fn factor_block_diagonal<T: Scalar>(
         let remaining = block_size - k;
 
         // 1. Find max |a[i,j]| in remaining diagonal sub-block [cur..search_end, cur..search_end]
-        let mut max_val = 0.0_f64;
+        let mut max_val = real::<T>(0.0);
         let mut max_row = cur;
         let mut max_col = cur;
         for j in cur..search_end {
@@ -962,7 +967,7 @@ fn factor_block_diagonal<T: Scalar>(
             let inv_d = T::one() / d_kk;
 
             // Compute L column ONLY within block
-            let mut max_l = 0.0_f64;
+            let mut max_l = real::<T>(0.0);
             for i in (cur + 1)..block_end {
                 let l_ik = a[(i, cur)] * inv_d;
                 a[(i, cur)] = l_ik;
@@ -984,13 +989,13 @@ fn factor_block_diagonal<T: Scalar>(
 
             d.set_1x1(k, d_kk);
             stats.num_1x1 += 1;
-            if max_l > stats.max_l_entry {
-                stats.max_l_entry = max_l;
+            if to_f64(max_l) > stats.max_l_entry {
+                stats.max_l_entry = to_f64(max_l);
             }
             pivot_log.push(AptpPivotRecord {
                 col: local_perm[k],
                 pivot_type: PivotType::OneByOne,
-                max_l_entry: max_l,
+                max_l_entry: to_f64(max_l),
                 was_fallback: false,
             });
             k += 1;
@@ -1032,7 +1037,7 @@ fn factor_block_diagonal<T: Scalar>(
                 continue;
             }
 
-            if delta.mag() >= BUNCH_KAUFMAN_ALPHA * a_tm.mag() * a_tm.mag() {
+            if delta.mag() >= real::<T>(BUNCH_KAUFMAN_ALPHA) * a_tm.mag() * a_tm.mag() {
                 // 2×2 pivot: swap m_idx → cur, t → cur+1
                 if m_idx != cur {
                     swap_symmetric_block(a.rb_mut(), cur, m_idx, col_start, row_limit);
@@ -1058,7 +1063,7 @@ fn factor_block_diagonal<T: Scalar>(
                 };
 
                 // Compute L columns ONLY within block
-                let mut max_l = 0.0_f64;
+                let mut max_l = real::<T>(0.0);
                 let rows_start = cur + 2;
                 for i in rows_start..block_end {
                     let ai1 = a[(i, cur)];
@@ -1090,15 +1095,15 @@ fn factor_block_diagonal<T: Scalar>(
 
                 d.set_2x2(block);
                 stats.num_2x2 += 1;
-                if max_l > stats.max_l_entry {
-                    stats.max_l_entry = max_l;
+                if to_f64(max_l) > stats.max_l_entry {
+                    stats.max_l_entry = to_f64(max_l);
                 }
                 pivot_log.push(AptpPivotRecord {
                     col: local_perm[k],
                     pivot_type: PivotType::TwoByTwo {
                         partner: local_perm[k + 1],
                     },
-                    max_l_entry: max_l,
+                    max_l_entry: to_f64(max_l),
                     was_fallback: false,
                 });
                 pivot_log.push(AptpPivotRecord {
@@ -1106,7 +1111,7 @@ fn factor_block_diagonal<T: Scalar>(
                     pivot_type: PivotType::TwoByTwo {
                         partner: local_perm[k],
                     },
-                    max_l_entry: max_l,
+                    max_l_entry: to_f64(max_l),
                     was_fallback: false,
                 });
                 k += 2;
@@ -1121,7 +1126,7 @@ fn factor_block_diagonal<T: Scalar>(
                 let d_kk = a[(cur, cur)];
                 let inv_d = T::one() / d_kk;
 
-                let mut max_l = 0.0_f64;
+                let mut max_l = real::<T>(0.0);
                 for i in (cur + 1)..block_end {
                     let l_ik = a[(i, cur)] * inv_d;
                     a[(i, cur)] = l_ik;
@@ -1142,13 +1147,13 @@ fn factor_block_diagonal<T: Scalar>(
 
                 d.set_1x1(k, d_kk);
                 stats.num_1x1 += 1;
-                if max_l > stats.max_l_entry {
-                    stats.max_l_entry = max_l;
+                if to_f64(max_l) > stats.max_l_entry {
+                    stats.max_l_entry = to_f64(max_l);
                 }
                 pivot_log.push(AptpPivotRecord {
                     col: local_perm[k],
                     pivot_type: PivotType::OneByOne,
-                    max_l_entry: max_l,
+                    max_l_entry: to_f64(max_l),
                     was_fallback: true,
                 });
                 k += 1;
@@ -1307,7 +1312,7 @@ fn apply_and_check<T: Scalar>(
     block_cols: usize,
     m: usize,
     d: &MixedDiagonal<T>,
-    threshold: f64,
+    threshold: T::Real,
     par: Par,
     l11_buf: &mut Mat<T>,
 ) -> usize {
@@ -1379,7 +1384,7 @@ fn apply_and_check<T: Scalar>(
     }
 
     // Step 3: Threshold scan — find first failing column
-    let stability_bound = 1.0 / threshold;
+    let stability_bound = real::<T>(1.0) / threshold;
     let mut effective_nelim = block_nelim;
 
     let mut scan_col = 0;
@@ -1831,8 +1836,8 @@ fn factor_inner<T: Scalar>(
 ) -> Result<AptpFactorResult<T>, SparseError> {
     let m = a.nrows();
     let ib = options.inner_block_size;
-    let small = options.small;
-    let threshold = options.threshold;
+    let small = real::<T>(options.small);
+    let threshold = real::<T>(options.threshold);
     let p = num_fully_summed;
 
     let mut col_order: Vec<usize> = (0..m).collect();
@@ -2044,8 +2049,8 @@ fn factor_inner<T: Scalar>(
         for c in 0..nelim {
             for i in panel_start..m {
                 let v = a[(i, k + c)].mag();
-                if v > stats.max_l_entry {
-                    stats.max_l_entry = v;
+                if to_f64(v) > stats.max_l_entry {
+                    stats.max_l_entry = to_f64(v);
                 }
             }
         }
@@ -2283,10 +2288,10 @@ fn tpp_test_2x2<T: Scalar>(
     a: MatRef<'_, T>,
     t: usize,
     p: usize,
-    maxt: f64,
-    maxp: f64,
-    u: f64,
-    small: f64,
+    maxt: T::Real,
+    maxp: T::Real,
+    u: T::Real,
+    small: T::Real,
 ) -> Option<(T, T, T)> {
     debug_assert!(t < p, "tpp_test_2x2 requires t < p");
 
@@ -2301,18 +2306,23 @@ fn tpp_test_2x2<T: Scalar>(
     }
 
     // 2. Cancellation guard on determinant
-    let detscale = 1.0 / maxpiv;
-    let detpiv0 = (a11 * T::from_f64(detscale)) * a22;
-    let detpiv1 = (a21 * T::from_f64(detscale)) * a21;
+    let detscale = real::<T>(1.0) / maxpiv;
+    let detscale_t = T::from_real_impl(&detscale);
+    let detpiv0 = (a11 * detscale_t) * a22;
+    let detpiv1 = (a21 * detscale_t) * a21;
     let detpiv = detpiv0 - detpiv1;
-    if detpiv.mag() < small.max(detpiv0.mag() / 2.0).max(detpiv1.mag() / 2.0) {
+    if detpiv.mag()
+        < small
+            .max(detpiv0.mag() / real::<T>(2.0))
+            .max(detpiv1.mag() / real::<T>(2.0))
+    {
         return None;
     }
 
     // 3. Threshold test using D^{-1}
-    let d_inv_11 = (a22 * T::from_f64(detscale)) / detpiv;
-    let d_inv_12 = (-a21 * T::from_f64(detscale)) / detpiv;
-    let d_inv_22 = (a11 * T::from_f64(detscale)) / detpiv;
+    let d_inv_11 = (a22 * detscale_t) / detpiv;
+    let d_inv_12 = (-a21 * detscale_t) / detpiv;
+    let d_inv_22 = (a11 * detscale_t) / detpiv;
 
     if maxt.max(maxp) < small {
         // Rest of column is small — accept
@@ -2321,7 +2331,7 @@ fn tpp_test_2x2<T: Scalar>(
 
     let x1 = d_inv_11.mag() * maxt + d_inv_12.mag() * maxp;
     let x2 = d_inv_12.mag() * maxt + d_inv_22.mag() * maxp;
-    if u * x1.max(x2) < 1.0 {
+    if u * x1.max(x2) < real::<T>(1.0) {
         Some((a11, a21, a22))
     } else {
         None
@@ -2358,8 +2368,8 @@ fn tpp_factor<T: Scalar>(
 ) -> usize {
     let m = a.nrows();
     let n = num_fully_summed;
-    let u = options.threshold;
-    let small = options.small;
+    let u = real::<T>(options.threshold);
+    let small = real::<T>(options.small);
 
     let mut nelim = start_col;
 
@@ -2444,13 +2454,13 @@ fn tpp_factor<T: Scalar>(
                     c: d22,
                 });
                 stats.num_2x2 += 1;
-                stats.max_l_entry = stats.max_l_entry.max(max_l);
+                stats.max_l_entry = stats.max_l_entry.max(to_f64(max_l));
                 pivot_log.push(AptpPivotRecord {
                     col: col_order[nelim],
                     pivot_type: PivotType::TwoByTwo {
                         partner: col_order[nelim + 1],
                     },
-                    max_l_entry: max_l,
+                    max_l_entry: to_f64(max_l),
                     was_fallback: true,
                 });
                 pivot_log.push(AptpPivotRecord {
@@ -2458,7 +2468,7 @@ fn tpp_factor<T: Scalar>(
                     pivot_type: PivotType::TwoByTwo {
                         partner: col_order[nelim],
                     },
-                    max_l_entry: max_l,
+                    max_l_entry: to_f64(max_l),
                     was_fallback: true,
                 });
                 nelim += 2;
@@ -2480,11 +2490,11 @@ fn tpp_factor<T: Scalar>(
 
                 global_d.set_1x1(nelim, a[(nelim, nelim)]);
                 stats.num_1x1 += 1;
-                stats.max_l_entry = stats.max_l_entry.max(max_l);
+                stats.max_l_entry = stats.max_l_entry.max(to_f64(max_l));
                 pivot_log.push(AptpPivotRecord {
                     col: col_order[nelim],
                     pivot_type: PivotType::OneByOne,
-                    max_l_entry: max_l,
+                    max_l_entry: to_f64(max_l),
                     was_fallback: true,
                 });
                 nelim += 1;
@@ -2501,11 +2511,11 @@ fn tpp_factor<T: Scalar>(
 
                 global_d.set_1x1(nelim, a[(nelim, nelim)]);
                 stats.num_1x1 += 1;
-                stats.max_l_entry = stats.max_l_entry.max(max_l);
+                stats.max_l_entry = stats.max_l_entry.max(to_f64(max_l));
                 pivot_log.push(AptpPivotRecord {
                     col: col_order[nelim],
                     pivot_type: PivotType::OneByOne,
-                    max_l_entry: max_l,
+                    max_l_entry: to_f64(max_l),
                     was_fallback: true,
                 });
                 nelim += 1;
@@ -2611,13 +2621,13 @@ fn tpp_apply_1x1<T: Scalar>(
     nelim: usize,
     m: usize,
     num_fully_summed: usize,
-) -> f64 {
+) -> T::Real {
     let d = a[(nelim, nelim)];
     let inv_d = T::one() / d;
     let p = num_fully_summed;
 
     // Compute L entries for ALL rows (FS + NFS)
-    let mut max_l = 0.0_f64;
+    let mut max_l = real::<T>(0.0);
     for i in (nelim + 1)..m {
         let l_ik = a[(i, nelim)] * inv_d;
         a[(i, nelim)] = l_ik;
@@ -2650,7 +2660,7 @@ fn tpp_apply_2x2<T: Scalar>(
     nelim: usize,
     m: usize,
     num_fully_summed: usize,
-) -> f64 {
+) -> T::Real {
     let a11 = a[(nelim, nelim)];
     let a21 = a[(nelim + 1, nelim)];
     let a22 = a[(nelim + 1, nelim + 1)];
@@ -2659,7 +2669,7 @@ fn tpp_apply_2x2<T: Scalar>(
     let p = num_fully_summed;
 
     // Compute L entries for ALL rows (FS + NFS)
-    let mut max_l = 0.0_f64;
+    let mut max_l = real::<T>(0.0);
     let start = nelim + 2;
     for i in start..m {
         let ai1 = a[(i, nelim)];
@@ -2698,7 +2708,7 @@ fn tpp_is_col_small<T: Scalar>(
     idx: usize,
     from: usize,
     to: usize,
-    small: f64,
+    small: T::Real,
 ) -> bool {
     let n = a.ncols();
     // Row entries: a[(idx, c)] for c < idx (lower triangle: idx > c), limited to ncols
@@ -2746,9 +2756,9 @@ fn tpp_find_rc_abs_max_exclude<T: Scalar>(
     nelim: usize,
     m: usize,
     exclude: usize,
-) -> f64 {
+) -> T::Real {
     let n = a.ncols();
-    let mut best = 0.0_f64;
+    let mut best = real::<T>(0.0);
     // Row part: a[(col, c)] for c in nelim..col (limited to ncols)
     for c in nelim..col.min(n) {
         if c == exclude {
@@ -2806,8 +2816,8 @@ pub(super) fn tpp_factor_rect<T: Scalar>(
     );
     debug_assert!(m >= n, "tpp_factor_rect: nrows {} < ncols {}", m, n);
 
-    let u = options.threshold;
-    let small = options.small;
+    let u = real::<T>(options.threshold);
+    let small = real::<T>(options.small);
 
     let mut col_order: Vec<usize> = (0..m).collect();
     let mut d = MixedDiagonal::new(n);
@@ -2894,13 +2904,13 @@ pub(super) fn tpp_factor_rect<T: Scalar>(
                     c: d22,
                 });
                 stats.num_2x2 += 1;
-                stats.max_l_entry = stats.max_l_entry.max(max_l);
+                stats.max_l_entry = stats.max_l_entry.max(to_f64(max_l));
                 pivot_log.push(AptpPivotRecord {
                     col: col_order[nelim],
                     pivot_type: PivotType::TwoByTwo {
                         partner: col_order[nelim + 1],
                     },
-                    max_l_entry: max_l,
+                    max_l_entry: to_f64(max_l),
                     was_fallback: false,
                 });
                 pivot_log.push(AptpPivotRecord {
@@ -2908,7 +2918,7 @@ pub(super) fn tpp_factor_rect<T: Scalar>(
                     pivot_type: PivotType::TwoByTwo {
                         partner: col_order[nelim],
                     },
-                    max_l_entry: max_l,
+                    max_l_entry: to_f64(max_l),
                     was_fallback: false,
                 });
                 nelim += 2;
@@ -2928,11 +2938,11 @@ pub(super) fn tpp_factor_rect<T: Scalar>(
 
                 d.set_1x1(nelim, a[(nelim, nelim)]);
                 stats.num_1x1 += 1;
-                stats.max_l_entry = stats.max_l_entry.max(max_l);
+                stats.max_l_entry = stats.max_l_entry.max(to_f64(max_l));
                 pivot_log.push(AptpPivotRecord {
                     col: col_order[nelim],
                     pivot_type: PivotType::OneByOne,
-                    max_l_entry: max_l,
+                    max_l_entry: to_f64(max_l),
                     was_fallback: false,
                 });
                 nelim += 1;
@@ -2949,11 +2959,11 @@ pub(super) fn tpp_factor_rect<T: Scalar>(
 
                 d.set_1x1(nelim, a[(nelim, nelim)]);
                 stats.num_1x1 += 1;
-                stats.max_l_entry = stats.max_l_entry.max(max_l);
+                stats.max_l_entry = stats.max_l_entry.max(to_f64(max_l));
                 pivot_log.push(AptpPivotRecord {
                     col: col_order[nelim],
                     pivot_type: PivotType::OneByOne,
-                    max_l_entry: max_l,
+                    max_l_entry: to_f64(max_l),
                     was_fallback: false,
                 });
                 nelim += 1;

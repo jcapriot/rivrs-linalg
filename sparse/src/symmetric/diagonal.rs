@@ -10,7 +10,7 @@
 
 use super::inertia::Inertia;
 use super::pivot::{Block2x2, PivotType};
-use crate::scalar::Scalar;
+use crate::scalar::{Scalar, real};
 
 /// A single pivot entry from a [`MixedDiagonal`], yielded by [`MixedDiagonal::iter_pivots`].
 #[derive(Debug, Clone)]
@@ -395,6 +395,9 @@ impl<T: Scalar> MixedDiagonal<T> {
     /// - Hogg, Duff & Lopez (2020), Section 2: inertia in APTP context
     /// - Bunch & Kaufman (1977): inertia from pivot classifications
     pub fn compute_inertia(&self) -> Inertia {
+        // Signs are taken in the scalar's real type. For complex symmetric
+        // matrices inertia is undefined and `SparseLDLT::inertia` returns None.
+        let real_zero = real::<T>(0.0);
         debug_assert!(
             self.num_delayed() == 0,
             "compute_inertia: {} delayed columns remain",
@@ -410,9 +413,9 @@ impl<T: Scalar> MixedDiagonal<T> {
             match self.pivot_map[col] {
                 PivotType::OneByOne => {
                     let d = self.diag[col];
-                    if d.real_part() > 0.0 {
+                    if T::real_part_impl(&d) > real_zero {
                         positive += 1;
-                    } else if d.real_part() < 0.0 {
+                    } else if T::real_part_impl(&d) < real_zero {
                         negative += 1;
                     } else {
                         zero += 1;
@@ -428,22 +431,22 @@ impl<T: Scalar> MixedDiagonal<T> {
                         let det = a * c - b * b;
                         let trace = a + c;
 
-                        if det.real_part() > 0.0 {
-                            if trace.real_part() > 0.0 {
+                        if T::real_part_impl(&det) > real_zero {
+                            if T::real_part_impl(&trace) > real_zero {
                                 positive += 2;
                             } else {
                                 // trace < 0 (trace == 0 impossible with det > 0 for real symmetric)
                                 negative += 2;
                             }
-                        } else if det.real_part() < 0.0 {
+                        } else if T::real_part_impl(&det) < real_zero {
                             positive += 1;
                             negative += 1;
                         } else {
                             // det == 0
-                            if trace.real_part() > 0.0 {
+                            if T::real_part_impl(&trace) > real_zero {
                                 positive += 1;
                                 zero += 1;
-                            } else if trace.real_part() < 0.0 {
+                            } else if T::real_part_impl(&trace) < real_zero {
                                 negative += 1;
                                 zero += 1;
                             } else {

@@ -8,6 +8,7 @@
 
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::sparse::{SparseColMat, Triplet};
+use faer::traits::num_traits::ToPrimitive;
 use faer::{Col, Par, c32, c64};
 
 use rivrs_sparse::scalar::Scalar;
@@ -63,14 +64,19 @@ fn backward_error<T: Scalar>(a: &SparseColMat<usize, T>, x: &Col<T>, b: &Col<T>)
     let ri = a.symbolic().row_idx();
     for j in 0..n {
         for k in cp[j]..cp[j + 1] {
-            row_sum[ri[k]] += a.val()[k].mag();
+            row_sum[ri[k]] += mag64(a.val()[k]);
         }
     }
     let a_norm = row_sum.iter().cloned().fold(0.0, f64::max);
-    let x_norm = (0..n).map(|i| x[i].mag()).fold(0.0, f64::max);
-    let b_norm = (0..n).map(|i| b[i].mag()).fold(0.0, f64::max);
-    let r_norm = (0..n).map(|i| (ax[i] - b[i]).mag()).fold(0.0, f64::max);
+    let x_norm = (0..n).map(|i| mag64(x[i])).fold(0.0, f64::max);
+    let b_norm = (0..n).map(|i| mag64(b[i])).fold(0.0, f64::max);
+    let r_norm = (0..n).map(|i| mag64(ax[i] - b[i])).fold(0.0, f64::max);
     r_norm / (a_norm * x_norm + b_norm)
+}
+
+/// |x| widened to f64 for error measurements.
+fn mag64<T: Scalar>(x: T) -> f64 {
+    x.mag().to_f64().expect("f32/f64 widen to f64")
 }
 
 /// A scalar with real part `re` and, for complex types, imaginary part `im`.
@@ -176,7 +182,7 @@ fn solve_ones<T: Scalar>(
     let x = solver
         .solve(&b, MemStack::new(&mut mem), par)
         .expect("solve");
-    let fe = (0..n).map(|i| (x[i] - T::one()).mag()).fold(0.0, f64::max);
+    let fe = (0..n).map(|i| mag64(x[i] - T::one())).fold(0.0, f64::max);
     (backward_error(a, &x, &b), fe, solver)
 }
 
@@ -198,7 +204,7 @@ fn test_matrices_are_symmetric_not_hermitian() {
         for i in 0..a.nrows() {
             let (x, y) = (a.get(i, j).copied(), at.get(i, j).copied());
             if let (Some(x), Some(y)) = (x, y) {
-                max_sym_diff = max_sym_diff.max((x - y).mag());
+                max_sym_diff = max_sym_diff.max(mag64(x - y));
                 has_complex_offdiag |= i != j && x.im != 0.0;
             }
         }
