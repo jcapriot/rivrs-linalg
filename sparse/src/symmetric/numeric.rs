@@ -2260,6 +2260,8 @@ fn factor_tree<T: Scalar>(
     } else {
         Vec::new()
     };
+    // Depth-first visiting order of each node's children (Liu's rule).
+    let visit = liu_child_order(supernodes, children);
     let mut is_layer_root = vec![false; n_supernodes];
     for &r in &layer {
         is_layer_root[r] = true;
@@ -2285,7 +2287,7 @@ fn factor_tree<T: Scalar>(
                     pending: (0..n_supernodes).map(|_| None).collect(),
                 });
                 st.ws.ensure_g2l(n);
-                let order = dfs_postorder(&[root], children, |_| true);
+                let order = dfs_postorder(&[root], &visit, |_| true);
                 let results = factor_in_order(&ctx, &order, &mut st.ws, &mut st.pending);
                 let contribution = st.pending[root].take();
                 pool.lock().unwrap().push(st);
@@ -2311,7 +2313,7 @@ fn factor_tree<T: Scalar>(
     let roots: Vec<usize> = (0..n_supernodes)
         .filter(|&s| supernodes[s].parent.is_none())
         .collect();
-    let order = dfs_postorder(&roots, children, |s| !is_layer_root[s]);
+    let order = dfs_postorder(&roots, &visit, |s| !is_layer_root[s]);
     let max_front = order
         .iter()
         .map(|&s| front_dims(&supernodes[s]).1)
@@ -2414,6 +2416,48 @@ fn factor_in_order<T: Scalar>(
 fn front_dims(sn: &SupernodeInfo) -> (usize, usize) {
     let k: usize = sn.owned_ranges.iter().map(|r| r.len()).sum();
     (k, k + sn.pattern.len())
+}
+
+/// Order each node's children to minimise the contribution-block stack of a
+/// depth-first traversal (Liu 1986).
+///
+/// While a child's subtree is factored, the blocks of siblings visited before
+/// it stay alive. Visiting children in decreasing order of
+/// `peak(c) − cb(c)` minimises the peak, where `cb(c)` is the child's own
+/// contribution block (lower triangle, before delays) and `peak(c)` is the
+/// largest stack its subtree needs. Only the visiting order changes: blocks
+/// are still handed to the parent in `children[s]` order.
+///
+/// # References
+///
+/// - Liu (1986), "On the storage requirement in the out-of-core multifrontal
+///   method for sparse factorization", ACM TOMS 12(3), Theorem 3.2
+fn liu_child_order(supernodes: &[SupernodeInfo], children: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let n = supernodes.len();
+    let tri = |x: usize| x * (x + 1) / 2;
+    let cb: Vec<usize> = (0..n)
+        .map(|s| {
+            let (k, m) = front_dims(&supernodes[s]);
+            if supernodes[s].parent.is_some() {
+                tri(m - k)
+            } else {
+                0
+            }
+        })
+        .collect();
+    let mut peak = vec![0usize; n];
+    let mut order: Vec<Vec<usize>> = children.to_vec();
+    // Postorder (parent > child): every child's peak is final before its parent.
+    for s in 0..n {
+        order[s].sort_by_key(|&c| std::cmp::Reverse(peak[c].saturating_sub(cb[c])));
+        let (mut running, mut pk) = (0usize, 0usize);
+        for &c in &order[s] {
+            pk = pk.max(running + peak[c]);
+            running += cb[c];
+        }
+        peak[s] = pk.max(running).max(cb[s]);
+    }
+    order
 }
 
 /// Depth-first postorder of the subtrees rooted at `roots`, visiting only
