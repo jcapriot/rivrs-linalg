@@ -368,13 +368,7 @@ pub fn aptp_factor_in_place<T: Scalar>(
     } else if num_fully_summed > options.outer_block_size {
         two_level_factor(a.rb_mut(), num_fully_summed, options, &mut kernel_ws)?
     } else {
-        factor_inner(
-            a.rb_mut(),
-            num_fully_summed,
-            num_fully_summed,
-            options,
-            &mut kernel_ws,
-        )?
+        factor_inner(a.rb_mut(), num_fully_summed, options, &mut kernel_ws)?
     };
 
     // Fallback: TPP on remaining columns
@@ -1421,14 +1415,23 @@ fn apply_and_check<T: Scalar>(
 
 /// Rank-nelim Schur complement update on the trailing submatrix via GEMM.
 ///
-/// Computes: A[trailing, trailing] -= L21 * D11 * L21^T
-/// where L21 is the panel at a[panel_start..m, col_start..col_start+nelim]
-/// and D11 is the block diagonal from the Factor phase.
+/// Computes `A[r, c] -= (L21 · D11 · L21ᵀ)[r, c]` for trailing columns
+/// `c ∈ [ts, col_limit)` and all rows `r ≥ c` below, where
+/// `ts = col_start + block_cols`, L21 is the panel at
+/// `a[ts..m, col_start..col_start+nelim]` and D11 is the block diagonal from
+/// the Factor phase. Columns at or beyond `col_limit` are not touched: inside
+/// `factor_inner` the limit is the current outer block, and `two_level_factor`
+/// calls this once more per outer block with the front's fully-summed
+/// boundary. The NFS×NFS block (rows and columns ≥ the fully-summed
+/// boundary) is never updated here; the contribution GEMM does it.
+///
+/// Two regions: `A[ts..col_limit, ts..col_limit]` (lower triangle) and the
+/// rectangle `A[col_limit..m, ts..col_limit]`.
 ///
 /// Uses explicit W = L21 * D11 workspace, then A -= W * L21^T (GEMM).
 #[allow(clippy::too_many_arguments)]
 fn update_trailing<T: Scalar>(
-    mut a: MatMut<'_, T>,
+    a: MatMut<'_, T>,
     col_start: usize,
     nelim: usize,
     block_cols: usize,
@@ -1437,71 +1440,50 @@ fn update_trailing<T: Scalar>(
     d: &MixedDiagonal<T>,
     par: Par,
     ld_buf: &mut Mat<T>,
-    copy_buf: &mut Mat<T>,
 ) {
     if nelim == 0 {
         return;
     }
-
     let trailing_start = col_start + block_cols;
     let trailing_size = m - trailing_start;
     if trailing_size == 0 {
         return;
     }
-
-    // p = num_fully_summed boundary: rows [trailing_start..p] are FS, [p..m] are NFS.
+    // p = column limit: columns [trailing_start..p] are updated; rows below p
+    // form the rectangular region.
     let p = num_fully_summed;
-
-    // Compute W = L21 * D11 using workspace buffer (trailing_size × nelim subview).
-    // We compute W for ALL trailing rows (FS + NFS) since the FS×FS region (region 1)
-    // and the NFS×FS cross-term (region 2) both need it.
-    let mut w = ld_buf.as_mut().submatrix_mut(0, 0, trailing_size, nelim);
-    let mut col = 0;
-    while col < nelim {
-        match d.pivot_type(col) {
-            PivotType::OneByOne => {
-                let d_val = d.diagonal_1x1(col);
-                for i in 0..trailing_size {
-                    w[(i, col)] = a[(trailing_start + i, col_start + col)] * d_val;
-                }
-                col += 1;
-            }
-            PivotType::TwoByTwo { partner } if partner > col => {
-                let block = d.diagonal_2x2(col);
-                for i in 0..trailing_size {
-                    let l1 = a[(trailing_start + i, col_start + col)];
-                    let l2 = a[(trailing_start + i, col_start + col + 1)];
-                    w[(i, col)] = l1 * block.a + l2 * block.b;
-                    w[(i, col + 1)] = l1 * block.b + l2 * block.c;
-                }
-                col += 2;
-            }
-            _ => {
-                col += 1;
-            }
-        }
+    let fs_size = p.saturating_sub(trailing_start);
+    if fs_size == 0 {
+        return;
     }
 
-    // Copy L21 into workspace buffer to avoid borrow conflict (L21 and A22 overlap in `a`)
-    {
-        let src = a
-            .rb()
-            .submatrix(trailing_start, col_start, trailing_size, nelim);
-        let mut dst = copy_buf.as_mut().submatrix_mut(0, 0, trailing_size, nelim);
-        dst.copy_from(src);
-    }
+    // The source panel (columns col_start..col_start+nelim) lies left of
+    // trailing_start and every updated column lies right of it, so split the
+    // matrix there and read L in place.
+    let (left, mut right) = a.split_at_col_mut(trailing_start);
+    let l21 = left
+        .rb()
+        .submatrix(trailing_start, col_start, trailing_size, nelim);
+
+    // W = L21 * D11 for ALL trailing rows (the FS×FS region and the
+    // rectangular region below both need it).
+    compute_ld_into(
+        l21,
+        d,
+        nelim,
+        ld_buf.as_mut().submatrix_mut(0, 0, trailing_size, nelim),
+        par,
+    );
+    let l21_fs = l21.subrows(0, fs_size);
 
     // Region 1 (FS×FS): Lower-triangular GEMM on A[ts..p, ts..p]
-    let fs_size = p.saturating_sub(trailing_start);
-    if fs_size > 0 {
+    {
         let w_fs = ld_buf.as_ref().submatrix(0, 0, fs_size, nelim);
-        let l21_fs = copy_buf.as_ref().submatrix(0, 0, fs_size, nelim);
-        let mut a_fs = a
+        let a_fs = right
             .rb_mut()
-            .submatrix_mut(trailing_start, trailing_start, fs_size, fs_size);
-
+            .submatrix_mut(trailing_start, 0, fs_size, fs_size);
         tri_matmul::matmul_with_conj(
-            a_fs.rb_mut(),
+            a_fs,
             BlockStructure::TriangularLower,
             Accum::Add,
             w_fs,
@@ -1515,15 +1497,13 @@ fn update_trailing<T: Scalar>(
         );
     }
 
-    // Region 2 (NFS×FS cross-term): Rectangular GEMM on A[p..m, ts..p]
+    // Region 2 (rows below p × FS columns): Rectangular GEMM on A[p..m, ts..p]
     let nfs_size = m - p;
-    if nfs_size > 0 && fs_size > 0 {
+    if nfs_size > 0 {
         let w_nfs = ld_buf.as_ref().submatrix(fs_size, 0, nfs_size, nelim);
-        let l21_fs = copy_buf.as_ref().submatrix(0, 0, fs_size, nelim);
-        let mut a_cross = a.submatrix_mut(p, trailing_start, nfs_size, fs_size);
-
+        let a_cross = right.submatrix_mut(p, 0, nfs_size, fs_size);
         faer::linalg::matmul::matmul_with_conj(
-            a_cross.rb_mut(),
+            a_cross,
             Accum::Add,
             w_nfs,
             Conj::No,
@@ -1550,25 +1530,72 @@ fn compute_ld_into<T: Scalar>(
     d: &MixedDiagonal<T>,
     nelim: usize,
     mut dst: MatMut<'_, T>,
+    par: Par,
 ) {
     let nrows = l.nrows();
+    // Split rows across threads for large blocks; each half is independent.
+    if par.degree() > 1 && nrows >= 2 * LD_PAR_MIN_ROWS && nrows * nelim >= LD_PAR_MIN_ENTRIES {
+        let mid = nrows / 2;
+        let (l_top, l_bot) = l.split_at_row(mid);
+        let (d_top, d_bot) = dst.split_at_row_mut(mid);
+        rayon::join(
+            || compute_ld_into(l_top, d, nelim, d_top, par),
+            || compute_ld_into(l_bot, d, nelim, d_bot, par),
+        );
+        return;
+    }
+
     let mut col = 0;
     while col < nelim {
         match d.pivot_type(col) {
             PivotType::OneByOne => {
                 let d_val = d.diagonal_1x1(col);
-                for i in 0..nrows {
-                    dst[(i, col)] = l[(i, col)] * d_val;
+                match (
+                    l.col(col).try_as_col_major(),
+                    dst.rb_mut().col_mut(col).try_as_col_major_mut(),
+                ) {
+                    (Some(src), Some(out)) => {
+                        for (o, &x) in out.as_slice_mut().iter_mut().zip(src.as_slice()) {
+                            *o = x * d_val;
+                        }
+                    }
+                    _ => {
+                        for i in 0..nrows {
+                            dst[(i, col)] = l[(i, col)] * d_val;
+                        }
+                    }
                 }
                 col += 1;
             }
             PivotType::TwoByTwo { partner } if partner > col => {
                 let block = d.diagonal_2x2(col);
-                for i in 0..nrows {
-                    let l1 = l[(i, col)];
-                    let l2 = l[(i, col + 1)];
-                    dst[(i, col)] = l1 * block.a + l2 * block.b;
-                    dst[(i, col + 1)] = l1 * block.b + l2 * block.c;
+                let (left, right) = dst.rb_mut().split_at_col_mut(col + 1);
+                match (
+                    l.col(col).try_as_col_major(),
+                    l.col(col + 1).try_as_col_major(),
+                    left.col_mut(col).try_as_col_major_mut(),
+                    right.col_mut(0).try_as_col_major_mut(),
+                ) {
+                    (Some(s1), Some(s2), Some(o1), Some(o2)) => {
+                        for (((o1, o2), &l1), &l2) in o1
+                            .as_slice_mut()
+                            .iter_mut()
+                            .zip(o2.as_slice_mut().iter_mut())
+                            .zip(s1.as_slice())
+                            .zip(s2.as_slice())
+                        {
+                            *o1 = l1 * block.a + l2 * block.b;
+                            *o2 = l1 * block.b + l2 * block.c;
+                        }
+                    }
+                    _ => {
+                        for i in 0..nrows {
+                            let l1 = l[(i, col)];
+                            let l2 = l[(i, col + 1)];
+                            dst[(i, col)] = l1 * block.a + l2 * block.b;
+                            dst[(i, col + 1)] = l1 * block.b + l2 * block.c;
+                        }
+                    }
                 }
                 col += 2;
             }
@@ -1578,6 +1605,11 @@ fn compute_ld_into<T: Scalar>(
         }
     }
 }
+
+/// Row count below which [`compute_ld_into`] does not split across threads.
+const LD_PAR_MIN_ROWS: usize = 2048;
+/// Entry count (rows × columns) below which [`compute_ld_into`] stays sequential.
+const LD_PAR_MIN_ENTRIES: usize = 1 << 18;
 
 /// Compute the NFS×NFS Schur complement via a single deferred GEMM.
 ///
@@ -1652,7 +1684,7 @@ pub(crate) fn compute_contribution_gemm<T: Scalar>(
     }
     let mut w = ld_workspace.as_mut().submatrix_mut(0, 0, nfs, ne);
     w.fill(T::zero());
-    compute_ld_into(l21_nfs, d, ne, w.rb_mut());
+    compute_ld_into(l21_nfs, d, ne, w.rb_mut(), par);
 
     // Step 3: Symmetric rank-ne update: contrib -= W * L21_NFS^T (lower triangle)
     tri_matmul::matmul_with_conj(
@@ -1709,7 +1741,7 @@ pub(crate) fn compute_contribution_gemm_in_place<T: Scalar>(
     }
     let mut w = ld_workspace.as_mut().submatrix_mut(0, 0, nfs, ne);
     w.fill(T::zero());
-    compute_ld_into(l21_nfs, d, ne, w.rb_mut());
+    compute_ld_into(l21_nfs, d, ne, w.rb_mut(), par);
 
     tri_matmul::matmul_with_conj(
         right.submatrix_mut(p, 0, nfs, nfs),
@@ -1777,6 +1809,7 @@ fn update_cross_terms<T: Scalar>(
             d,
             nelim,
             ld_buf.as_mut().submatrix_mut(0, 0, n_failed, nelim),
+            Par::Seq,
         );
     }
 
@@ -1825,6 +1858,7 @@ fn update_cross_terms<T: Scalar>(
             ld_buf
                 .as_mut()
                 .submatrix_mut(n_failed, 0, trailing_size, nelim),
+            Par::Seq,
         );
         let w_panel = ld_buf.as_ref().submatrix(n_failed, 0, trailing_size, nelim);
 
@@ -1880,13 +1914,19 @@ fn update_cross_terms<T: Scalar>(
 /// - `num_fully_summed`: Number of columns eligible for elimination
 /// - `options`: APTP configuration (inner_block_size determines ib)
 ///
+/// The rank-ib Schur updates (step 10) are applied to columns
+/// `0..num_fully_summed` only, for all rows below. When called from
+/// [`two_level_factor`] for one outer block, columns beyond the block are left
+/// for the caller's single deferred rank-nb update; when called directly,
+/// `num_fully_summed` is the whole fully-summed width, so every fully-summed
+/// column is updated here. NFS×NFS is always deferred to the contribution GEMM.
+///
 /// # References
 /// - SPRAL: `run_elim_pivoted_notasks` in `ldlt_app.cxx:1585-1713`
 /// - Duff, Hogg & Lopez (2020), Algorithm 3.1
 fn factor_inner<T: Scalar>(
     mut a: MatMut<'_, T>,
     num_fully_summed: usize,
-    nfs_boundary: usize,
     options: &AptpOptions,
     kernel_ws: &mut AptpKernelWorkspace<T>,
 ) -> Result<AptpFactorResult<T>, SparseError> {
@@ -2080,17 +2120,17 @@ fn factor_inner<T: Scalar>(
         if nelim > 0 {
             #[cfg(feature = "diagnostic")]
             let t = std::time::Instant::now();
+            // Columns limited to this call's block (p); rows: all below.
             update_trailing(
                 a.rb_mut(),
                 k,
                 nelim,
                 block_size,
                 m,
-                nfs_boundary,
+                p,
                 &block_d,
                 options.par,
                 &mut kernel_ws.ld_buf,
-                &mut kernel_ws.copy_buf,
             );
             #[cfg(feature = "diagnostic")]
             kernel_profile::add(5, t);
@@ -2211,7 +2251,7 @@ fn factor_inner<T: Scalar>(
 pub(crate) mod kernel_profile {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    pub(crate) const NAMES: [&str; 7] = [
+    pub(crate) const NAMES: [&str; 8] = [
         "backup",
         "factor diag block",
         "permute panel + rows",
@@ -2219,8 +2259,9 @@ pub(crate) mod kernel_profile {
         "restore failed",
         "update_trailing (rank-ib)",
         "update_cross_terms",
+        "deferred update (rank-nb)",
     ];
-    pub(crate) static NANOS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    pub(crate) static NANOS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
     pub(crate) static CALLS: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
@@ -2272,6 +2313,9 @@ fn two_level_factor<T: Scalar>(
     let mut global_nelim = 0;
     let mut remaining_fully_summed = p;
 
+    // Workspace for the deferred rank-nb update (W = L·D).
+    let mut deferred_ld = Mat::<T>::zeros(m, nb);
+
     while remaining_fully_summed > 0 {
         let col_start = global_nelim;
         let block_cols = remaining_fully_summed.min(nb);
@@ -2292,12 +2336,37 @@ fn two_level_factor<T: Scalar>(
             let block_view = a
                 .rb_mut()
                 .submatrix_mut(col_start, col_start, block_m, block_m);
-            // nfs_boundary relative to this subview: p - col_start
-            // This ensures inner blocks skip NFS×NFS updates consistently
-            // with the deferred GEMM that runs after aptp_factor_in_place.
-            factor_inner(block_view, block_cols, p - col_start, options, kernel_ws)?
+            // Inner rank-ib updates cover only this block's columns; the
+            // rest of the front is updated once below.
+            factor_inner(block_view, block_cols, options, kernel_ws)?
         };
         let block_nelim = block_result.num_eliminated;
+
+        // DEFERRED UPDATE: apply this outer block's eliminated columns to all
+        // fully-summed columns beyond the block in one rank-`block_nelim`
+        // update (≤ nb), instead of one rank-ib update per inner block:
+        //   A[ts..p, ts..p] -= L·D·Lᵀ (lower) and A[p..m, ts..p] -= L·D·Lᵀ,
+        // with ts = col_start + block_cols. NFS×NFS stays deferred to the
+        // contribution GEMM. This must run before failed columns are swapped
+        // out of the block below: trailing columns must be updated in place.
+        // Rows were already permuted consistently by factor_inner.
+        if block_nelim > 0 {
+            #[cfg(feature = "diagnostic")]
+            let t = std::time::Instant::now();
+            update_trailing(
+                a.rb_mut(),
+                col_start,
+                block_nelim,
+                block_cols,
+                m,
+                p,
+                &block_result.d,
+                options.par,
+                &mut deferred_ld,
+            );
+            #[cfg(feature = "diagnostic")]
+            kernel_profile::add(7, t);
+        }
 
         // PROPAGATE ROW PERMUTATION to already-factored columns.
         //
@@ -3157,7 +3226,7 @@ pub(super) fn compute_contribution_gemm_rect<T: Scalar>(
     }
     let mut w = ld_workspace.as_mut().submatrix_mut(0, 0, nfs, ne);
     w.fill(T::zero());
-    compute_ld_into(l21_nfs, d, ne, w.rb_mut());
+    compute_ld_into(l21_nfs, d, ne, w.rb_mut(), par);
 
     // Symmetric rank-ne update: contrib -= W * L21_NFS^T (lower triangle)
     tri_matmul::matmul_with_conj(
