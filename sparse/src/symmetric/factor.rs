@@ -1348,46 +1348,53 @@ fn apply_and_check<T: Scalar>(
         .submatrix_mut(panel_start, col_start, panel_rows, block_nelim);
     triangular_solve::solve_unit_lower_triangular_in_place(l11_ref, panel.transpose_mut(), par);
 
-    // Steps 2+3, fused and split across row blocks: scale by D^{-1}, then
-    // find the first pivot (1x1 or 2x2 group) whose column has an entry with
-    // |l| >= 1/u. Rows are independent, so each block reports its own first
-    // failing pivot and the minimum over blocks is the answer.
+    // Steps 2+3, fused and split across row blocks: scale by D^{-1} and
+    // record each column's largest |l|; the first pivot group whose column
+    // reaches 1/u fails.
     let stability_bound = real::<T>(1.0) / threshold;
     let panel = a
         .rb_mut()
         .submatrix_mut(panel_start, col_start, panel_rows, block_nelim);
-    let first_fail = scale_and_check_rows(panel, d, block_nelim, stability_bound, par);
-    first_fail.unwrap_or(block_nelim)
+    let col_max = scale_rows_col_max(panel, d, block_nelim, par);
+    first_failing_pivot(&col_max, d, block_nelim, stability_bound)
 }
 
-/// Rows per task below which [`scale_and_check_rows`] stays sequential.
+/// Rows per task below which [`scale_rows_col_max`] stays sequential.
 const SCALE_CHECK_PAR_MIN_ROWS: usize = 1024;
 
-/// Scale panel rows by D^{-1} (1x1 and 2x2 pivots) and return the start of
-/// the first pivot group with any |entry| >= `bound` in these rows, if any.
-fn scale_and_check_rows<T: Scalar>(
+/// Scale panel rows by D^{-1} (1x1 and 2x2 pivots, columns `0..nelim`) and
+/// return each column's largest modulus. Rows are independent, so row
+/// blocks run in parallel and their maxima are merged.
+fn scale_rows_col_max<T: Scalar>(
     mut panel: MatMut<'_, T>,
     d: &MixedDiagonal<T>,
     nelim: usize,
-    bound: T::Real,
     par: Par,
-) -> Option<usize> {
+) -> Vec<T::Real> {
     let rows = panel.nrows();
     if par.degree() > 1 && rows >= 2 * SCALE_CHECK_PAR_MIN_ROWS {
         let mid = rows / 2;
         let (top, bot) = panel.split_at_row_mut(mid);
-        let (a, b) = rayon::join(
-            || scale_and_check_rows(top, d, nelim, bound, par),
-            || scale_and_check_rows(bot, d, nelim, bound, par),
+        let (mut a, b) = rayon::join(
+            || scale_rows_col_max(top, d, nelim, par),
+            || scale_rows_col_max(bot, d, nelim, par),
         );
-        return match (a, b) {
-            (Some(x), Some(y)) => Some(x.min(y)),
-            (x, y) => x.or(y),
-        };
+        for (x, y) in a.iter_mut().zip(b) {
+            *x = x.max(y);
+        }
+        return a;
     }
 
-    let exceeds = |col: &[T]| col.iter().any(|v| v.mag() >= bound);
-    let mut first_fail: Option<usize> = None;
+    let col_max_of = |panel: MatRef<'_, T>, c: usize| -> T::Real {
+        match panel.col(c).try_as_col_major() {
+            Some(x) => x
+                .as_slice()
+                .iter()
+                .fold(real::<T>(0.0), |acc, v| acc.max(v.mag())),
+            None => (0..rows).fold(real::<T>(0.0), |acc, i| acc.max(panel[(i, c)].mag())),
+        }
+    };
+    let mut col_max = vec![real::<T>(0.0); nelim];
     let mut col = 0;
     while col < nelim {
         match d.pivot_type(col) {
@@ -1397,15 +1404,7 @@ fn scale_and_check_rows<T: Scalar>(
                 for i in 0..rows {
                     c[i] *= inv_d;
                 }
-                if first_fail.is_none() {
-                    let fail = match panel.rb().col(col).try_as_col_major() {
-                        Some(x) => exceeds(x.as_slice()),
-                        None => (0..rows).any(|i| panel[(i, col)].mag() >= bound),
-                    };
-                    if fail {
-                        first_fail = Some(col);
-                    }
-                }
+                col_max[col] = col_max_of(panel.rb(), col);
                 col += 1;
             }
             PivotType::TwoByTwo { partner } if partner > col => {
@@ -1421,17 +1420,8 @@ fn scale_and_check_rows<T: Scalar>(
                     panel[(i, col)] = (x1 * block.c - x2 * block.b) * inv_det;
                     panel[(i, col + 1)] = (x2 * block.a - x1 * block.b) * inv_det;
                 }
-                if first_fail.is_none() {
-                    let fail = (col..(col + 2).min(nelim)).any(|c| {
-                        match panel.rb().col(c).try_as_col_major() {
-                            Some(x) => exceeds(x.as_slice()),
-                            None => (0..rows).any(|i| panel[(i, c)].mag() >= bound),
-                        }
-                    });
-                    if fail {
-                        first_fail = Some(col);
-                    }
-                }
+                col_max[col] = col_max_of(panel.rb(), col);
+                col_max[col + 1] = col_max_of(panel.rb(), col + 1);
                 col += 2;
             }
             _ => {
@@ -1439,7 +1429,29 @@ fn scale_and_check_rows<T: Scalar>(
             }
         }
     }
-    first_fail
+    col_max
+}
+
+/// Start of the first pivot group (1x1, or both columns of a 2x2) whose
+/// column maximum reaches `bound`, or `nelim` if every group passes.
+fn first_failing_pivot<T: Scalar>(
+    col_max: &[T::Real],
+    d: &MixedDiagonal<T>,
+    nelim: usize,
+    bound: T::Real,
+) -> usize {
+    let mut col = 0;
+    while col < nelim {
+        let width = match d.pivot_type(col) {
+            PivotType::TwoByTwo { partner } if partner > col => 2,
+            _ => 1,
+        };
+        if (col..(col + width).min(nelim)).any(|c| col_max[c] >= bound) {
+            return col;
+        }
+        col += width;
+    }
+    nelim
 }
 
 /// Rank-nelim Schur complement update on the trailing submatrix via GEMM.
@@ -2280,7 +2292,7 @@ fn factor_inner<T: Scalar>(
 pub(crate) mod kernel_profile {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    pub(crate) const NAMES: [&str; 8] = [
+    pub(crate) const NAMES: [&str; 10] = [
         "backup",
         "factor diag block",
         "permute panel + rows",
@@ -2289,8 +2301,10 @@ pub(crate) mod kernel_profile {
         "update_trailing (rank-ib)",
         "update_cross_terms",
         "deferred update (rank-nb)",
+        "rows below tile (perm+TRSM+check)",
+        "rollback (restore+update)",
     ];
-    pub(crate) static NANOS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    pub(crate) static NANOS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
     pub(crate) static CALLS: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
@@ -2313,17 +2327,102 @@ pub fn take_kernel_profile() -> (Vec<(&'static str, f64)>, u64) {
     (steps, kernel_profile::CALLS.swap(0, Relaxed))
 }
 
+/// Copy columns: `dst[:, j] = src[:, map[j]]` (or `src[:, j]` without a
+/// map), splitting columns across threads for large copies.
+fn copy_cols<T: Scalar>(dst: MatMut<'_, T>, src: MatRef<'_, T>, map: Option<&[usize]>, par: Par) {
+    let (nr, nc) = (dst.nrows(), dst.ncols());
+    if par.degree() > 1 && nc >= 32 && nr * nc >= 1 << 18 {
+        let mid = nc / 2;
+        let (left, right) = dst.split_at_col_mut(mid);
+        let (map_l, map_r) = match map {
+            Some(m) => (Some(&m[..mid]), Some(&m[mid..])),
+            None => (None, None),
+        };
+        let (src_l, src_r) = match map {
+            Some(_) => (src, src),
+            None => src.split_at_col(mid),
+        };
+        rayon::join(
+            || copy_cols(left, src_l, map_l, par),
+            || copy_cols(right, src_r, map_r, par),
+        );
+        return;
+    }
+    let mut dst = dst;
+    for j in 0..nc {
+        let s = map.map_or(j, |m| m[j]);
+        dst.rb_mut().col_mut(j).copy_from(src.col(s));
+    }
+}
+
+/// Reclassify tile positions `block_nelim..tile_nelim` of a `factor_inner`
+/// result as failed after a rows-below rollback: truncate D, mark their
+/// pivot records delayed and recount the statistics.
+fn rollback_block_result<T: Scalar>(
+    result: &mut AptpFactorResult<T>,
+    block_nelim: usize,
+    tile_nelim: usize,
+) {
+    let rolled: std::collections::HashSet<usize> = result.perm[block_nelim..tile_nelim]
+        .iter()
+        .copied()
+        .collect();
+    for record in result.pivot_log.iter_mut() {
+        if rolled.contains(&record.col) && !matches!(record.pivot_type, PivotType::Delayed) {
+            record.pivot_type = PivotType::Delayed;
+            record.max_l_entry = 0.0;
+        }
+    }
+    let (mut n1, mut n2) = (0, 0);
+    let mut col = 0;
+    while col < block_nelim {
+        match result.d.pivot_type(col) {
+            PivotType::TwoByTwo { partner } if partner > col => {
+                n2 += 1;
+                col += 2;
+            }
+            _ => {
+                n1 += 1;
+                col += 1;
+            }
+        }
+    }
+    result.d.truncate(block_nelim);
+    result.stats.num_1x1 = n1;
+    result.stats.num_2x2 = n2;
+    result.stats.num_delayed += tile_nelim - block_nelim;
+    result.num_eliminated = block_nelim;
+}
+
 /// Two-level outer block loop for large frontal matrices.
 ///
-/// Processes nb-sized blocks. For each outer block: `factor_inner` handles
-/// the BLAS-3 Factor/Apply/Update loop internally on ib-sized sub-blocks,
-/// including threshold checking on the panel via `apply_and_check` and
-/// block-level backup/restore on failure.
+/// Processes the fully-summed columns in tiles of `nb` columns. For each tile:
+///
+/// 1. `factor_inner` factors the `nb × nb` diagonal tile alone (sequentially):
+///    complete pivoting on ib-sized sub-blocks, their a posteriori checks
+///    and rank-ib updates, all within the tile.
+/// 2. The rows below the tile are handled once: the tile's column
+///    permutation, one TRSM with the tile's L11 (rank up to nb), and a fused
+///    D⁻¹ scaling with per-column maxima.
+/// 3. A posteriori check on those rows: the first pivot with |l| ≥ 1/u ends
+///    the tile's passed set. Columns that passed in the tile but fail here
+///    are rolled back: restored from the pre-tile backups and updated from
+///    the surviving columns only. Columns that failed inside the tile get
+///    their rows-below update from the passed columns.
+/// 4. One rank-`nelim` update of every fully-summed column beyond the tile
+///    (NFS×NFS stays deferred to the contribution GEMM).
+///
+/// Failed columns are then moved past the remaining columns, as before.
+/// Checking the rows below once per tile (rather than once per ib block) is
+/// the block-column granularity of SPRAL's APP; it can delay a few more
+/// columns on hard indefinite matrices, in exchange for coarse, parallel
+/// BLAS-3 work on the long rows-below panel.
 ///
 /// Called by `aptp_factor_in_place` when `num_fully_summed > outer_block_size`.
 ///
 /// # References
 /// - Duff, Hogg & Lopez (2020), Algorithm 3.1: two-level outer loop
+/// - SPRAL `ldlt_app.cxx` (BSD-3): block-column apply/check/update
 fn two_level_factor<T: Scalar>(
     mut a: MatMut<'_, T>,
     num_fully_summed: usize,
@@ -2342,43 +2441,192 @@ fn two_level_factor<T: Scalar>(
     let mut global_nelim = 0;
     let mut remaining_fully_summed = p;
 
-    // Workspace for the deferred rank-nb update (W = L·D).
+    // Workspaces: W = L·D for the rank-nb updates, and the pre-factorization
+    // tile and rows-below panel kept for rollback.
     let mut deferred_ld = Mat::<T>::zeros(m, nb);
+    let mut tile_backup = Mat::<T>::zeros(nb, nb);
+    let tile_options = AptpOptions {
+        par: Par::Seq,
+        ..options.clone()
+    };
+    let mut panel_backup = Mat::<T>::zeros(m, nb);
 
     while remaining_fully_summed > 0 {
         let col_start = global_nelim;
         let block_cols = remaining_fully_summed.min(nb);
 
-        // FACTOR: inner APTP on the full view (including panel rows).
-        // factor_inner handles:
-        //   - Complete pivoting search within ib×ib sub-blocks
-        //   - Symmetric swaps applied to ALL rows (including panel)
-        //   - L entry computation + threshold check for ALL rows (via try_1x1/try_2x2)
-        //   - Schur complement update for ALL trailing rows
-        //   - Internal backup/restore for failed pivots (inside try_1x1/try_2x2)
-        //
-        // No external backup/restore is needed: factor_inner handles all
-        // threshold failures internally, and the Schur complement has been
-        // applied to all trailing entries including any delayed columns.
-        let block_m = m - col_start;
-        let block_result = {
-            let block_view = a
-                .rb_mut()
-                .submatrix_mut(col_start, col_start, block_m, block_m);
-            // Inner rank-ib updates cover only this block's columns; the
-            // rest of the front is updated once below.
-            factor_inner(block_view, block_cols, options, kernel_ws)?
-        };
-        let block_nelim = block_result.num_eliminated;
+        let tile_end = col_start + block_cols;
+        let rows_below = m - tile_end;
 
-        // DEFERRED UPDATE: apply this outer block's eliminated columns to all
-        // fully-summed columns beyond the block in one rank-`block_nelim`
-        // update (≤ nb), instead of one rank-ib update per inner block:
+        // Keep the tile's pre-factorization values: if a column that passed
+        // inside the tile fails in the rows below, the tile is rolled back.
+        tile_backup
+            .as_mut()
+            .submatrix_mut(0, 0, block_cols, block_cols)
+            .copy_from(
+                a.rb()
+                    .submatrix(col_start, col_start, block_cols, block_cols),
+            );
+
+        // FACTOR the diagonal tile only (block_cols x block_cols). Pivoting,
+        // the per-inner-block stability checks and rank-ib updates all stay
+        // inside the tile; the rows below are handled once per tile below.
+        // The tile is at most nb x nb (256 x 256): too small for intra-tile
+        // parallelism to pay off, so it runs sequentially. The rows below
+        // and the deferred update carry the parallel work.
+        let mut block_result = {
+            let tile_view = a
+                .rb_mut()
+                .submatrix_mut(col_start, col_start, block_cols, block_cols);
+            factor_inner(tile_view, block_cols, &tile_options, kernel_ws)?
+        };
+        let tile_nelim = block_result.num_eliminated;
+        let mut block_nelim = tile_nelim;
+
+        // ROWS BELOW THE TILE (fully-summed rows of later tiles and NFS rows),
+        // once per tile instead of once per inner block:
+        //   1. apply the tile's column permutation (keeping the original panel
+        //      for rollback),
+        //   2. L_below = A_below · L11^{-T} · D^{-1} for the passed columns
+        //      (one rank-tile_nelim TRSM, then fused scaling and column maxima),
+        //   3. the a posteriori check: the first column with |l| >= 1/u in
+        //      these rows ends the passed set (Duff, Hogg & Lopez 2020, APP).
+        if rows_below > 0 {
+            #[cfg(feature = "diagnostic")]
+            let t = std::time::Instant::now();
+            let perm = &block_result.perm[..block_cols];
+            let (top, mut below) = a.rb_mut().split_at_row_mut(tile_end);
+            let tile = top
+                .rb()
+                .submatrix(col_start, col_start, block_cols, block_cols);
+            let mut panel = below
+                .rb_mut()
+                .submatrix_mut(0, col_start, rows_below, block_cols);
+            let mut saved = panel_backup
+                .as_mut()
+                .submatrix_mut(0, 0, rows_below, block_cols);
+            copy_cols(saved.rb_mut(), panel.rb(), None, options.par);
+            copy_cols(panel.rb_mut(), saved.rb(), Some(perm), options.par);
+
+            if tile_nelim > 0 {
+                triangular_solve::solve_unit_lower_triangular_in_place(
+                    tile.submatrix(0, 0, tile_nelim, tile_nelim),
+                    panel.rb_mut().subcols_mut(0, tile_nelim).transpose_mut(),
+                    options.par,
+                );
+                let col_max = scale_rows_col_max(
+                    panel.rb_mut().subcols_mut(0, tile_nelim),
+                    &block_result.d,
+                    tile_nelim,
+                    options.par,
+                );
+                let bound = real::<T>(1.0) / real::<T>(options.threshold);
+                block_nelim = adjust_for_2x2_boundary(
+                    first_failing_pivot(&col_max, &block_result.d, tile_nelim, bound),
+                    &block_result.d,
+                );
+                for &v in &col_max[..block_nelim] {
+                    let v = to_f64(v);
+                    if v > block_result.stats.max_l_entry {
+                        block_result.stats.max_l_entry = v;
+                    }
+                }
+            }
+
+            // Columns that failed inside the tile (block_nelim == tile_nelim)
+            // already carry the tile's updates in the tile rows; their rows
+            // below still need the update from the passed columns.
+            if block_nelim == tile_nelim && block_nelim > 0 && block_nelim < block_cols {
+                let nf = block_cols - block_nelim;
+                let l_below = panel.rb().subcols(0, block_nelim);
+                let mut w = deferred_ld
+                    .as_mut()
+                    .submatrix_mut(0, 0, rows_below, block_nelim);
+                compute_ld_into(
+                    l_below,
+                    &block_result.d,
+                    block_nelim,
+                    w.rb_mut(),
+                    options.par,
+                );
+                let (_, failed) = panel.rb_mut().split_at_col_mut(block_nelim);
+                faer::linalg::matmul::matmul_with_conj(
+                    failed,
+                    Accum::Add,
+                    w.rb(),
+                    Conj::No,
+                    tile.submatrix(block_nelim, 0, nf, block_nelim).transpose(),
+                    Conj::No,
+                    T::from_f64(-1.0),
+                    options.par,
+                );
+            }
+            #[cfg(feature = "diagnostic")]
+            kernel_profile::add(8, t);
+        }
+
+        // ROLLBACK: a column that passed inside the tile failed in the rows
+        // below. Columns block_nelim..block_cols become failed: restore them
+        // (tile part from the tile backup, rows below from the panel backup,
+        // both through the tile permutation) and apply the update from the
+        // passed columns 0..block_nelim only.
+        if block_nelim < tile_nelim {
+            #[cfg(feature = "diagnostic")]
+            let t = std::time::Instant::now();
+            let perm = &block_result.perm[..block_cols];
+            for c in block_nelim..block_cols {
+                for i in c..block_cols {
+                    let (r0, c0) = (perm[i], perm[c]);
+                    let v = if r0 >= c0 {
+                        tile_backup[(r0, c0)]
+                    } else {
+                        tile_backup[(c0, r0)]
+                    };
+                    a[(col_start + i, col_start + c)] = v;
+                }
+            }
+            if rows_below > 0 {
+                let mut panel = a.rb_mut().submatrix_mut(
+                    tile_end,
+                    col_start + block_nelim,
+                    rows_below,
+                    block_cols - block_nelim,
+                );
+                copy_cols(
+                    panel.rb_mut(),
+                    panel_backup
+                        .as_ref()
+                        .submatrix(0, 0, rows_below, block_cols),
+                    Some(&perm[block_nelim..]),
+                    options.par,
+                );
+            }
+            if block_nelim > 0 {
+                // Columns [col_start+block_nelim, tile_end), rows below them.
+                update_trailing(
+                    a.rb_mut(),
+                    col_start,
+                    block_nelim,
+                    block_nelim,
+                    m,
+                    tile_end,
+                    &block_result.d,
+                    options.par,
+                    &mut deferred_ld,
+                );
+            }
+            rollback_block_result(&mut block_result, block_nelim, tile_nelim);
+            #[cfg(feature = "diagnostic")]
+            kernel_profile::add(9, t);
+        }
+
+        // DEFERRED UPDATE: apply this tile's passed columns to all
+        // fully-summed columns beyond the tile in one rank-`block_nelim`
+        // update (≤ nb):
         //   A[ts..p, ts..p] -= L·D·Lᵀ (lower) and A[p..m, ts..p] -= L·D·Lᵀ,
-        // with ts = col_start + block_cols. NFS×NFS stays deferred to the
-        // contribution GEMM. This must run before failed columns are swapped
-        // out of the block below: trailing columns must be updated in place.
-        // Rows were already permuted consistently by factor_inner.
+        // with ts = tile_end. NFS×NFS stays deferred to the contribution GEMM.
+        // This must run before failed columns are swapped out of the tile
+        // below: trailing columns must be updated in place.
         if block_nelim > 0 {
             #[cfg(feature = "diagnostic")]
             let t = std::time::Instant::now();
@@ -5947,6 +6195,121 @@ mod tests {
     }
 
     // ---- NFS boundary in two-level factor tests ----
+
+    #[test]
+    fn test_two_level_rows_below_rollback() {
+        // Columns that pass inside their diagonal tile but have huge entries
+        // only in the rows below it must fail the per-tile a posteriori check
+        // and be rolled back (restored, then updated from the passed columns
+        // only). The tile itself is unchanged, so only the rows-below check
+        // can reject them.
+        struct Case {
+            m: usize,
+            p: usize,
+            nb: usize,
+            ib: usize,
+            seed: u64,
+            diag_scale: f64,
+            /// (tile index, columns within that tile) to poison below the tile
+            poison: &'static [(usize, &'static [usize])],
+        }
+        let cases = [
+            Case {
+                m: 64,
+                p: 48,
+                nb: 16,
+                ib: 4,
+                seed: 42,
+                diag_scale: 5.0,
+                poison: &[(0, &[3, 9])],
+            },
+            Case {
+                m: 96,
+                p: 80,
+                nb: 32,
+                ib: 8,
+                seed: 7,
+                diag_scale: 5.0,
+                poison: &[(0, &[1]), (1, &[5, 6])],
+            },
+            Case {
+                m: 48,
+                p: 40,
+                nb: 8,
+                ib: 4,
+                seed: 137,
+                diag_scale: 5.0,
+                poison: &[(1, &[0, 7]), (2, &[2])],
+            },
+            // Weak diagonal: many 2x2 pivots inside the tiles.
+            Case {
+                m: 80,
+                p: 64,
+                nb: 16,
+                ib: 4,
+                seed: 271,
+                diag_scale: 0.1,
+                poison: &[(0, &[2, 3]), (2, &[11])],
+            },
+        ];
+
+        for (idx, c) in cases.iter().enumerate() {
+            let base = deterministic_indefinite_matrix(c.m, c.seed, c.diag_scale);
+            let big = 1e6
+                * (0..c.m)
+                    .flat_map(|i| (0..c.m).map(move |j| (i, j)))
+                    .fold(0.0f64, |acc, (i, j)| acc.max(base[(i, j)].abs()));
+            let mut poisoned = base.clone();
+            for &(tile, cols) in c.poison {
+                for &cl in cols {
+                    let col = tile * c.nb + cl;
+                    for r in (tile + 1) * c.nb..c.m {
+                        let v = big * (1.0 + 0.01 * r as f64);
+                        poisoned[(r, col)] = v;
+                        poisoned[(col, r)] = v;
+                    }
+                }
+            }
+
+            for method in [FailedPivotMethod::Pass, FailedPivotMethod::Tpp] {
+                let opts = AptpOptions {
+                    outer_block_size: c.nb,
+                    inner_block_size: c.ib,
+                    threshold: 0.01,
+                    failed_pivot_method: method,
+                    ..AptpOptions::default()
+                };
+                let delayed_of = |mat: &Mat<f64>| {
+                    let mut a = mat.clone();
+                    let r = aptp_factor_in_place(a.as_mut(), c.p, &opts).unwrap();
+                    (a, r)
+                };
+                let (_, base_result) = delayed_of(&base);
+                let (factored, result) = delayed_of(&poisoned);
+
+                let sum =
+                    result.stats.num_1x1 + 2 * result.stats.num_2x2 + result.stats.num_delayed;
+                assert_eq!(
+                    sum, c.p,
+                    "case {idx} {method:?}: statistics invariant {sum} != {}",
+                    c.p
+                );
+                let err = check_partial_factorization_in_place(&poisoned, &factored, c.p, &result);
+                assert!(
+                    err < 1e-10,
+                    "case {idx} {method:?}: reconstruction error {err:.2e}"
+                );
+                if method == FailedPivotMethod::Pass {
+                    assert!(
+                        result.stats.num_delayed > base_result.stats.num_delayed,
+                        "case {idx}: poisoned columns were not delayed ({} vs {} baseline)",
+                        result.stats.num_delayed,
+                        base_result.stats.num_delayed
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_two_level_nfs_boundary_mid_block() {
