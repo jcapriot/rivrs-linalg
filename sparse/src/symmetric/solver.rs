@@ -27,8 +27,7 @@ use super::solve::{aptp_solve, aptp_solve_scratch};
 use super::symbolic::AptpSymbolic;
 use crate::error::SparseError;
 use crate::ordering::{match_order_metis, metis_ordering};
-#[allow(unused_imports)]
-use crate::scalar::{Mag, S, s, zero};
+use crate::scalar::Scalar;
 
 /// Fill-reducing ordering strategy.
 ///
@@ -177,15 +176,15 @@ impl Default for SolverOptions {
 /// assert!((x[0] - 1.0).abs() < 1e-12);
 /// assert!((x[1] - 1.0).abs() < 1e-12);
 /// ```
-pub struct SparseLDLT {
+pub struct SparseLDLT<T: Scalar = f64> {
     symbolic: AptpSymbolic,
-    numeric: Option<AptpNumeric>,
+    numeric: Option<AptpNumeric<T>>,
     scaling: Option<Vec<f64>>,
     /// Cached forward permutation (perm_fwd[new] = old). Computed once during analyze.
     perm_fwd: Vec<usize>,
 }
 
-impl SparseLDLT {
+impl<T: Scalar> SparseLDLT<T> {
     /// Build a `SparseLDLT` with cached permutation vectors from symbolic analysis.
     fn new_with_cached_perm(symbolic: AptpSymbolic, scaling: Option<Vec<f64>>) -> Self {
         let (perm_fwd, _) = symbolic.perm_vecs();
@@ -261,18 +260,21 @@ impl SparseLDLT {
     /// matching on the numeric matrix to compute scaling factors and
     /// a fill-reducing ordering. Other orderings delegate to [`analyze`](Self::analyze).
     pub fn analyze_with_matrix(
-        matrix: &SparseColMat<usize, S>,
+        matrix: &SparseColMat<usize, T>,
         options: &AnalyzeOptions,
     ) -> Result<Self, SparseError> {
         let n = matrix.nrows();
 
         match &options.ordering {
             OrderingStrategy::MatchOrderMetis => {
-                #[cfg(not(feature = "complex"))]
-                let result = match_order_metis(matrix)?;
-                // Complex symmetric: run MC64 on |A| (real), as MUMPS does.
-                #[cfg(feature = "complex")]
-                let result = match_order_metis(&magnitude_matrix(matrix)?)?;
+                // MC64 needs real weights. For f64 use A directly; for any
+                // other scalar run it on |A| (as MUMPS does for complex).
+                let result = match (matrix as &dyn std::any::Any)
+                    .downcast_ref::<SparseColMat<usize, f64>>()
+                {
+                    Some(real) => match_order_metis(real)?,
+                    None => match_order_metis(&magnitude_matrix(matrix)?)?,
+                };
                 let ordering_perm = result.ordering;
                 let symbolic = AptpSymbolic::analyze(
                     matrix.symbolic(),
@@ -301,7 +303,7 @@ impl SparseLDLT {
     /// - `SparseError::DimensionMismatch` if matrix dimensions differ from analysis
     pub fn factor(
         &mut self,
-        matrix: &SparseColMat<usize, S>,
+        matrix: &SparseColMat<usize, T>,
         options: &FactorOptions,
     ) -> Result<(), SparseError> {
         let aptp_options = AptpOptions {
@@ -340,7 +342,7 @@ impl SparseLDLT {
     /// Equivalent to calling [`factor`](Self::factor) again.
     pub fn refactor(
         &mut self,
-        matrix: &SparseColMat<usize, S>,
+        matrix: &SparseColMat<usize, T>,
         options: &FactorOptions,
     ) -> Result<(), SparseError> {
         self.factor(matrix, options)
@@ -356,10 +358,10 @@ impl SparseLDLT {
     /// - `SparseError::DimensionMismatch` if rhs length != matrix dimension
     pub fn solve(
         &self,
-        rhs: &Col<S>,
+        rhs: &Col<T>,
         stack: &mut MemStack,
         par: Par,
-    ) -> Result<Col<S>, SparseError> {
+    ) -> Result<Col<T>, SparseError> {
         let mut result = rhs.to_owned();
         self.solve_in_place(&mut result, stack, par)?;
         Ok(result)
@@ -375,7 +377,7 @@ impl SparseLDLT {
     /// - `SparseError::DimensionMismatch` if rhs length != matrix dimension
     pub fn solve_in_place(
         &self,
-        rhs: &mut Col<S>,
+        rhs: &mut Col<T>,
         stack: &mut MemStack,
         par: Par,
     ) -> Result<(), SparseError> {
@@ -403,7 +405,7 @@ impl SparseLDLT {
 
         // 1. Permute: rhs_perm[new] = rhs[perm_fwd[new]]
         //    perm_fwd[new] = old, so this gathers original RHS into permuted order.
-        let mut rhs_perm = vec![crate::scalar::zero(); n];
+        let mut rhs_perm = vec![T::zero(); n];
         for new in 0..n {
             rhs_perm[new] = rhs[perm_fwd[new]];
         }
@@ -411,17 +413,17 @@ impl SparseLDLT {
         // 2. Scale (if scaling present): rhs_perm[i] *= scaling[i]
         if let Some(ref scaling) = self.scaling {
             for i in 0..n {
-                rhs_perm[i] *= scaling[i];
+                rhs_perm[i] *= T::from_f64(scaling[i]);
             }
         }
 
         // 3. Core solve: aptp_solve(symbolic, numeric, &mut rhs_perm, stack, par)
         aptp_solve(&self.symbolic, numeric, &mut rhs_perm, stack, par)?;
 
-        // 4. Unscale: rhs_perm[i] *= scaling[i] (symmetric: same S applied)
+        // 4. Unscale: rhs_perm[i] *= scaling[i] (symmetric: same T applied)
         if let Some(ref scaling) = self.scaling {
             for i in 0..n {
-                rhs_perm[i] *= scaling[i];
+                rhs_perm[i] *= T::from_f64(scaling[i]);
             }
         }
 
@@ -474,10 +476,10 @@ impl SparseLDLT {
     /// assert!((x[0] - 1.0).abs() < 1e-12);
     /// ```
     pub fn solve_full(
-        matrix: &SparseColMat<usize, S>,
-        rhs: &Col<S>,
+        matrix: &SparseColMat<usize, T>,
+        rhs: &Col<T>,
         options: &SolverOptions,
-    ) -> Result<Col<S>, SparseError> {
+    ) -> Result<Col<T>, SparseError> {
         let analyze_opts = AnalyzeOptions {
             ordering: options.ordering.clone(),
         };
@@ -508,6 +510,11 @@ impl SparseLDLT {
     ///
     /// Returns `None` if [`factor`](Self::factor) has not been called.
     pub fn inertia(&self) -> Option<Inertia> {
+        // Inertia (eigenvalue sign counts) is only defined for real symmetric
+        // matrices; a complex symmetric matrix has complex eigenvalues.
+        if T::IS_COMPLEX {
+            return None;
+        }
         self.numeric.as_ref().map(|numeric| {
             let mut inertia = Inertia {
                 positive: 0,
@@ -556,12 +563,15 @@ impl SparseLDLT {
 
 /// Entry-wise modulus of a complex matrix, for orderings/scalings that need
 /// real weights (MC64 matching).
-#[cfg(feature = "complex")]
-fn magnitude_matrix(matrix: &SparseColMat<usize, S>) -> Result<SparseColMat<usize, f64>, SparseError> {
+fn magnitude_matrix<T: Scalar>(
+    matrix: &SparseColMat<usize, T>,
+) -> Result<SparseColMat<usize, f64>, SparseError> {
     let symbolic = matrix
         .symbolic()
         .to_owned()
-        .map_err(|e| SparseError::AnalysisFailure { reason: format!("{e:?}") })?;
+        .map_err(|e| SparseError::AnalysisFailure {
+            reason: format!("{e:?}"),
+        })?;
     let vals = matrix.val().iter().map(|v| v.mag()).collect();
     Ok(SparseColMat::new(symbolic, vals))
 }

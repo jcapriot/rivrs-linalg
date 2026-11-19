@@ -5,8 +5,7 @@
 //! decisions made during the A Posteriori Threshold Pivoting algorithm described
 //! in Hogg, Duff & Lopez (2020), "A New Sparse LDL^T Solver Using A Posteriori
 //! Threshold Pivoting", SIAM J. Sci. Comput. 42(4).
-#[allow(unused_imports)]
-use crate::scalar::{Mag, S, s, zero};
+use crate::scalar::Scalar;
 
 /// Classification of a single column's pivot decision during APTP factorization.
 ///
@@ -45,29 +44,28 @@ pub enum PivotType {
 ///   "Some Stable Methods for Calculating Inertia and Solving Symmetric
 ///   Linear Systems", Math. Comp.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Block2x2 {
+pub struct Block2x2<T: Scalar = f64> {
     /// Index of the first (lower-indexed) column of the 2x2 block.
     pub first_col: usize,
     /// Top-left element: `D[i, i]`.
-    pub a: S,
+    pub a: T,
     /// Off-diagonal element: `D[i, i+1] = D[i+1, i]`.
-    pub b: S,
+    pub b: T,
     /// Bottom-right element: `D[i+1, i+1]`.
-    pub c: S,
+    pub c: T,
 }
 
-impl Block2x2 {
+impl<T: Scalar> Block2x2<T> {
     /// Determinant of the 2x2 block: `ac - b²`.
-    pub fn determinant(&self) -> S {
+    pub fn determinant(&self) -> T {
         self.a * self.c - self.b * self.b
     }
 
     /// Trace of the 2x2 block: `a + c`.
-    pub fn trace(&self) -> S {
+    pub fn trace(&self) -> T {
         self.a + self.c
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

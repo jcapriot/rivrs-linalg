@@ -892,7 +892,7 @@ fn test_match_order_metis_requires_numeric() {
     let opts = AnalyzeOptions {
         ordering: OrderingStrategy::MatchOrderMetis,
     };
-    let result = SparseLDLT::analyze(matrix.symbolic(), &opts);
+    let result = SparseLDLT::<f64>::analyze(matrix.symbolic(), &opts);
     assert!(
         result.is_err(),
         "MatchOrderMetis with symbolic-only should fail"

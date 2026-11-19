@@ -10,16 +10,15 @@
 
 use super::inertia::Inertia;
 use super::pivot::{Block2x2, PivotType};
-#[allow(unused_imports)]
-use crate::scalar::{Mag, S, re, s, zero};
+use crate::scalar::Scalar;
 
 /// A single pivot entry from a [`MixedDiagonal`], yielded by [`MixedDiagonal::iter_pivots`].
 #[derive(Debug, Clone)]
-pub enum PivotEntry {
+pub enum PivotEntry<T: Scalar = f64> {
     /// 1x1 pivot with scalar diagonal value.
-    OneByOne(S),
+    OneByOne(T),
     /// 2x2 Bunch-Kaufman pivot block (yielded only at the lower-indexed column).
-    TwoByTwo(Block2x2),
+    TwoByTwo(Block2x2<T>),
     /// Unresolved pivot.
     Delayed,
 }
@@ -48,22 +47,22 @@ pub enum PivotEntry {
 /// - Hogg, Duff & Lopez (2020), Section 3: mixed diagonal D storage in APTP
 /// - Bunch & Kaufman (1977): 2x2 pivot block structure
 #[derive(Debug)]
-pub struct MixedDiagonal {
+pub struct MixedDiagonal<T: Scalar = f64> {
     pivot_map: Vec<PivotType>,
-    diag: Vec<S>,
-    off_diag: Vec<S>,
+    diag: Vec<T>,
+    off_diag: Vec<T>,
     n: usize,
 }
 
-impl MixedDiagonal {
+impl<T: Scalar> MixedDiagonal<T> {
     /// Create a new `MixedDiagonal` of dimension `n`.
     ///
     /// All columns start as [`PivotType::Delayed`] (unset).
     pub fn new(n: usize) -> Self {
         Self {
             pivot_map: vec![PivotType::Delayed; n],
-            diag: vec![zero(); n],
-            off_diag: vec![zero(); n],
+            diag: vec![T::zero(); n],
+            off_diag: vec![T::zero(); n],
             n,
         }
     }
@@ -74,7 +73,7 @@ impl MixedDiagonal {
     ///
     /// - `col >= n` (bounds check)
     /// - Column is not currently [`PivotType::Delayed`] (cannot overwrite a set pivot)
-    pub fn set_1x1(&mut self, col: usize, value: S) {
+    pub fn set_1x1(&mut self, col: usize, value: T) {
         debug_assert!(
             col < self.n,
             "set_1x1: col {} out of bounds (n = {})",
@@ -99,7 +98,7 @@ impl MixedDiagonal {
     ///
     /// - `first_col + 1 >= n` (block must fit)
     /// - Either column is not currently [`PivotType::Delayed`]
-    pub fn set_2x2(&mut self, block: Block2x2) {
+    pub fn set_2x2(&mut self, block: Block2x2<T>) {
         let col = block.first_col;
         debug_assert!(
             col + 1 < self.n,
@@ -151,7 +150,7 @@ impl MixedDiagonal {
     /// # Panics (debug only)
     ///
     /// Column is not [`PivotType::OneByOne`].
-    pub fn diagonal_1x1(&self, col: usize) -> S {
+    pub fn diagonal_1x1(&self, col: usize) -> T {
         debug_assert!(
             self.pivot_map[col] == PivotType::OneByOne,
             "diagonal_1x1: col {} is not OneByOne ({:?})",
@@ -168,7 +167,7 @@ impl MixedDiagonal {
     /// # Panics (debug only)
     ///
     /// Column is not the owner (lower-indexed) of a [`PivotType::TwoByTwo`] block.
-    pub fn diagonal_2x2(&self, first_col: usize) -> Block2x2 {
+    pub fn diagonal_2x2(&self, first_col: usize) -> Block2x2<T> {
         debug_assert!(
             matches!(self.pivot_map[first_col], PivotType::TwoByTwo { partner } if partner > first_col),
             "diagonal_2x2: col {} is not a 2x2 block owner ({:?})",
@@ -203,8 +202,8 @@ impl MixedDiagonal {
     pub fn grow(&mut self, new_n: usize) {
         if new_n > self.n {
             self.pivot_map.resize(new_n, PivotType::Delayed);
-            self.diag.resize(new_n, zero());
-            self.off_diag.resize(new_n, zero());
+            self.diag.resize(new_n, T::zero());
+            self.off_diag.resize(new_n, T::zero());
             self.n = new_n;
         }
     }
@@ -233,7 +232,12 @@ impl MixedDiagonal {
     ///
     /// - `self_offset + count > self.n`
     /// - `count > source.n`
-    pub fn copy_from_offset(&mut self, source: &MixedDiagonal, self_offset: usize, count: usize) {
+    pub fn copy_from_offset(
+        &mut self,
+        source: &MixedDiagonal<T>,
+        self_offset: usize,
+        count: usize,
+    ) {
         debug_assert!(
             self_offset + count <= self.n,
             "copy_from_offset: self_offset {} + count {} > self.n {}",
@@ -277,11 +281,11 @@ impl MixedDiagonal {
         }
     }
 
-    /// Iterate over pivot entries, yielding `(col_index, PivotEntry)` pairs.
+    /// Iterate over pivot entries, yielding `(col_index, PivotEntry<T>)` pairs.
     ///
     /// Advances by 1 for 1x1 and Delayed pivots, by 2 for 2x2 pivots
     /// (yielding the block only at the lower-indexed column and skipping the partner).
-    pub fn iter_pivots(&self) -> PivotIter<'_> {
+    pub fn iter_pivots(&self) -> PivotIter<'_, T> {
         PivotIter { d: self, col: 0 }
     }
 
@@ -311,7 +315,7 @@ impl MixedDiagonal {
     ///
     /// - Cramer's rule for 2x2 symmetric systems
     /// - Hogg, Duff & Lopez (2020), Section 3: D-solve in APTP context
-    pub fn solve_in_place(&self, x: &mut [S]) {
+    pub fn solve_in_place(&self, x: &mut [T]) {
         debug_assert_eq!(
             x.len(),
             self.n,
@@ -330,9 +334,9 @@ impl MixedDiagonal {
             match self.pivot_map[col] {
                 PivotType::OneByOne => {
                     let d = self.diag[col];
-                    if d == zero() {
+                    if d == T::zero() {
                         // Zero pivot: set solution component to zero
-                        x[col] = zero();
+                        x[col] = T::zero();
                     } else {
                         x[col] /= d;
                     }
@@ -344,10 +348,10 @@ impl MixedDiagonal {
                         let b = self.off_diag[col];
                         let c = self.diag[partner];
                         let det = a * c - b * b;
-                        if det == zero() {
+                        if det == T::zero() {
                             // Zero-determinant 2x2 block: set both components to zero
-                            x[col] = zero();
-                            x[partner] = zero();
+                            x[col] = T::zero();
+                            x[partner] = T::zero();
                         } else {
                             let r1 = x[col];
                             let r2 = x[partner];
@@ -406,9 +410,9 @@ impl MixedDiagonal {
             match self.pivot_map[col] {
                 PivotType::OneByOne => {
                     let d = self.diag[col];
-                    if re(d) > 0.0 {
+                    if d.real_part() > 0.0 {
                         positive += 1;
-                    } else if re(d) < 0.0 {
+                    } else if d.real_part() < 0.0 {
                         negative += 1;
                     } else {
                         zero += 1;
@@ -424,22 +428,22 @@ impl MixedDiagonal {
                         let det = a * c - b * b;
                         let trace = a + c;
 
-                        if re(det) > 0.0 {
-                            if re(trace) > 0.0 {
+                        if det.real_part() > 0.0 {
+                            if trace.real_part() > 0.0 {
                                 positive += 2;
                             } else {
                                 // trace < 0 (trace == 0 impossible with det > 0 for real symmetric)
                                 negative += 2;
                             }
-                        } else if re(det) < 0.0 {
+                        } else if det.real_part() < 0.0 {
                             positive += 1;
                             negative += 1;
                         } else {
                             // det == 0
-                            if re(trace) > 0.0 {
+                            if trace.real_part() > 0.0 {
                                 positive += 1;
                                 zero += 1;
-                            } else if re(trace) < 0.0 {
+                            } else if trace.real_part() < 0.0 {
                                 negative += 1;
                                 zero += 1;
                             } else {
@@ -465,15 +469,15 @@ impl MixedDiagonal {
 
 /// Iterator over pivot entries in a [`MixedDiagonal`].
 ///
-/// Yields `(col_index, PivotEntry)` pairs, advancing by 2 for 2x2 pivots
+/// Yields `(col_index, PivotEntry<T>)` pairs, advancing by 2 for 2x2 pivots
 /// (yielding only at the lower-indexed column).
-pub struct PivotIter<'a> {
-    d: &'a MixedDiagonal,
+pub struct PivotIter<'a, T: Scalar = f64> {
+    d: &'a MixedDiagonal<T>,
     col: usize,
 }
 
-impl<'a> Iterator for PivotIter<'a> {
-    type Item = (usize, PivotEntry);
+impl<'a, T: Scalar> Iterator for PivotIter<'a, T> {
+    type Item = (usize, PivotEntry<T>);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.col >= self.d.n {
@@ -509,7 +513,6 @@ impl<'a> Iterator for PivotIter<'a> {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,7 +522,7 @@ mod tests {
 
     #[test]
     fn new_creates_all_delayed() {
-        let diag = MixedDiagonal::new(5);
+        let diag = MixedDiagonal::<f64>::new(5);
         assert_eq!(diag.dimension(), 5);
         for col in 0..5 {
             assert_eq!(diag.pivot_type(col), PivotType::Delayed);
@@ -531,7 +534,7 @@ mod tests {
 
     #[test]
     fn set_1x1_marks_correct_pivot_type() {
-        let mut diag = MixedDiagonal::new(4);
+        let mut diag = MixedDiagonal::<f64>::new(4);
         diag.set_1x1(0, 3.5);
         diag.set_1x1(2, -1.0);
 
@@ -549,7 +552,7 @@ mod tests {
 
     #[test]
     fn set_2x2_marks_both_columns() {
-        let mut diag = MixedDiagonal::new(6);
+        let mut diag = MixedDiagonal::<f64>::new(6);
         let block = Block2x2 {
             first_col: 2,
             a: 2.0,
@@ -567,7 +570,7 @@ mod tests {
 
     #[test]
     fn mixed_pivots_correct_counts() {
-        let mut diag = MixedDiagonal::new(6);
+        let mut diag = MixedDiagonal::<f64>::new(6);
         diag.set_2x2(Block2x2 {
             first_col: 0,
             a: 2.0,
@@ -592,7 +595,7 @@ mod tests {
         // D = diag(2, 4, -1, 5)
         // b = [6, 12, -3, 20]
         // x = [3, 3, 3, 4]
-        let mut diag = MixedDiagonal::new(4);
+        let mut diag = MixedDiagonal::<f64>::new(4);
         diag.set_1x1(0, 2.0);
         diag.set_1x1(1, 4.0);
         diag.set_1x1(2, -1.0);
@@ -622,7 +625,7 @@ mod tests {
         // b = [4.5, -0.5] → det = 2*(-3) - 0.5^2 = -6.25
         // x1 = ((-3)*4.5 - 0.5*(-0.5)) / (-6.25) = (-13.5 + 0.25) / (-6.25) = -13.25/-6.25 = 2.12
         // x2 = (2*(-0.5) - 0.5*4.5) / (-6.25) = (-1 - 2.25) / (-6.25) = -3.25/-6.25 = 0.52
-        let mut diag = MixedDiagonal::new(2);
+        let mut diag = MixedDiagonal::<f64>::new(2);
         diag.set_2x2(Block2x2 {
             first_col: 0,
             a: 2.0,
@@ -649,7 +652,7 @@ mod tests {
     #[test]
     fn solve_mixed_1x1_and_2x2() {
         // Dimension 6: 2x2 block at [0,1], then 1x1 at [2,3,4,5]
-        let mut diag = MixedDiagonal::new(6);
+        let mut diag = MixedDiagonal::<f64>::new(6);
         diag.set_2x2(Block2x2 {
             first_col: 0,
             a: 2.0,
@@ -692,7 +695,7 @@ mod tests {
 
     #[test]
     fn solve_dimension_0_is_noop() {
-        let diag = MixedDiagonal::new(0);
+        let diag = MixedDiagonal::<f64>::new(0);
         let mut x: Vec<f64> = vec![];
         diag.solve_in_place(&mut x);
         assert!(x.is_empty());
@@ -702,7 +705,7 @@ mod tests {
 
     #[test]
     fn dimension_0() {
-        let diag = MixedDiagonal::new(0);
+        let diag = MixedDiagonal::<f64>::new(0);
         assert_eq!(diag.dimension(), 0);
         assert_eq!(diag.num_delayed(), 0);
         assert_eq!(diag.num_1x1(), 0);
@@ -711,7 +714,7 @@ mod tests {
 
     #[test]
     fn dimension_1_single_1x1() {
-        let mut diag = MixedDiagonal::new(1);
+        let mut diag = MixedDiagonal::<f64>::new(1);
         diag.set_1x1(0, 5.0);
         assert_eq!(diag.pivot_type(0), PivotType::OneByOne);
         assert_eq!(diag.diagonal_1x1(0), 5.0);
@@ -721,7 +724,7 @@ mod tests {
 
     #[test]
     fn dimension_2_single_2x2() {
-        let mut diag = MixedDiagonal::new(2);
+        let mut diag = MixedDiagonal::<f64>::new(2);
         let block = Block2x2 {
             first_col: 0,
             a: 1.0,
@@ -735,7 +738,7 @@ mod tests {
 
     #[test]
     fn all_2x2_even_n() {
-        let mut diag = MixedDiagonal::new(4);
+        let mut diag = MixedDiagonal::<f64>::new(4);
         diag.set_2x2(Block2x2 {
             first_col: 0,
             a: 1.0,
@@ -755,7 +758,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn solve_panics_on_delayed_columns() {
-        let mut diag = MixedDiagonal::new(3);
+        let mut diag = MixedDiagonal::<f64>::new(3);
         diag.set_1x1(0, 1.0);
         // columns 1, 2 still delayed
         let mut x = vec![1.0, 2.0, 3.0];
@@ -765,7 +768,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn set_2x2_at_last_column_odd_n_panics() {
-        let mut diag = MixedDiagonal::new(3);
+        let mut diag = MixedDiagonal::<f64>::new(3);
         // first_col = 2, but 2+1 = 3 which is NOT < 3, so debug-assert should fire
         diag.set_2x2(Block2x2 {
             first_col: 2,
@@ -779,7 +782,7 @@ mod tests {
 
     #[test]
     fn inertia_all_positive_1x1() {
-        let mut diag = MixedDiagonal::new(4);
+        let mut diag = MixedDiagonal::<f64>::new(4);
         for i in 0..4 {
             diag.set_1x1(i, (i + 1) as f64);
         }
@@ -796,7 +799,7 @@ mod tests {
 
     #[test]
     fn inertia_mixed_sign_1x1() {
-        let mut diag = MixedDiagonal::new(5);
+        let mut diag = MixedDiagonal::<f64>::new(5);
         diag.set_1x1(0, 3.0); // +
         diag.set_1x1(1, -2.0); // -
         diag.set_1x1(2, 1.0); // +
@@ -816,7 +819,7 @@ mod tests {
     #[test]
     fn inertia_2x2_det_negative_one_plus_one_minus() {
         // [[2, 0.5], [0.5, -3]] → det = -6.25 < 0 → one +, one -
-        let mut diag = MixedDiagonal::new(2);
+        let mut diag = MixedDiagonal::<f64>::new(2);
         diag.set_2x2(Block2x2 {
             first_col: 0,
             a: 2.0,
@@ -837,7 +840,7 @@ mod tests {
     #[test]
     fn inertia_2x2_det_positive_trace_positive() {
         // [[5, 1], [1, 3]] → det = 15-1 = 14 > 0, trace = 8 > 0 → both positive
-        let mut diag = MixedDiagonal::new(2);
+        let mut diag = MixedDiagonal::<f64>::new(2);
         diag.set_2x2(Block2x2 {
             first_col: 0,
             a: 5.0,
@@ -858,7 +861,7 @@ mod tests {
     #[test]
     fn inertia_2x2_det_positive_trace_negative() {
         // [[-5, 1], [1, -3]] → det = 15-1 = 14 > 0, trace = -8 < 0 → both negative
-        let mut diag = MixedDiagonal::new(2);
+        let mut diag = MixedDiagonal::<f64>::new(2);
         diag.set_2x2(Block2x2 {
             first_col: 0,
             a: -5.0,
@@ -882,7 +885,7 @@ mod tests {
         // 2x2 [[2, 0.5], [0.5, -3]] → det < 0 → 1+, 1-
         // 1x1: 4(+), -1(-), 7(+), 2(+)
         // Total: 4+, 2-
-        let mut diag = MixedDiagonal::new(6);
+        let mut diag = MixedDiagonal::<f64>::new(6);
         diag.set_2x2(Block2x2 {
             first_col: 0,
             a: 2.0,
@@ -908,7 +911,7 @@ mod tests {
     fn scale_test_n_10000() {
         // MixedDiagonal at n=10,000 with random mixed pivot pattern
         let n = 10_000;
-        let mut diag = MixedDiagonal::new(n);
+        let mut diag = MixedDiagonal::<f64>::new(n);
 
         // Alternate: 2x2 block, then 1x1, then 2x2, then 1x1...
         // Pattern: pairs at (0,1), 1x1 at 2, pairs at (3,4), 1x1 at 5, ...
