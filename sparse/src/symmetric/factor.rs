@@ -3259,7 +3259,7 @@ pub(super) fn extract_front_factors_rect<T: Scalar>(
     let ne = result.num_eliminated;
 
     // Extract L11 (ne × ne), in column panels
-    let l11 = super::numeric::BlockedUnitLower::from_factored(l_storage, ne, &result.d);
+    let l11 = super::numeric::BlockedUnitLower::from_factored(l_storage, ne, &result.d, Par::Seq);
 
     // Build truncated D11
     let mut d11 = MixedDiagonal::new(ne);
