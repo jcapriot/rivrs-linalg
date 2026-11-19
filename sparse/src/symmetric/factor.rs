@@ -1604,6 +1604,7 @@ fn compute_ld_into<T: Scalar>(
 /// - Duff, Hogg & Lopez (2020), Section 3: deferred Schur complement
 /// - Liu (1992), Section 4: Schur complement in multifrontal method
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn compute_contribution_gemm<T: Scalar>(
     frontal_data: &Mat<T>,
     num_fully_summed: usize,
@@ -1656,6 +1657,62 @@ pub(crate) fn compute_contribution_gemm<T: Scalar>(
     // Step 3: Symmetric rank-ne update: contrib -= W * L21_NFS^T (lower triangle)
     tri_matmul::matmul_with_conj(
         contrib_buffer.as_mut().submatrix_mut(0, 0, nfs, nfs),
+        BlockStructure::TriangularLower,
+        Accum::Add,
+        w.as_ref(),
+        BlockStructure::Rectangular,
+        Conj::No,
+        l21_nfs.transpose(),
+        BlockStructure::Rectangular,
+        Conj::No,
+        T::from_f64(-1.0),
+        par,
+    );
+}
+
+/// Apply the deferred Schur-complement update to the front's NFS×NFS block,
+/// in place: `F22 ← F22 − L21_NFS · D · L21_NFSᵀ` (lower triangle only).
+///
+/// `frontal_data[p..m, p..m]` holds the assembled, not yet updated NFS×NFS
+/// block (the APTP kernel defers it); `frontal_data[p..m, 0..ne]` holds
+/// `L21_NFS`. Updating in place lets the contribution block be packed straight
+/// out of the front, so no separate m × m contribution buffer is needed.
+///
+/// # References
+///
+/// - Duff, Hogg & Lopez (2020), Section 3: deferred contribution update
+pub(crate) fn compute_contribution_gemm_in_place<T: Scalar>(
+    frontal_data: &mut Mat<T>,
+    num_fully_summed: usize,
+    num_eliminated: usize,
+    m: usize,
+    d: &MixedDiagonal<T>,
+    ld_workspace: &mut Mat<T>,
+    par: Par,
+) {
+    let p = num_fully_summed;
+    let ne = num_eliminated;
+    let nfs = m - p;
+    if nfs == 0 || ne == 0 {
+        return;
+    }
+
+    let (left, right) = frontal_data
+        .as_mut()
+        .submatrix_mut(0, 0, m, m)
+        .split_at_col_mut(p);
+    let l21_nfs = left.rb().submatrix(p, 0, nfs, ne);
+
+    if ld_workspace.nrows() < nfs || ld_workspace.ncols() < ne {
+        *ld_workspace =
+            Mat::<T>::zeros(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
+    }
+    let mut w = ld_workspace.as_mut().submatrix_mut(0, 0, nfs, ne);
+    w.fill(T::zero());
+    compute_ld_into(l21_nfs, d, ne, w.rb_mut());
+
+    tri_matmul::matmul_with_conj(
+        right.submatrix_mut(p, 0, nfs, nfs),
         BlockStructure::TriangularLower,
         Accum::Add,
         w.as_ref(),
@@ -3164,45 +3221,36 @@ pub(super) fn extract_front_factors_rect<T: Scalar>(
 /// Adapts `extract_contribution` for rectangular layout. The NFS×NFS Schur
 /// complement is already in `contrib_buffer` (from `compute_contribution_gemm_rect`).
 /// Delayed column data (if any) is read from `l_storage[ne..k, ne..k]` and
-/// `l_storage[k..m, ne..k]`.
+/// `l_storage[k..m, ne..k]`. The result is packed (lower triangle only), so the
+/// caller keeps its dense scratch buffer for the next node.
 pub(super) fn extract_contribution_rect<T: Scalar>(
     l_storage: &Mat<T>,
     m: usize,
     k: usize,
     frontal_row_indices: &[usize],
     result: &AptpFactorResult<T>,
-    mut contrib_buffer: Mat<T>,
+    contrib_buffer: &Mat<T>,
 ) -> super::numeric::ContributionBlock<T> {
     let ne = result.num_eliminated;
     let size = m - ne;
     let num_delayed = k - ne;
     let nfs = m - k;
 
-    if num_delayed > 0 {
-        let mut data = Mat::<T>::zeros(size, size);
-
-        // Copy delayed × delayed from l_storage[ne..k, ne..k]
-        for j in 0..num_delayed {
-            let col_len = num_delayed - j;
-            let src = &l_storage.col_as_slice(ne + j)[ne + j..ne + j + col_len];
-            data.col_as_slice_mut(j)[j..j + col_len].copy_from_slice(src);
-        }
-
-        // Copy NFS × delayed cross-terms from l_storage[k..m, ne..k]
-        for j in 0..num_delayed {
-            let src = &l_storage.col_as_slice(ne + j)[k..m];
-            data.col_as_slice_mut(j)[num_delayed..size].copy_from_slice(src);
-        }
-
-        // Copy NFS × NFS from contrib_buffer
-        for j in 0..nfs {
-            let col_len = nfs - j;
-            let src = &contrib_buffer.col_as_slice(j)[j..j + col_len];
-            data.col_as_slice_mut(num_delayed + j)[num_delayed + j..size].copy_from_slice(src);
-        }
-
-        contrib_buffer = data;
-    }
+    let data = if num_delayed > 0 {
+        // Column j < num_delayed: delayed rows ne+j..k then NFS rows k..m of
+        // l_storage column ne+j, which are contiguous. Column num_delayed + j:
+        // the updated NFS×NFS column j from contrib_buffer.
+        super::numeric::PackedLower::from_columns(size, |j| {
+            if j < num_delayed {
+                &l_storage.col_as_slice(ne + j)[ne + j..m]
+            } else {
+                let c = j - num_delayed;
+                &contrib_buffer.col_as_slice(c)[c..nfs]
+            }
+        })
+    } else {
+        super::numeric::PackedLower::from_columns(size, |j| &contrib_buffer.col_as_slice(j)[j..nfs])
+    };
 
     let mut row_indices = Vec::with_capacity(size);
     for &lp in &result.perm[ne..k] {
@@ -3211,7 +3259,7 @@ pub(super) fn extract_contribution_rect<T: Scalar>(
     row_indices.extend_from_slice(&frontal_row_indices[k..m]);
 
     super::numeric::ContributionBlock {
-        data: contrib_buffer,
+        data,
         row_indices,
         num_delayed,
     }
@@ -6840,12 +6888,12 @@ mod tests {
         );
 
         let row_indices: Vec<usize> = (0..m).collect();
-        let contrib = extract_contribution_rect(&a, m, k, &row_indices, &result, contrib_buffer);
+        let contrib = extract_contribution_rect(&a, m, k, &row_indices, &result, &contrib_buffer);
 
         // With all columns eliminated, num_delayed = 0
         assert_eq!(contrib.num_delayed, 0);
         // Contribution block size = m - ne = 2
-        assert_eq!(contrib.data.nrows(), nfs);
+        assert_eq!(contrib.data.dim(), nfs);
         assert_eq!(contrib.row_indices.len(), nfs);
     }
 
