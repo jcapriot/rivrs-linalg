@@ -605,7 +605,7 @@ pub(crate) const L11_PANEL_WIDTH: usize = 64;
 
 /// Unit lower-triangular `L11` factor stored as column panels.
 ///
-/// Columns are grouped into panels of [`L11_PANEL_WIDTH`]; the panel starting
+/// Columns are grouped into panels of 64 columns (`L11_PANEL_WIDTH`); the panel starting
 /// at column `b` stores rows `b..n` only. The upper triangle is therefore
 /// wasted only inside each diagonal block, about `n·w/2` entries for panel
 /// width `w`, instead of the `n²/2` of a dense square — roughly 2% extra over
