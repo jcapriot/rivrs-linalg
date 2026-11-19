@@ -3115,44 +3115,8 @@ pub(super) fn extract_front_factors_rect<T: Scalar>(
 ) -> super::numeric::FrontFactors<T> {
     let ne = result.num_eliminated;
 
-    // Extract L11 (ne × ne)
-    let l11 = if ne > 0 {
-        let mut l = Mat::<T>::zeros(ne, ne);
-        let mut col = 0;
-        while col < ne {
-            l[(col, col)] = T::from_f64(1.0);
-            match result.d.pivot_type(col) {
-                PivotType::OneByOne => {
-                    let n_entries = ne - (col + 1);
-                    if n_entries > 0 {
-                        let src = &l_storage.col_as_slice(col)[col + 1..ne];
-                        l.col_as_slice_mut(col)[col + 1..ne].copy_from_slice(src);
-                    }
-                    col += 1;
-                }
-                PivotType::TwoByTwo { partner } if partner > col => {
-                    l[(col + 1, col + 1)] = T::from_f64(1.0);
-                    let n_entries = ne - (col + 2);
-                    if n_entries > 0 {
-                        let src0 = &l_storage.col_as_slice(col)[col + 2..ne];
-                        l.col_as_slice_mut(col)[col + 2..ne].copy_from_slice(src0);
-                        let src1 = &l_storage.col_as_slice(col + 1)[col + 2..ne];
-                        l.col_as_slice_mut(col + 1)[col + 2..ne].copy_from_slice(src1);
-                    }
-                    col += 2;
-                }
-                PivotType::TwoByTwo { .. } => {
-                    col += 1;
-                }
-                PivotType::Delayed => {
-                    unreachable!("unexpected Delayed pivot at col {} in 0..ne", col);
-                }
-            }
-        }
-        l
-    } else {
-        Mat::<T>::zeros(0, 0)
-    };
+    // Extract L11 (ne × ne), in column panels
+    let l11 = super::numeric::BlockedUnitLower::from_factored(l_storage, ne, &result.d);
 
     // Build truncated D11
     let mut d11 = MixedDiagonal::new(ne);
@@ -6817,21 +6781,21 @@ mod tests {
         let ff = extract_front_factors_rect(&a, m, k, &row_indices, &result);
 
         assert_eq!(ff.num_eliminated, ne);
-        assert_eq!(ff.l11.nrows(), ne);
-        assert_eq!(ff.l11.ncols(), ne);
+        assert_eq!(ff.l11.dim(), ne);
+        assert_eq!(ff.l11.dim(), ne);
 
         // L11 should be unit lower triangular
         for i in 0..ne {
             assert!(
-                (ff.l11[(i, i)] - 1.0).abs() < 1e-15,
+                (ff.l11.get(i, i) - 1.0).abs() < 1e-15,
                 "L11 diagonal at {i} is not 1.0: {}",
-                ff.l11[(i, i)]
+                ff.l11.get(i, i)
             );
             for j in (i + 1)..ne {
                 assert!(
-                    ff.l11[(i, j)].abs() < 1e-15,
+                    ff.l11.get(i, j).abs() < 1e-15,
                     "L11 upper triangle at ({i},{j}) is not 0: {}",
-                    ff.l11[(i, j)]
+                    ff.l11.get(i, j)
                 );
             }
         }

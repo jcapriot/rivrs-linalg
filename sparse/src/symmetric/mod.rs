@@ -41,6 +41,7 @@ pub use factor::{
 };
 
 pub use numeric::{
-    AptpNumeric, FactorStorage, FactorizationStats, FrontFactors, PerSupernodeStats,
+    AptpNumeric, BlockedUnitLower, FactorStorage, FactorizationStats, FrontFactors,
+    PerSupernodeStats,
 };
 pub use solver::{AnalyzeOptions, FactorOptions, OrderingStrategy, SolverOptions, SparseLDLT};

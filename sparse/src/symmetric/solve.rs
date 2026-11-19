@@ -23,9 +23,6 @@
 use faer::dyn_stack::StackReq;
 use faer::linalg::matmul::matmul_with_conj;
 use faer::linalg::temp_mat_scratch;
-use faer::linalg::triangular_solve::{
-    solve_unit_lower_triangular_in_place_with_conj, solve_unit_upper_triangular_in_place_with_conj,
-};
 use faer::mat::{MatMut, MatRef};
 use faer::{Accum, Conj, Par};
 
@@ -189,13 +186,8 @@ pub(crate) fn forward_solve_supernode<T: Scalar>(
 
     // Solve L11 * y = work (unit lower triangular, in-place)
     if ne > 1 {
-        let mut local = MatMut::from_column_major_slice_mut(&mut work[..ne], ne, 1);
-        solve_unit_lower_triangular_in_place_with_conj(
-            ff.l11().as_ref(),
-            Conj::No,
-            local.as_mut(),
-            effective_par,
-        );
+        let local = MatMut::from_column_major_slice_mut(&mut work[..ne], ne, 1);
+        ff.l11().solve_in_place(local, effective_par);
     }
 
     // Write back: rhs[col_indices[i]] = work[i]
@@ -315,13 +307,8 @@ pub(crate) fn backward_solve_supernode<T: Scalar>(
 
     // Solve L11^T * z = work (unit upper triangular via transpose)
     if ne > 1 {
-        let mut local = MatMut::from_column_major_slice_mut(&mut work[..ne], ne, 1);
-        solve_unit_upper_triangular_in_place_with_conj(
-            ff.l11().as_ref().transpose(),
-            Conj::No,
-            local.as_mut(),
-            effective_par,
-        );
+        let local = MatMut::from_column_major_slice_mut(&mut work[..ne], ne, 1);
+        ff.l11().solve_transpose_in_place(local, effective_par);
     }
 
     // Write back
@@ -597,8 +584,8 @@ mod tests {
             total_eliminated += ne;
 
             // L11 dimensions must match num_eliminated
-            assert_eq!(ff.l11().nrows(), ne);
-            assert_eq!(ff.l11().ncols(), ne);
+            assert_eq!(ff.l11().dim(), ne);
+            assert_eq!(ff.l11().dim(), ne);
 
             // L21 rows = row_indices length
             assert_eq!(ff.l21().nrows(), ff.row_indices().len());

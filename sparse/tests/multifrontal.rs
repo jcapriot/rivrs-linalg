@@ -57,7 +57,7 @@ fn multifrontal_reconstruction_error(
             for j in 0..i {
                 let gi = ff.col_indices()[i];
                 let gj = ff.col_indices()[j];
-                l_global[(gi, gj)] = ff.l11()[(i, j)];
+                l_global[(gi, gj)] = ff.l11().get(i, j);
             }
         }
 
@@ -357,8 +357,8 @@ fn test_extract_front_factors_shapes() {
     // Each front factor should have valid shapes
     for (s, ff) in numeric.front_factors().iter().enumerate() {
         let ne = ff.num_eliminated();
-        assert_eq!(ff.l11().nrows(), ne, "supernode {} L11 rows mismatch", s);
-        assert_eq!(ff.l11().ncols(), ne, "supernode {} L11 cols mismatch", s);
+        assert_eq!(ff.l11().dim(), ne, "supernode {} L11 rows mismatch", s);
+        assert_eq!(ff.l11().dim(), ne, "supernode {} L11 cols mismatch", s);
         assert_eq!(ff.l21().ncols(), ne, "supernode {} L21 cols mismatch", s);
         assert_eq!(
             ff.col_indices().len(),

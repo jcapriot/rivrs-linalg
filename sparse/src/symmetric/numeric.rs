@@ -33,9 +33,13 @@
 //! - Hogg, Duff & Lopez (2020), "A New Sparse LDL^T Solver Using A Posteriori
 //!   Threshold Pivoting" — APTP algorithm integration with multifrontal framework
 
+use faer::linalg::matmul::matmul_with_conj;
+use faer::linalg::triangular_solve::{
+    solve_unit_lower_triangular_in_place_with_conj, solve_unit_upper_triangular_in_place_with_conj,
+};
 use faer::sparse::SparseColMat;
 use faer::sparse::linalg::cholesky::SymbolicCholeskyRaw;
-use faer::{Mat, MatMut, Par};
+use faer::{Accum, Conj, Mat, MatMut, Par};
 
 use super::diagonal::{MixedDiagonal, PivotEntry};
 use super::factor::{
@@ -515,6 +519,147 @@ impl<T: Scalar> ContributionBlock<T> {
     }
 }
 
+/// Column-panel width of [`BlockedUnitLower`] storage.
+pub(crate) const L11_PANEL_WIDTH: usize = 64;
+
+/// Unit lower-triangular `L11` factor stored as column panels.
+///
+/// Columns are grouped into panels of [`L11_PANEL_WIDTH`]; the panel starting
+/// at column `b` stores rows `b..n` only. The upper triangle is therefore
+/// wasted only inside each diagonal block, about `n·w/2` entries for panel
+/// width `w`, instead of the `n²/2` of a dense square — roughly 2% extra over
+/// packed storage for a 3000-column supernode — while every panel remains a
+/// dense column-major matrix for BLAS-3 triangular solves and GEMM.
+///
+/// # References
+///
+/// - Gustavson, Karlsson & Kågström (2009), "Parallel and cache-efficient
+///   in-place matrix storage format conversion" and the LAPACK RFP/blocked
+///   packed formats: trading a block of waste for dense kernels
+/// - Duff, Hogg & Lopez (2020), Section 4: column-panel storage of L in SSIDS
+#[derive(Debug, Clone)]
+pub struct BlockedUnitLower<T: Scalar = f64> {
+    n: usize,
+    panels: Vec<Mat<T>>,
+}
+
+impl<T: Scalar> BlockedUnitLower<T> {
+    /// Build from a factored front or L storage whose first `ne` columns hold
+    /// the eliminated L entries below the diagonal. For the first column of a
+    /// 2×2 pivot, the entry just below the diagonal belongs to D and is
+    /// skipped (that L entry is zero).
+    pub(crate) fn from_factored(src: &Mat<T>, ne: usize, d: &MixedDiagonal<T>) -> Self {
+        let nb = L11_PANEL_WIDTH;
+        let mut panels = Vec::with_capacity(ne.div_ceil(nb));
+        let mut base = 0;
+        while base < ne {
+            let w = nb.min(ne - base);
+            let mut panel = Mat::<T>::zeros(ne - base, w);
+            for jj in 0..w {
+                let j = base + jj;
+                panel[(jj, jj)] = T::one();
+                let start = match d.pivot_type(j) {
+                    PivotType::TwoByTwo { partner } if partner > j => j + 2,
+                    PivotType::Delayed => {
+                        unreachable!("unexpected Delayed pivot at col {j} in 0..ne")
+                    }
+                    _ => j + 1,
+                };
+                if start < ne {
+                    panel.col_as_slice_mut(jj)[start - base..]
+                        .copy_from_slice(&src.col_as_slice(j)[start..ne]);
+                }
+            }
+            panels.push(panel);
+            base += w;
+        }
+        Self { n: ne, panels }
+    }
+
+    /// Dimension `n` (number of eliminated columns).
+    pub fn dim(&self) -> usize {
+        self.n
+    }
+
+    /// Entry `(i, j)`; zero above the diagonal, one on it.
+    pub fn get(&self, i: usize, j: usize) -> T {
+        if i < j {
+            return T::zero();
+        }
+        let b = j / L11_PANEL_WIDTH;
+        let base = b * L11_PANEL_WIDTH;
+        self.panels[b][(i - base, j - base)]
+    }
+
+    /// Dense `n × n` copy (allocates; intended for tests and diagnostics).
+    pub fn to_dense(&self) -> Mat<T> {
+        Mat::<T>::from_fn(self.n, self.n, |i, j| self.get(i, j))
+    }
+
+    /// Entries allocated, including faer's column padding.
+    pub fn allocated(&self) -> usize {
+        self.panels
+            .iter()
+            .map(|p| p.col_stride().unsigned_abs() * p.ncols())
+            .sum()
+    }
+
+    /// Solve `L x = b` in place (`rhs` is `n × nrhs`).
+    pub(crate) fn solve_in_place(&self, mut rhs: MatMut<'_, T>, par: Par) {
+        let mut base = 0;
+        for panel in &self.panels {
+            let w = panel.ncols();
+            let (diag, below) = panel.as_ref().split_at_row(w);
+            let (top, rest) = rhs.as_mut().split_at_row_mut(base + w);
+            let mut x_b = top.subrows_mut(base, w);
+            solve_unit_lower_triangular_in_place_with_conj(diag, Conj::No, x_b.as_mut(), par);
+            if below.nrows() > 0 {
+                matmul_with_conj(
+                    rest,
+                    Accum::Add,
+                    below,
+                    Conj::No,
+                    x_b.as_ref(),
+                    Conj::No,
+                    T::from_f64(-1.0),
+                    par,
+                );
+            }
+            base += w;
+        }
+    }
+
+    /// Solve `Lᵀ x = b` in place (`rhs` is `n × nrhs`). No conjugation.
+    pub(crate) fn solve_transpose_in_place(&self, mut rhs: MatMut<'_, T>, par: Par) {
+        let mut base = self.n;
+        for panel in self.panels.iter().rev() {
+            let w = panel.ncols();
+            base -= w;
+            let (diag, below) = panel.as_ref().split_at_row(w);
+            let (top, rest) = rhs.as_mut().split_at_row_mut(base + w);
+            let mut x_b = top.subrows_mut(base, w);
+            if below.nrows() > 0 {
+                matmul_with_conj(
+                    x_b.as_mut(),
+                    Accum::Add,
+                    below.transpose(),
+                    Conj::No,
+                    rest.as_ref(),
+                    Conj::No,
+                    T::from_f64(-1.0),
+                    par,
+                );
+            }
+            solve_unit_upper_triangular_in_place_with_conj(
+                diag.transpose(),
+                Conj::No,
+                x_b.as_mut(),
+                par,
+            );
+        }
+    }
+}
+
 /// Lower triangle (diagonal included) of a symmetric `n × n` matrix, packed
 /// column by column: column `j` holds rows `j..n` contiguously, so the block
 /// uses `n(n+1)/2` entries — half a dense square — and is allocated exactly.
@@ -601,8 +746,8 @@ impl<T: Scalar> PackedLower<T> {
 /// - `col_indices.len() == num_eliminated`
 #[derive(Debug)]
 pub struct FrontFactors<T: Scalar = f64> {
-    /// Unit lower triangular factor (ne × ne).
-    pub(crate) l11: Mat<T>,
+    /// Unit lower triangular factor (ne × ne), stored as column panels.
+    pub(crate) l11: BlockedUnitLower<T>,
     /// Block diagonal with 1x1 and 2x2 pivots (ne entries).
     pub(crate) d11: MixedDiagonal<T>,
     /// Subdiagonal factor block (r × ne).
@@ -619,8 +764,9 @@ pub struct FrontFactors<T: Scalar = f64> {
 }
 
 impl<T: Scalar> FrontFactors<T> {
-    /// Unit lower triangular factor L11 (ne × ne).
-    pub fn l11(&self) -> &Mat<T> {
+    /// Unit lower triangular factor L11 (ne × ne), in column-panel storage.
+    /// Use [`BlockedUnitLower::to_dense`] for a dense copy.
+    pub fn l11(&self) -> &BlockedUnitLower<T> {
         &self.l11
     }
 
@@ -865,8 +1011,8 @@ impl<T: Scalar> AptpNumeric<T> {
         };
         for ff in &self.front_factors {
             let (l11, l21) = (ff.l11(), ff.l21());
-            let ne = l11.ncols();
-            fs.l11_allocated += l11.col_stride().unsigned_abs() * ne;
+            let ne = l11.dim();
+            fs.l11_allocated += l11.allocated();
             fs.l11_lower += ne * (ne + 1) / 2;
             fs.l21_allocated += l21.col_stride().unsigned_abs() * l21.ncols();
             fs.l21_logical += l21.nrows() * l21.ncols();
@@ -2843,52 +2989,9 @@ pub(crate) fn extract_front_factors<T: Scalar>(
 ) -> FrontFactors<T> {
     let ne = result.num_eliminated;
 
-    // Extract L11 (ne × ne) — unit lower triangular part
+    // Extract L11 (ne × ne) — unit lower triangular part, in column panels.
     // For 2x2 pivots, a[(col+1, col)] is the D off-diagonal, NOT an L entry.
-    // Uses per-column slice copies for 1x1 pivot columns where the L entries
-    // form a contiguous segment.
-    let l11 = if ne > 0 {
-        let mut l = Mat::<T>::zeros(ne, ne);
-        let mut col = 0;
-        while col < ne {
-            l[(col, col)] = T::from_f64(1.0); // unit diagonal
-            match result.d.pivot_type(col) {
-                PivotType::OneByOne => {
-                    // L entries: rows (col+1)..ne — contiguous in both source and dest
-                    let n_entries = ne - (col + 1);
-                    if n_entries > 0 {
-                        let src = &frontal_data.col_as_slice(col)[col + 1..ne];
-                        l.col_as_slice_mut(col)[col + 1..ne].copy_from_slice(src);
-                    }
-                    col += 1;
-                }
-                PivotType::TwoByTwo { partner } if partner > col => {
-                    l[(col + 1, col + 1)] = T::from_f64(1.0); // unit diagonal for partner
-                    // a[(col+1, col)] is D off-diagonal, skip it
-                    // L entries for both columns start at row col+2
-                    let n_entries = ne - (col + 2);
-                    if n_entries > 0 {
-                        let src0 = &frontal_data.col_as_slice(col)[col + 2..ne];
-                        l.col_as_slice_mut(col)[col + 2..ne].copy_from_slice(src0);
-                        let src1 = &frontal_data.col_as_slice(col + 1)[col + 2..ne];
-                        l.col_as_slice_mut(col + 1)[col + 2..ne].copy_from_slice(src1);
-                    }
-                    col += 2;
-                }
-                PivotType::TwoByTwo { .. } => {
-                    // Second column of a 2x2 pair — already handled above
-                    col += 1;
-                }
-                PivotType::Delayed => {
-                    // Should not appear for columns 0..ne (they were eliminated)
-                    unreachable!("unexpected Delayed pivot at col {} in 0..ne", col);
-                }
-            }
-        }
-        l
-    } else {
-        Mat::<T>::zeros(0, 0)
-    };
+    let l11 = BlockedUnitLower::from_factored(frontal_data, ne, &result.d);
 
     // Build truncated D11 (first ne pivots from result.d)
     let mut d11 = MixedDiagonal::new(ne);
@@ -3028,6 +3131,59 @@ pub(crate) fn extract_contribution<T: Scalar>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_unit_lower_matches_dense() {
+        // 150 columns -> panels of 64, 64, 22. 2x2 pivots straddle panel
+        // boundaries (63/64) and sit inside panels, so the D off-diagonal
+        // skip is exercised in both places.
+        let n = 150;
+        let src = Mat::<f64>::from_fn(n, n, |i, j| ((i * 7 + j * 13) % 17) as f64 / 17.0 - 0.5);
+        let mut d = MixedDiagonal::new(n);
+        let mut col = 0;
+        while col < n {
+            if col == 10 || col == 63 || col == 100 {
+                d.set_2x2(Block2x2 {
+                    first_col: col,
+                    a: 2.0,
+                    b: 0.5,
+                    c: 3.0,
+                });
+                col += 2;
+            } else {
+                d.set_1x1(col, 1.0);
+                col += 1;
+            }
+        }
+        let l = BlockedUnitLower::from_factored(&src, n, &d);
+
+        // Expected dense L: unit diagonal, src below it, zero at (j+1, j)
+        // for the first column of each 2x2 pivot.
+        let expected = Mat::<f64>::from_fn(n, n, |i, j| {
+            if i < j {
+                0.0
+            } else if i == j {
+                1.0
+            } else if i == j + 1 && (j == 10 || j == 63 || j == 100) {
+                0.0
+            } else {
+                src[(i, j)]
+            }
+        });
+        assert_eq!(l.dim(), n);
+        assert!((&l.to_dense() - &expected).norm_max() == 0.0);
+        // Storage: packed lower plus at most half of each 64x64 diagonal block.
+        assert!(l.allocated() < n * (n + 1) / 2 + 3 * 64 * 64 / 2 + 3 * 64);
+
+        // Solves against the dense factor, three right-hand sides.
+        let b = Mat::<f64>::from_fn(n, 3, |i, j| (i + 2 * j) as f64 * 0.01 + 1.0);
+        let mut x = b.clone();
+        l.solve_in_place(x.as_mut(), Par::Seq);
+        assert!((&expected * &x - &b).norm_max() < 1e-10);
+        let mut y = b.clone();
+        l.solve_transpose_in_place(y.as_mut(), Par::Seq);
+        assert!((expected.transpose() * &y - &b).norm_max() < 1e-10);
+    }
     use crate::symmetric::factor::AptpOptions;
 
     /// Helper: build frontal matrix data from a dense lower-triangle matrix.
@@ -3299,15 +3455,15 @@ mod tests {
                 PivotType::OneByOne => {
                     let d = ff.d11.diagonal_1x1(col);
                     for i in 0..ne {
-                        ld[(i, col)] = ff.l11[(i, col)] * d;
+                        ld[(i, col)] = ff.l11.get(i, col) * d;
                     }
                     col += 1;
                 }
                 PivotType::TwoByTwo { .. } => {
                     let block = ff.d11.diagonal_2x2(col);
                     for i in 0..ne {
-                        let l0 = ff.l11[(i, col)];
-                        let l1 = ff.l11[(i, col + 1)];
+                        let l0 = ff.l11.get(i, col);
+                        let l1 = ff.l11.get(i, col + 1);
                         ld[(i, col)] = l0 * block.a + l1 * block.b;
                         ld[(i, col + 1)] = l0 * block.b + l1 * block.c;
                     }
@@ -3325,7 +3481,7 @@ mod tests {
             for j in 0..=i {
                 let mut val = 0.0;
                 for p in 0..ne {
-                    val += ld[(i, p)] * ff.l11[(j, p)];
+                    val += ld[(i, p)] * ff.l11.get(j, p);
                 }
                 reconstructed[(i, j)] = val;
                 reconstructed[(j, i)] = val;
@@ -3426,7 +3582,7 @@ mod tests {
         let mut full_l = Mat::<f64>::zeros(full_l_rows, ne);
         for i in 0..ne {
             for j in 0..ne {
-                full_l[(i, j)] = ff.l11[(i, j)];
+                full_l[(i, j)] = ff.l11.get(i, j);
             }
         }
         for i in 0..r {
