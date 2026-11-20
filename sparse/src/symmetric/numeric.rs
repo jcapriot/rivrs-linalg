@@ -43,9 +43,9 @@ use faer::{Accum, Conj, Mat, MatMut, Par};
 
 use super::diagonal::{MixedDiagonal, PivotEntry};
 use super::factor::{
-    AptpFactorResult, AptpOptions, aptp_factor_in_place, compute_contribution_gemm_in_place,
-    compute_contribution_gemm_rect, extract_contribution_rect, extract_front_factors_rect,
-    tpp_factor_rect, unpivoted_factor_in_place, zeros_padded,
+    AptpFactorResult, AptpOptions, advise_huge_pages, aptp_factor_in_place,
+    compute_contribution_gemm_in_place, compute_contribution_gemm_rect, extract_contribution_rect,
+    extract_front_factors_rect, tpp_factor_rect, unpivoted_factor_in_place, zeros_padded,
 };
 use super::pivot::{Block2x2, PivotType};
 use super::symbolic::AptpSymbolic;
@@ -635,7 +635,7 @@ impl<T: Scalar> BlockedUnitLower<T> {
         let build = |b: usize| {
             let base = b * nb;
             let w = nb.min(ne - base);
-            let mut panel = Mat::<T>::zeros(ne - base, w);
+            let mut panel = zeros_padded::<T>(ne - base, w);
             for jj in 0..w {
                 let j = base + jj;
                 panel[(jj, jj)] = T::one();
@@ -772,7 +772,11 @@ impl<T: Scalar> PackedLower<T> {
     where
         T: 'a,
     {
-        let mut data = Vec::with_capacity(n * (n + 1) / 2);
+        let mut data = Vec::<T>::with_capacity(n * (n + 1) / 2);
+        advise_huge_pages(
+            data.as_ptr().cast(),
+            data.capacity() * core::mem::size_of::<T>(),
+        );
         for j in 0..n {
             let c = col(j);
             debug_assert_eq!(c.len(), n - j, "PackedLower column {j} has wrong length");
@@ -796,7 +800,11 @@ impl<T: Scalar> PackedLower<T> {
             return Self::from_columns(n, col);
         }
         use rayon::iter::ParallelExtend;
-        let mut data = Vec::with_capacity(total);
+        let mut data = Vec::<T>::with_capacity(total);
+        advise_huge_pages(
+            data.as_ptr().cast(),
+            data.capacity() * core::mem::size_of::<T>(),
+        );
         data.par_extend(rayon::iter::repeat_n(T::zero(), total));
         fill_packed_cols(&mut data, n, 0, n, col, par);
         Self { n, data }
@@ -2397,32 +2405,98 @@ fn factor_tree<T: Scalar>(
     let phase_a_start = std::time::Instant::now();
 
     // Phase A: L0 subtrees in parallel, largest first (LPT order).
+    //
+    // `layer` is sorted by decreasing cost. Each of `threads` workers takes
+    // the next unclaimed subtree from a shared counter, which is the greedy
+    // longest-processing-time schedule. (A `par_iter` over the sorted list
+    // splits it into contiguous halves, so one worker ran the largest
+    // subtrees back to back while the others idled.)
     if !layer.is_empty() {
-        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-        let pool: std::sync::Mutex<Vec<WorkerState<T>>> = std::sync::Mutex::new(Vec::new());
-        let outputs: Vec<SubtreeOutput<T>> = layer
-            .par_iter()
-            .map(|&root| {
-                // Poisoned mutex means a worker panicked — already fatal.
-                let popped = pool.lock().unwrap().pop();
-                let mut st = popped.unwrap_or_else(|| WorkerState {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        #[cfg(feature = "diagnostic")]
+        let subtree_times: std::sync::Mutex<Vec<(usize, usize, f64, f64)>> =
+            std::sync::Mutex::new(Vec::new());
+        let per_worker: Vec<Result<Vec<SubtreeOutput<T>>, SparseError>> = (0..threads)
+            .into_par_iter()
+            .map(|_worker| {
+                let mut st = WorkerState {
                     ws: FactorizationWorkspace::empty(),
                     pending: (0..n_supernodes).map(|_| None).collect(),
-                });
+                };
                 st.ws.ensure_g2l(n);
-                let order = dfs_postorder(&[root], &visit, |_| true);
-                let results = factor_in_order(&ctx, &order, &mut st.ws, &mut st.pending);
-                let contribution = st.pending[root].take();
-                pool.lock().unwrap().push(st);
-                results.map(|results| SubtreeOutput {
-                    root,
-                    results,
-                    contribution,
-                })
+                let mut outs = Vec::new();
+                while !failed.load(Ordering::Relaxed) {
+                    let Some(&root) = layer.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                        break;
+                    };
+                    #[cfg(feature = "diagnostic")]
+                    let t_start = phase_a_start.elapsed().as_secs_f64();
+                    let order = dfs_postorder(&[root], &visit, |_| true);
+                    let results = match factor_in_order(&ctx, &order, &mut st.ws, &mut st.pending) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            failed.store(true, Ordering::Relaxed);
+                            return Err(e);
+                        }
+                    };
+                    let contribution = st.pending[root].take();
+                    #[cfg(feature = "diagnostic")]
+                    if let Ok(mut v) = subtree_times.lock() {
+                        v.push((
+                            root,
+                            _worker,
+                            t_start,
+                            phase_a_start.elapsed().as_secs_f64(),
+                        ));
+                    }
+                    outs.push(SubtreeOutput {
+                        root,
+                        results,
+                        contribution,
+                    });
+                }
+                Ok(outs)
             })
-            .collect::<Result<_, _>>()?;
-        // Free phase-A workspaces before allocating phase B's large one.
-        drop(pool);
+            .collect();
+        #[cfg(feature = "diagnostic")]
+        if std::env::var("RIVRS_MEMDEBUG").is_ok_and(|v| v == "1") {
+            let v = subtree_times.into_inner().unwrap_or_default();
+            let wall = v.iter().map(|x| x.3).fold(0.0, f64::max);
+            let mut busy = vec![(0.0f64, 0.0f64); threads];
+            for &(_, t, s0, s1) in &v {
+                if t < threads {
+                    busy[t].0 += s1 - s0;
+                    busy[t].1 = busy[t].1.max(s1);
+                }
+            }
+            let mut by_len: Vec<_> = v.iter().map(|x| (x.3 - x.2, x.0, x.2)).collect();
+            by_len.sort_by(|a, b| b.0.total_cmp(&a.0));
+            eprintln!(
+                "phase A: wall {wall:.2} s, per-worker busy/finish (s): {}",
+                busy.iter()
+                    .map(|b| format!("{:.2}/{:.2}", b.0, b.1))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            eprintln!(
+                "phase A: longest subtrees (s, start): {}",
+                by_len
+                    .iter()
+                    .take(6)
+                    .map(|x| format!("{:.2}@{:.2}", x.0, x.2))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        // Workers' workspaces are dropped with their closures, before phase
+        // B allocates its large one.
+        let mut outputs = Vec::with_capacity(layer.len());
+        for w in per_worker {
+            outputs.extend(w?);
+        }
         for out in outputs {
             pending[out.root] = out.contribution;
             all_results.extend(out.results);
@@ -3256,7 +3330,7 @@ pub(crate) fn extract_front_factors<T: Scalar>(
     // These two functions MUST be consistent in their row treatment.
     let r = m - ne;
     let l21 = if ne > 0 && r > 0 {
-        let mut l = Mat::<T>::zeros(r, ne);
+        let mut l = zeros_padded::<T>(r, ne);
         for_each_col_mut(l.as_mut(), 0, par, &|j, dst: &mut [T]| {
             dst.copy_from_slice(&frontal_data.col_as_slice(j)[ne..m]);
         });
