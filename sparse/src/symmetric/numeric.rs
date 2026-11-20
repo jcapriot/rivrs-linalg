@@ -45,7 +45,7 @@ use super::diagonal::{MixedDiagonal, PivotEntry};
 use super::factor::{
     AptpFactorResult, AptpOptions, aptp_factor_in_place, compute_contribution_gemm_in_place,
     compute_contribution_gemm_rect, extract_contribution_rect, extract_front_factors_rect,
-    tpp_factor_rect, unpivoted_factor_in_place,
+    tpp_factor_rect, unpivoted_factor_in_place, zeros_padded,
 };
 use super::pivot::{Block2x2, PivotType};
 use super::symbolic::AptpSymbolic;
@@ -117,7 +117,7 @@ impl<T: Scalar> FactorizationWorkspace<T> {
             };
         }
         Self {
-            frontal_data: Mat::<T>::zeros(max_front, max_front),
+            frontal_data: zeros_padded(max_front, max_front),
             frontal_row_indices: Vec::with_capacity(max_front),
             delayed_cols_buf: Vec::with_capacity(max_front),
             global_to_local: vec![NOT_IN_FRONT; n],
@@ -1474,7 +1474,7 @@ impl<T: Scalar> AptpNumeric<T> {
             }
 
             // 4. Assemble frontal matrix (owned data — diagnostic path)
-            let mut frontal_data = Mat::<T>::zeros(m, m);
+            let mut frontal_data = zeros_padded::<T>(m, m);
             {
                 let mut frontal = FrontalMatrix {
                     data: frontal_data.as_mut(),
@@ -1617,7 +1617,7 @@ fn factor_single_supernode<T: Scalar>(
     // 3. Ensure workspace capacity and zero frontal data for this supernode
     // If delayed columns make this front larger than estimated, grow the workspace
     if m > workspace.frontal_data.nrows() {
-        workspace.frontal_data = Mat::<T>::zeros(m, m);
+        workspace.frontal_data = zeros_padded(m, m);
     }
 
     #[cfg(feature = "diagnostic")]
@@ -1921,7 +1921,7 @@ fn factor_small_leaf_subtree<T: Scalar>(
     // - ld_workspace: for L·D product in contribution GEMM
     // - frontal_row_indices: reusable buffer for building front structure
     // - delayed_cols_buf: reusable buffer for collecting child delays
-    let mut l_storage = Mat::<T>::zeros(max_front, max_front);
+    let mut l_storage = zeros_padded::<T>(max_front, max_front);
     let mut global_to_local = vec![NOT_IN_FRONT; n];
     let mut contrib_buffer = Mat::<T>::new();
     let mut ld_workspace = Mat::<T>::new();
@@ -1962,7 +1962,7 @@ fn factor_small_leaf_subtree<T: Scalar>(
         let zero_start = std::time::Instant::now();
 
         if m > l_storage.nrows() || k > l_storage.ncols() {
-            l_storage = Mat::<T>::zeros(m, k.max(l_storage.ncols()));
+            l_storage = zeros_padded(m, k.max(l_storage.ncols()));
         }
         // Zero only the m×k rectangle (smaller than m×m for NFS nodes)
         for j in 0..k {
@@ -1999,7 +1999,7 @@ fn factor_small_leaf_subtree<T: Scalar>(
         let has_nfs = nfs > 0 && sn.parent.is_some();
         if has_nfs {
             if contrib_buffer.nrows() < nfs || contrib_buffer.ncols() < nfs {
-                contrib_buffer = Mat::<T>::zeros(
+                contrib_buffer = zeros_padded(
                     nfs.max(contrib_buffer.nrows()),
                     nfs.max(contrib_buffer.ncols()),
                 );
@@ -2161,7 +2161,7 @@ fn factor_small_leaf_subtree<T: Scalar>(
             if contrib_buffer.nrows() < m || contrib_buffer.ncols() < m {
                 // Grow if delayed columns expanded the need
                 let new_size = m.max(contrib_buffer.nrows());
-                let mut new_buf = Mat::<T>::zeros(new_size, new_size);
+                let mut new_buf = zeros_padded::<T>(new_size, new_size);
                 // Preserve NFS×NFS data already assembled
                 if nfs > 0 {
                     for j in 0..nfs {

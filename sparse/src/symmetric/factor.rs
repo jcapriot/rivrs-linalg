@@ -47,6 +47,34 @@ use super::pivot::{Block2x2, PivotType};
 use crate::error::SparseError;
 use crate::ordering::perm_from_forward;
 
+/// Allocate a zeroed `nrows × ncols` workspace whose column stride is not a
+/// multiple of 4096 bytes.
+///
+/// faer rounds the column stride of an owned [`Mat`] up to a whole number of
+/// 64-byte cache lines. When that stride is also a multiple of the 4 KiB page
+/// size, every column of the matrix starts at the same offset within a page,
+/// so walking along a row maps all accesses to the same few cache sets. GEMM
+/// packing reads operands that way; with a frontal workspace of 14842 `f64`
+/// rows (stride 118784 B = 29 × 4096) faer's contribution update dropped from
+/// about 76 to 53 GFLOP/s on one core. Padding the stride by one cache line
+/// removes the conflict at negligible memory cost.
+///
+/// Only the stride differs from [`Mat::zeros`]: `nrows()`/`ncols()` are as
+/// requested and every column is a contiguous slice.
+pub(crate) fn zeros_padded<T: Scalar>(nrows: usize, ncols: usize) -> Mat<T> {
+    const PAGE: usize = 4096;
+    const LINE: usize = 64;
+    let elem = core::mem::size_of::<T>().max(1);
+    let per_line = (LINE / elem).max(1);
+    let mut rows = nrows.next_multiple_of(per_line);
+    if rows > 0 && (rows * elem).is_multiple_of(PAGE) {
+        rows += per_line;
+    }
+    let mut mat = Mat::<T>::with_capacity(rows, ncols);
+    mat.resize_with(nrows, ncols, |_, _| T::zero());
+    mat
+}
+
 use crate::scalar::{Scalar, real, to_f64};
 
 /// Bunch-Kaufman α parameter for 2×2 determinant condition: |det| ≥ α × |a₂₁|².
@@ -202,10 +230,10 @@ impl<T: Scalar> AptpKernelWorkspace<T> {
     /// inner block dimensions.
     pub(crate) fn new(max_front: usize, inner_block_size: usize) -> Self {
         Self {
-            backup: Mat::<T>::zeros(max_front, inner_block_size),
+            backup: zeros_padded(max_front, inner_block_size),
             l11_buf: Mat::<T>::zeros(inner_block_size, inner_block_size),
-            ld_buf: Mat::<T>::zeros(max_front, inner_block_size),
-            copy_buf: Mat::<T>::zeros(max_front, inner_block_size),
+            ld_buf: zeros_padded(max_front, inner_block_size),
+            copy_buf: zeros_padded(max_front, inner_block_size),
         }
     }
 }
@@ -1729,8 +1757,7 @@ pub(crate) fn compute_contribution_gemm<T: Scalar>(
     // Use caller-provided workspace to avoid per-supernode allocation.
     // Resize if needed (rare: delayed cascades may exceed initial estimate).
     if ld_workspace.nrows() < nfs || ld_workspace.ncols() < ne {
-        *ld_workspace =
-            Mat::<T>::zeros(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
+        *ld_workspace = zeros_padded(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
     }
     let mut w = ld_workspace.as_mut().submatrix_mut(0, 0, nfs, ne);
     w.fill(T::zero());
@@ -1786,8 +1813,7 @@ pub(crate) fn compute_contribution_gemm_in_place<T: Scalar>(
     let l21_nfs = left.rb().submatrix(p, 0, nfs, ne);
 
     if ld_workspace.nrows() < nfs || ld_workspace.ncols() < ne {
-        *ld_workspace =
-            Mat::<T>::zeros(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
+        *ld_workspace = zeros_padded(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
     }
     let mut w = ld_workspace.as_mut().submatrix_mut(0, 0, nfs, ne);
     w.fill(T::zero());
@@ -2440,7 +2466,7 @@ pub(crate) fn unpivoted_factor_in_place<T: Scalar>(
     let par = options.par;
     let small = real::<T>(options.small);
     let mut d = MixedDiagonal::new(p);
-    let mut w_buf = Mat::<T>::zeros(p, UNPIVOTED_BLOCK.min(p.max(1)));
+    let mut w_buf = zeros_padded::<T>(p, UNPIVOTED_BLOCK.min(p.max(1)));
 
     let mut k0 = 0;
     while k0 < p {
@@ -2599,13 +2625,13 @@ fn two_level_factor<T: Scalar>(
 
     // Workspaces: W = L·D for the rank-nb updates, and the pre-factorization
     // tile and rows-below panel kept for rollback.
-    let mut deferred_ld = Mat::<T>::zeros(m, nb);
+    let mut deferred_ld = zeros_padded::<T>(m, nb);
     let mut tile_backup = Mat::<T>::zeros(nb, nb);
     let tile_options = AptpOptions {
         par: Par::Seq,
         ..options.clone()
     };
-    let mut panel_backup = Mat::<T>::zeros(m, nb);
+    let mut panel_backup = zeros_padded::<T>(m, nb);
 
     while remaining_fully_summed > 0 {
         let col_start = global_nelim;
@@ -3659,8 +3685,7 @@ pub(super) fn compute_contribution_gemm_rect<T: Scalar>(
 
     // Use caller-provided workspace
     if ld_workspace.nrows() < nfs || ld_workspace.ncols() < ne {
-        *ld_workspace =
-            Mat::<T>::zeros(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
+        *ld_workspace = zeros_padded(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
     }
     let mut w = ld_workspace.as_mut().submatrix_mut(0, 0, nfs, ne);
     w.fill(T::zero());
@@ -6380,6 +6405,30 @@ mod tests {
         );
         let err = check_partial_factorization_in_place(&a, &f, p, &result);
         assert!(err < 1e-12, "reconstruction error {err:.2e}");
+    }
+
+    #[test]
+    fn test_zeros_padded_avoids_page_multiple_stride() {
+        // 14842 f64 rows round to a 14848-element (29 × 4096 B) stride in a plain
+        // Mat; 256 c64 rows are exactly 4096 B. Both must be padded.
+        fn check<T: Scalar>(nrows: usize, ncols: usize) {
+            let m = zeros_padded::<T>(nrows, ncols);
+            assert_eq!((m.nrows(), m.ncols()), (nrows, ncols));
+            let stride_bytes = m.col_stride().unsigned_abs() * core::mem::size_of::<T>();
+            if nrows > 0 {
+                assert_ne!(stride_bytes % 4096, 0, "stride {stride_bytes} B");
+                assert!(m.col_stride().unsigned_abs() >= nrows);
+            }
+            for j in 0..ncols {
+                assert!(m.col_as_slice(j).iter().all(|x| *x == T::zero()));
+            }
+        }
+        check::<f64>(14842, 3);
+        check::<f64>(512, 2);
+        check::<f32>(1024, 2);
+        check::<faer::c64>(256, 2);
+        check::<faer::c32>(500, 2);
+        check::<f64>(0, 0);
     }
 
     #[test]
