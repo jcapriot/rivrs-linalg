@@ -353,3 +353,100 @@ fn metis_ordering_is_deterministic_under_concurrency() {
         "concurrent METIS orderings differ"
     );
 }
+
+/// Shifted 3D Laplacian, 6 + σ on the diagonal: symmetric positive definite
+/// for real `T`; for complex `T` the shift gets an imaginary part (complex
+/// symmetric with positive definite real part, as in damped wave problems).
+fn shifted_laplacian_3d<T: FromParts>(m: usize, seed: u64) -> SparseColMat<usize, T> {
+    let mut rng = Lcg(seed);
+    let idx = |i: usize, j: usize, k: usize| i + m * (j + m * k);
+    let mut lower = Vec::new();
+    for k in 0..m {
+        for j in 0..m {
+            for i in 0..m {
+                let p = idx(i, j, k);
+                lower.push((
+                    p,
+                    p,
+                    T::from_parts(6.0 + 0.5 * rng.next(), 0.3 + rng.next()),
+                ));
+                for q in [
+                    (i > 0).then(|| idx(i - 1, j, k)),
+                    (j > 0).then(|| idx(i, j - 1, k)),
+                    (k > 0).then(|| idx(i, j, k - 1)),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    lower.push((p, q, T::from_parts(-1.0, 0.0)));
+                }
+            }
+        }
+    }
+    symmetric_from_lower(m * m * m, &lower)
+}
+
+/// Solve A x = A·1 with the given pivoting choice (METIS ordering).
+fn solve_ones_pivoting<T: Scalar>(
+    a: &SparseColMat<usize, T>,
+    pivoting: bool,
+    par: Par,
+) -> Result<(f64, f64), rivrs_sparse::error::SparseError> {
+    let n = a.nrows();
+    let ones = Col::<T>::from_fn(n, |_| T::one());
+    let b = matvec(a, &ones);
+    let mut solver = SparseLDLT::analyze_with_matrix(
+        a,
+        &AnalyzeOptions {
+            ordering: OrderingStrategy::Metis,
+        },
+    )?;
+    solver.factor(
+        a,
+        &FactorOptions {
+            pivoting,
+            par,
+            ..Default::default()
+        },
+    )?;
+    let mut mem = MemBuffer::new(solver.solve_scratch(1));
+    let x = solver.solve(&b, MemStack::new(&mut mem), par)?;
+    let fe = (0..n).map(|i| mag64(x[i] - T::one())).fold(0.0, f64::max);
+    Ok((backward_error(a, &x, &b), fe))
+}
+
+#[test]
+fn unpivoted_matches_pivoted_on_definite_matrices() {
+    fn check<T: FromParts>(tol: f64, name: &str) {
+        // 14^3 with METIS has fronts above 128 fully-summed columns, so the
+        // blocked kernel and its rows-below TRSM are both exercised.
+        let a = shifted_laplacian_3d::<T>(14, 3);
+        for par in [Par::Seq, Par::rayon(4)] {
+            let (be_u, fe_u) = solve_ones_pivoting(&a, false, par).expect("unpivoted factor");
+            let (be_p, _) = solve_ones_pivoting(&a, true, par).expect("pivoted factor");
+            assert!(be_u < tol, "{name} unpivoted backward error {be_u:e}");
+            assert!(be_p < tol, "{name} pivoted backward error {be_p:e}");
+            assert!(fe_u < 1e3 * tol, "{name} unpivoted forward error {fe_u:e}");
+        }
+    }
+    check::<f64>(1e-13, "f64");
+    check::<c64>(1e-13, "c64");
+    check::<f32>(1e-5, "f32");
+    check::<c32>(1e-5, "c32");
+}
+
+#[test]
+fn unpivoted_saddle_point_is_refused_or_accurate() {
+    // A zero (2,2) block needs pivoting in general. Without it, either a
+    // (near-)zero pivot is hit and reported, or the order happened to avoid
+    // one and the answer must still be accurate; never a silent bad factor.
+    let a = kkt::<c64>(600, 150, 3);
+    match solve_ones_pivoting(&a, false, Par::Seq) {
+        Err(rivrs_sparse::error::SparseError::NumericalSingularity { .. }) => {}
+        Err(e) => panic!("unexpected error {e:?}"),
+        Ok((be, _)) => assert!(
+            be < 1e-10,
+            "unpivoted KKT accepted with backward error {be:e}"
+        ),
+    }
+}

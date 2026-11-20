@@ -117,6 +117,9 @@ pub struct AptpOptions {
     /// Largest front inside a parallel L0 subtree. Default: 4096.
     /// See `FactorOptions::l0_max_front`.
     pub l0_max_front: usize,
+    /// Pivot during factorization (APTP). Default: true. With false, fronts
+    /// are factored as unpivoted L·D·Lᵀ. See `FactorOptions::pivoting`.
+    pub pivoting: bool,
 }
 
 impl Default for AptpOptions {
@@ -132,6 +135,7 @@ impl Default for AptpOptions {
             nemin: 32,
             small_leaf_threshold: 256,
             l0_max_front: 4096,
+            pivoting: true,
         }
     }
 }
@@ -351,6 +355,11 @@ pub fn aptp_factor_in_place<T: Scalar>(
                 options.inner_block_size, options.outer_block_size
             ),
         });
+    }
+
+    // Unpivoted L·D·Lᵀ: no APTP machinery.
+    if !options.pivoting {
+        return unpivoted_factor_in_place(a, num_fully_summed, options);
     }
 
     // Primary factorization dispatch.
@@ -2392,6 +2401,153 @@ fn rollback_block_result<T: Scalar>(
     result.stats.num_2x2 = n2;
     result.stats.num_delayed += tile_nelim - block_nelim;
     result.num_eliminated = block_nelim;
+}
+
+/// Column block size of [`unpivoted_factor_in_place`].
+const UNPIVOTED_BLOCK: usize = 128;
+
+/// Partial L·D·Lᵀ factorization of a front with 1×1 pivots in the given
+/// order (no pivoting).
+///
+/// Blocked, right-looking and non-conjugating, so it serves real and complex
+/// symmetric matrices alike. For each `UNPIVOTED_BLOCK`-column block of the
+/// `p × p` fully-summed part: factor the diagonal block element by element,
+/// compute the block's L below it within the fully-summed part (one TRSM and
+/// D⁻¹ scaling), then apply one rank-block update to the remaining
+/// fully-summed columns. Finally the rows below (`p..m`) get
+/// `L21 = A21 · L11⁻ᵀ · D⁻¹` in one TRSM. The NFS×NFS block is left for the
+/// contribution GEMM, as in the APTP path. `a` may be the square front or
+/// rectangular `m × p` storage; only columns `0..p` are touched.
+///
+/// A pivot with modulus at or below `options.small`, or not finite, returns
+/// [`SparseError::NumericalSingularity`]. No other stability check is made:
+/// this is for matrices known not to need pivoting (SPD, quasi-definite,
+/// diagonally dominant). The result has all 1×1 pivots, the identity
+/// permutation and no delays, so extraction, storage and the solve are shared
+/// with the APTP path.
+///
+/// # References
+///
+/// - Golub & Van Loan (2013), *Matrix Computations* 4th ed., §4.1: LDLᵀ
+///   without pivoting; §4.2 and §4.4 for when it is stable
+/// - Higham (2002), *Accuracy and Stability of Numerical Algorithms*, §10.1
+pub(crate) fn unpivoted_factor_in_place<T: Scalar>(
+    mut a: MatMut<'_, T>,
+    p: usize,
+    options: &AptpOptions,
+) -> Result<AptpFactorResult<T>, SparseError> {
+    let m = a.nrows();
+    let par = options.par;
+    let small = real::<T>(options.small);
+    let mut d = MixedDiagonal::new(p);
+    let mut w_buf = Mat::<T>::zeros(p, UNPIVOTED_BLOCK.min(p.max(1)));
+
+    let mut k0 = 0;
+    while k0 < p {
+        let w = UNPIVOTED_BLOCK.min(p - k0);
+        let k1 = k0 + w;
+
+        // 1. Diagonal block: unblocked right-looking LDLᵀ.
+        for j in k0..k1 {
+            let dj = a[(j, j)];
+            let mag = dj.mag();
+            if mag <= small || !mag.is_finite() {
+                return Err(SparseError::NumericalSingularity {
+                    pivot_index: j,
+                    value: to_f64(mag),
+                });
+            }
+            d.set_1x1(j, dj);
+            let inv = T::one() / dj;
+            for c in j + 1..k1 {
+                let ldc = a[(c, j)]; // = l_cj · d_j (not yet scaled)
+                for i in c..k1 {
+                    let upd = a[(i, j)] * inv * ldc;
+                    a[(i, c)] -= upd;
+                }
+            }
+            for i in j + 1..k1 {
+                a[(i, j)] *= inv;
+            }
+        }
+
+        // 2. Block column below the diagonal block, within the fully-summed
+        //    part: L = A · L_blk⁻ᵀ · D_blk⁻¹ (rows k1..p).
+        let below = p - k1;
+        if below > 0 {
+            let (top, mut rest) = a.rb_mut().split_at_row_mut(k1);
+            let l_blk = top.rb().submatrix(k0, k0, w, w);
+            let mut panel = rest.rb_mut().submatrix_mut(0, k0, below, w);
+            triangular_solve::solve_unit_lower_triangular_in_place(
+                l_blk,
+                panel.rb_mut().transpose_mut(),
+                par,
+            );
+            // This block's pivots, indexed from 0 for the shared helpers.
+            let mut d_blk = MixedDiagonal::new(w);
+            for jj in 0..w {
+                d_blk.set_1x1(jj, d.diagonal_1x1(k0 + jj));
+            }
+            let _ = scale_rows_col_max(panel.rb_mut(), &d_blk, w, par);
+
+            // 3. Trailing update of fully-summed columns k1..p (rows k1..p):
+            //    A -= L · D · Lᵀ (lower), one rank-w GEMM with W = L · D.
+            let mut wd = w_buf.as_mut().submatrix_mut(0, 0, below, w);
+            compute_ld_into(panel.rb(), &d_blk, w, wd.rb_mut(), par);
+            let (left, right) = rest.rb_mut().split_at_col_mut(k1);
+            let l_rows = left.rb().submatrix(0, k0, below, w);
+            tri_matmul::matmul_with_conj(
+                right.submatrix_mut(0, 0, below, below),
+                BlockStructure::TriangularLower,
+                Accum::Add,
+                wd.rb(),
+                BlockStructure::Rectangular,
+                Conj::No,
+                l_rows.transpose(),
+                BlockStructure::Rectangular,
+                Conj::No,
+                T::from_f64(-1.0),
+                par,
+            );
+        }
+        k0 = k1;
+    }
+
+    // Rows below the fully-summed part: L21 = A21 · L11⁻ᵀ · D⁻¹.
+    let mut stats = AptpStatistics {
+        num_1x1: p,
+        ..AptpStatistics::default()
+    };
+    let rows = m - p;
+    if p > 0 && rows > 0 {
+        let (top, mut below) = a.rb_mut().split_at_row_mut(p);
+        let l11 = top.rb().submatrix(0, 0, p, p);
+        let mut panel = below.rb_mut().submatrix_mut(0, 0, rows, p);
+        triangular_solve::solve_unit_lower_triangular_in_place(
+            l11,
+            panel.rb_mut().transpose_mut(),
+            par,
+        );
+        let col_max = scale_rows_col_max(panel, &d, p, par);
+        stats.max_l_entry = col_max.iter().fold(0.0, |acc, &v| acc.max(to_f64(v)));
+    }
+
+    let pivot_log = (0..p)
+        .map(|col| AptpPivotRecord {
+            col,
+            pivot_type: PivotType::OneByOne,
+            max_l_entry: 0.0,
+            was_fallback: false,
+        })
+        .collect();
+    Ok(AptpFactorResult {
+        d,
+        perm: (0..m).collect(),
+        num_eliminated: p,
+        delayed_cols: Vec::new(),
+        stats,
+        pivot_log,
+    })
 }
 
 /// Two-level outer block loop for large frontal matrices.
@@ -6195,6 +6351,55 @@ mod tests {
     }
 
     // ---- NFS boundary in two-level factor tests ----
+
+    #[test]
+    fn test_unpivoted_spd_partial_factorization() {
+        // SPD front (diagonally dominant), p = 250 fully-summed of m = 300:
+        // spans two 128-column blocks and has rows below the fully-summed part.
+        let (m, p) = (300, 250);
+        let base = deterministic_indefinite_matrix(m, 11, 0.0);
+        let a = Mat::<f64>::from_fn(m, m, |i, j| {
+            if i == j {
+                2.0 * m as f64 + base[(i, i)].abs()
+            } else {
+                base[(i, j)]
+            }
+        });
+        let opts = AptpOptions {
+            pivoting: false,
+            ..AptpOptions::default()
+        };
+        let mut f = a.clone();
+        let result = aptp_factor_in_place(f.as_mut(), p, &opts).unwrap();
+        assert_eq!(result.num_eliminated, p);
+        assert_eq!(result.stats.num_1x1, p);
+        assert_eq!(result.stats.num_delayed, 0);
+        assert!(
+            result.perm.iter().enumerate().all(|(i, &v)| i == v),
+            "unpivoted: identity perm"
+        );
+        let err = check_partial_factorization_in_place(&a, &f, p, &result);
+        assert!(err < 1e-12, "reconstruction error {err:.2e}");
+    }
+
+    #[test]
+    fn test_unpivoted_zero_pivot_errors() {
+        // [[0, 1], [1, 0]] is nonsingular but needs pivoting: the first pivot
+        // is exactly zero, so unpivoted LDLᵀ must refuse it.
+        let mut a = Mat::<f64>::from_fn(2, 2, |i, j| if i == j { 0.0 } else { 1.0 });
+        let opts = AptpOptions {
+            pivoting: false,
+            ..AptpOptions::default()
+        };
+        let err = aptp_factor_in_place(a.as_mut(), 2, &opts).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SparseError::NumericalSingularity { pivot_index: 0, .. }
+            ),
+            "got {err:?}"
+        );
+    }
 
     #[test]
     fn test_two_level_rows_below_rollback() {

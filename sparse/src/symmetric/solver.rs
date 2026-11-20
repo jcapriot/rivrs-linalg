@@ -109,6 +109,23 @@ pub struct FactorOptions {
     /// threads inside the front. Raising it trades memory for tree-level
     /// parallelism. Ignored for `Par::Seq`.
     pub l0_max_front: usize,
+    /// Pivot during factorization. Default: `true`.
+    ///
+    /// With `false`, each front's fully-summed block is factored as L·D·Lᵀ
+    /// with 1×1 pivots in the given order: no pivot search, stability checks
+    /// or delays. A pivot with modulus at or below `small`, or not finite,
+    /// stops factorization with [`SparseError::NumericalSingularity`]. Works
+    /// for every scalar type (complex symmetric included).
+    ///
+    /// Unpivoted LDLᵀ is stable for symmetric positive definite matrices
+    /// (Higham 2002, §10.1), symmetric quasi-definite matrices and diagonally
+    /// dominant ones. For other indefinite matrices a small but nonzero pivot
+    /// can make the factors grow without bound: check
+    /// `FactorizationStats::max_l_entry` and the solution's backward error,
+    /// or keep the default APTP pivoting.
+    ///
+    /// [`SparseError::NumericalSingularity`]: crate::error::SparseError::NumericalSingularity
+    pub pivoting: bool,
 }
 
 impl Default for FactorOptions {
@@ -122,6 +139,7 @@ impl Default for FactorOptions {
             nemin: 32,
             small_leaf_threshold: 256,
             l0_max_front: 4096,
+            pivoting: true,
         }
     }
 }
@@ -146,6 +164,9 @@ pub struct SolverOptions {
     /// Largest front inside a parallel subtree. Default: 4096.
     /// See [`FactorOptions::l0_max_front`].
     pub l0_max_front: usize,
+    /// Pivot during factorization. Default: `true`.
+    /// See [`FactorOptions::pivoting`].
+    pub pivoting: bool,
 }
 
 impl Default for SolverOptions {
@@ -158,6 +179,7 @@ impl Default for SolverOptions {
             nemin: 32,
             small_leaf_threshold: 256,
             l0_max_front: 4096,
+            pivoting: true,
         }
     }
 }
@@ -324,6 +346,7 @@ impl<T: Scalar> SparseLDLT<T> {
             nemin: options.nemin,
             small_leaf_threshold: options.small_leaf_threshold,
             l0_max_front: options.l0_max_front,
+            pivoting: options.pivoting,
             ..AptpOptions::default()
         };
 
@@ -500,6 +523,7 @@ impl<T: Scalar> SparseLDLT<T> {
             nemin: options.nemin,
             small_leaf_threshold: options.small_leaf_threshold,
             l0_max_front: options.l0_max_front,
+            pivoting: options.pivoting,
             ..FactorOptions::default()
         };
 

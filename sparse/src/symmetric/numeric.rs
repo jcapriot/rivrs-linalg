@@ -45,7 +45,7 @@ use super::diagonal::{MixedDiagonal, PivotEntry};
 use super::factor::{
     AptpFactorResult, AptpOptions, aptp_factor_in_place, compute_contribution_gemm_in_place,
     compute_contribution_gemm_rect, extract_contribution_rect, extract_front_factors_rect,
-    tpp_factor_rect,
+    tpp_factor_rect, unpivoted_factor_in_place,
 };
 use super::pivot::{Block2x2, PivotType};
 use super::symbolic::AptpSymbolic;
@@ -2135,7 +2135,16 @@ fn factor_small_leaf_subtree<T: Scalar>(
         #[cfg(feature = "diagnostic")]
         let kernel_start = std::time::Instant::now();
 
-        let result = tpp_factor_rect(l_storage.as_mut().submatrix_mut(0, 0, m, k), k, options)?;
+        let result = if !options.pivoting {
+            // Small fronts: unpivoted kernel on the rectangular storage.
+            let seq = AptpOptions {
+                par: Par::Seq,
+                ..options.clone()
+            };
+            unpivoted_factor_in_place(l_storage.as_mut().submatrix_mut(0, 0, m, k), k, &seq)?
+        } else {
+            tpp_factor_rect(l_storage.as_mut().submatrix_mut(0, 0, m, k), k, options)?
+        };
         let ne = result.num_eliminated;
 
         #[cfg(feature = "diagnostic")]
