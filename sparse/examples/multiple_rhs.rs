@@ -3,7 +3,9 @@
 //! Demonstrates factoring a matrix once and solving for several different
 //! right-hand sides, reusing both the factorization and the solve workspace.
 //! This is the typical pattern for problems with multiple load cases or
-//! source terms.
+//! source terms. When the right-hand sides are all known up front, put them
+//! in the columns of one matrix and use `solve_mat`: each pass over the
+//! factor then serves many columns at once.
 //!
 //! ```sh
 //! cargo run --example multiple_rhs
@@ -11,7 +13,7 @@
 
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::sparse::{SparseColMat, Triplet};
-use faer::{Col, Par};
+use faer::{Col, Mat, Par};
 
 use rivrs_sparse::symmetric::{AnalyzeOptions, FactorOptions, OrderingStrategy, SparseLDLT};
 use rivrs_sparse::validate::sparse_backward_error;
@@ -90,6 +92,21 @@ fn main() {
 
         assert!(be < 1e-12, "backward error too large: {be:.2e}");
     }
+
+    // -----------------------------------------------------------------------
+    // 4. Or solve them all at once: one column per right-hand side.
+    // -----------------------------------------------------------------------
+    let b_all = Mat::from_fn(n, rhs_vectors.len(), |i, j| rhs_vectors[j][i]);
+    let mut mem_all = MemBuffer::new(solver.solve_scratch(b_all.ncols()));
+    let x_all = solver
+        .solve_mat(b_all.as_ref(), MemStack::new(&mut mem_all), Par::Seq)
+        .expect("solve_mat");
+    for (j, b) in rhs_vectors.iter().enumerate() {
+        let x = Col::from_fn(n, |i| x_all[(i, j)]);
+        let be = sparse_backward_error(&a, &x, b);
+        assert!(be < 1e-12, "solve_mat column {j}: backward error {be:.2e}");
+    }
+    println!("solve_mat: all {} columns at once, same results", b_all.ncols());
 
     println!("\nAll solves passed (backward error < 1e-12).");
 }

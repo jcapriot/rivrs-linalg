@@ -1836,3 +1836,58 @@ fn test_fast_path_suitesparse_ci() {
         );
     }
 }
+
+/// `solve_mat` on CI subset matrices (MC64 scaling for the hard indefinite
+/// ones): every column has a small backward error and matches the
+/// single-vector solve, sequential and threaded.
+#[test]
+fn test_solve_mat_ci_subset() {
+    use faer::Mat;
+    use rivrs_sparse::io::registry;
+
+    let all_matrices = registry::load_registry().expect("load registry");
+    for meta in all_matrices.iter().filter(|m| m.ci_subset) {
+        let test = registry::load_test_matrix(&meta.name)
+            .unwrap_or_else(|e| panic!("load '{}': {}", meta.name, e))
+            .unwrap_or_else(|| panic!("matrix '{}' not found", meta.name));
+        let a = &test.matrix;
+        let n = a.nrows();
+        let ordering = if meta.category == "hard-indefinite" {
+            OrderingStrategy::MatchOrderMetis
+        } else {
+            OrderingStrategy::Metis
+        };
+        let mut solver =
+            SparseLDLT::analyze_with_matrix(a, &AnalyzeOptions { ordering }).expect("analyze");
+        solver.factor(a, &FactorOptions::default()).expect("factor");
+
+        let k = 5;
+        let b = Mat::<f64>::from_fn(n, k, |i, j| ((i + 1) as f64 * (j + 1) as f64 * 0.37).sin());
+        let mut mem = MemBuffer::new(solver.solve_scratch(k));
+        for par in [Par::Seq, Par::rayon(4)] {
+            let x = solver
+                .solve_mat(b.as_ref(), MemStack::new(&mut mem), par)
+                .expect("solve_mat");
+            for j in 0..k {
+                let bj = Col::from_fn(n, |i| b[(i, j)]);
+                let xj = Col::from_fn(n, |i| x[(i, j)]);
+                let be = sparse_backward_error(a, &xj, &bj);
+                assert!(
+                    be < 5e-11,
+                    "'{}' {par:?} col {j}: backward error {be:.2e}",
+                    meta.name
+                );
+                let x1 = solver
+                    .solve(&bj, MemStack::new(&mut mem), par)
+                    .expect("solve");
+                let scale = (0..n).fold(1.0f64, |m, i| m.max(x1[i].abs()));
+                let diff = (0..n).fold(0.0f64, |m, i| m.max((x1[i] - xj[i]).abs()));
+                assert!(
+                    diff <= 1e-10 * scale,
+                    "'{}' {par:?} col {j}: diff {diff:e}",
+                    meta.name
+                );
+            }
+        }
+    }
+}

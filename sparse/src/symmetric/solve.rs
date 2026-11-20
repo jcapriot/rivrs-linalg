@@ -135,6 +135,8 @@ pub(crate) use {tic, toc};
 /// coordinate system — the caller handles P and T). Traverses the assembly
 /// tree performing per-supernode gather/solve/scatter operations.
 ///
+/// Single right-hand side form of [`aptp_solve_mat`].
+///
 /// # Arguments
 ///
 /// - `symbolic`: Symbolic analysis (supernode structure, traversal order)
@@ -154,7 +156,7 @@ pub fn aptp_solve<T: Scalar>(
     symbolic: &AptpSymbolic,
     numeric: &AptpNumeric<T>,
     rhs: &mut [T],
-    _stack: &mut faer::dyn_stack::MemStack,
+    stack: &mut faer::dyn_stack::MemStack,
     par: Par,
 ) -> Result<(), SparseError> {
     let n = symbolic.nrows();
@@ -165,8 +167,59 @@ pub fn aptp_solve<T: Scalar>(
             context: "RHS length must match matrix dimension".to_string(),
         });
     }
+    let len = rhs.len();
+    aptp_solve_mat(
+        symbolic,
+        numeric,
+        MatMut::from_column_major_slice_mut(rhs, len, 1),
+        stack,
+        par,
+    )
+}
 
-    if n == 0 {
+/// Right-hand sides solved together per pass over the factor. Each pass
+/// reads every L block once and applies it to this many columns (GEMM
+/// instead of GEMV); the workspace grows linearly with it.
+pub(crate) const SOLVE_RHS_BLOCK: usize = 64;
+
+/// Per-supernode triangular solve for several right-hand sides at once.
+///
+/// Solves L D L^T X = B in place, where B is `n × k` in `rhs` (permuted
+/// coordinates — the caller handles P and T). Columns are processed in
+/// blocks of up to [`SOLVE_RHS_BLOCK`], so each block reads the factor once.
+///
+/// # Errors
+///
+/// Returns `SparseError::DimensionMismatch` if `rhs.nrows() != symbolic.nrows()`.
+///
+/// # References
+///
+/// - Duff, Hogg & Lopez (2020), Section 3: APTP solve algorithm
+/// - Liu (1992), Sections 4-5: multifrontal solve traversal
+pub fn aptp_solve_mat<T: Scalar>(
+    symbolic: &AptpSymbolic,
+    numeric: &AptpNumeric<T>,
+    mut rhs: MatMut<'_, T>,
+    _stack: &mut faer::dyn_stack::MemStack,
+    par: Par,
+) -> Result<(), SparseError> {
+    let n = symbolic.nrows();
+    if rhs.nrows() != n {
+        return Err(SparseError::DimensionMismatch {
+            expected: (n, rhs.ncols()),
+            got: (rhs.nrows(), rhs.ncols()),
+            context: "RHS rows must match matrix dimension".to_string(),
+        });
+    }
+    if n == 0 || rhs.ncols() == 0 {
+        return Ok(());
+    }
+    // The per-front kernels index rows directly; work on a contiguous copy
+    // if the caller's columns are strided.
+    if rhs.row_stride() != 1 {
+        let mut tmp = rhs.to_owned();
+        aptp_solve_mat(symbolic, numeric, tmp.as_mut(), _stack, par)?;
+        rhs.copy_from(&tmp);
         return Ok(());
     }
 
@@ -185,116 +238,190 @@ pub fn aptp_solve<T: Scalar>(
     };
     toc!(t_plan, 6, 0);
 
-    match plan {
-        Some(plan) => plan.solve(factors, rhs, max_size, par),
-        None => {
-            let mut work = vec![T::zero(); max_size];
-            let mut work2 = vec![T::zero(); max_size];
-            // Forward solve (postorder = index order), then the diagonal and
-            // backward solves fused per front in reverse postorder. A front's
-            // own entries are final after its forward solve and untouched
-            // until its backward solve, so fusing D gives identical results.
-            for ff in factors {
-                forward_solve_supernode(ff, rhs, &mut work, &mut work2, par);
-            }
-            for ff in factors.iter().rev() {
-                diag_backward_solve_supernode(ff, rhs, &mut work, &mut work2, par);
+    let k_all = rhs.ncols();
+    let kb = k_all.min(SOLVE_RHS_BLOCK);
+    let mut work = vec![T::zero(); max_size * kb];
+    let mut work2 = vec![T::zero(); max_size * kb];
+    let mut c0 = 0;
+    while c0 < k_all {
+        let c1 = (c0 + SOLVE_RHS_BLOCK).min(k_all);
+        let block = rhs.as_mut().subcols_mut(c0, c1 - c0);
+        match &plan {
+            Some(plan) => plan.solve(factors, block, &mut work, &mut work2, max_size, par),
+            None => {
+                let mut view = RhsView::exclusive(block);
+                // Forward solve (postorder = index order), then the diagonal
+                // and backward solves fused per front in reverse postorder. A
+                // front's own entries are final after its forward solve and
+                // untouched until its backward solve, so fusing D gives
+                // identical results.
+                for ff in factors {
+                    forward_solve_supernode(ff, &mut view, &mut work, &mut work2, par);
+                }
+                for ff in factors.iter().rev() {
+                    diag_backward_solve_supernode(ff, &mut view, &mut work, &mut work2, par);
+                }
             }
         }
+        c0 = c1;
     }
     toc!(t_total, 13, 0);
 
     Ok(())
 }
 
-/// Access to the right-hand side for the per-front solve steps.
+/// Access to the right-hand side block (`n × k`) for the per-front steps.
 ///
-/// `[T]` is the plain sequential case. [`TaskRhs`] is the view a subtree
-/// task gets: it writes its own entries in place and buffers updates to
-/// entries owned by the top part of the tree.
+/// `[T]`/`Vec<T>` are a single column. [`RhsView`] is a column-major block,
+/// either held exclusively or shared by subtree tasks (then it writes its
+/// own entries in place and buffers updates to top-part entries).
 pub(crate) trait SolveRhs<T> {
-    /// Entry `i`.
-    fn get(&self, i: usize) -> T;
-    /// Overwrite entry `i` (only ever an entry the current front owns).
-    fn set(&mut self, i: usize, v: T);
-    /// Entry `i` -= `v` (forward scatter into an ancestor's entry).
-    fn sub(&mut self, i: usize, v: T);
+    /// Number of right-hand side columns.
+    fn ncols(&self) -> usize;
+    /// Entry `(i, j)`.
+    fn get(&self, i: usize, j: usize) -> T;
+    /// Overwrite entry `(i, j)` (only ever an entry the current front owns).
+    fn set(&mut self, i: usize, j: usize, v: T);
+    /// Entry `(i, j)` -= `v` (forward scatter into an ancestor's entry).
+    fn sub(&mut self, i: usize, j: usize, v: T);
 }
 
 impl<T: Scalar> SolveRhs<T> for [T] {
     #[inline(always)]
-    fn get(&self, i: usize) -> T {
+    fn ncols(&self) -> usize {
+        1
+    }
+    #[inline(always)]
+    fn get(&self, i: usize, j: usize) -> T {
+        debug_assert_eq!(j, 0);
         self[i]
     }
     #[inline(always)]
-    fn set(&mut self, i: usize, v: T) {
+    fn set(&mut self, i: usize, j: usize, v: T) {
+        debug_assert_eq!(j, 0);
         self[i] = v;
     }
     #[inline(always)]
-    fn sub(&mut self, i: usize, v: T) {
+    fn sub(&mut self, i: usize, j: usize, v: T) {
+        debug_assert_eq!(j, 0);
         self[i] -= v;
     }
 }
 
 impl<T: Scalar> SolveRhs<T> for Vec<T> {
     #[inline(always)]
-    fn get(&self, i: usize) -> T {
-        self[i]
+    fn ncols(&self) -> usize {
+        1
     }
     #[inline(always)]
-    fn set(&mut self, i: usize, v: T) {
-        self[i] = v;
+    fn get(&self, i: usize, j: usize) -> T {
+        <[T] as SolveRhs<T>>::get(self, i, j)
     }
     #[inline(always)]
-    fn sub(&mut self, i: usize, v: T) {
-        self[i] -= v;
+    fn set(&mut self, i: usize, j: usize, v: T) {
+        <[T] as SolveRhs<T>>::set(self, i, j, v);
+    }
+    #[inline(always)]
+    fn sub(&mut self, i: usize, j: usize, v: T) {
+        <[T] as SolveRhs<T>>::sub(self, i, j, v);
     }
 }
 
-/// Raw pointer to the right-hand side shared by concurrent subtree tasks.
+/// Raw pointer to a column-major right-hand side block (row stride 1).
 #[derive(Clone, Copy)]
 struct SharedRhs<T> {
     ptr: *mut T,
-    len: usize,
+    nrows: usize,
+    ncols: usize,
+    col_stride: usize,
 }
 
-// SAFETY: tasks only access entries as described on `SolvePlan::solve`:
-// disjoint writes, and reads of entries no task writes in that phase.
+// SAFETY: concurrent tasks only access entries as described on
+// `SolvePlan::solve`: disjoint writes, and reads of entries no task writes
+// in that phase.
 unsafe impl<T: Send> Send for SharedRhs<T> {}
 unsafe impl<T: Send> Sync for SharedRhs<T> {}
 
-/// A subtree task's view of the right-hand side (see [`SolvePlan`]).
-struct TaskRhs<'a, T> {
-    rhs: SharedRhs<T>,
-    /// Pending forward updates to top-part entries, indexed by `top_idx`.
-    buf: &'a mut [T],
-    top_idx: &'a [u32],
+impl<T> SharedRhs<T> {
+    fn new(mut rhs: MatMut<'_, T>) -> Self {
+        assert!(rhs.row_stride() == 1 || rhs.nrows() <= 1);
+        let col_stride = if rhs.ncols() > 1 {
+            usize::try_from(rhs.col_stride()).expect("positive column stride")
+        } else {
+            rhs.nrows()
+        };
+        Self {
+            ptr: rhs.as_mut().as_ptr_mut(),
+            nrows: rhs.nrows(),
+            ncols: rhs.ncols(),
+            col_stride,
+        }
+    }
+
+    #[inline(always)]
+    fn offset(&self, i: usize, j: usize) -> usize {
+        assert!(i < self.nrows && j < self.ncols);
+        i + j * self.col_stride
+    }
 }
 
-impl<T: Scalar> SolveRhs<T> for TaskRhs<'_, T> {
+/// A view of the right-hand side block for the per-front steps.
+///
+/// Held exclusively (sequential solve, top part), it reads and writes the
+/// block directly. A subtree task's view (see [`SolvePlan`]) writes entries
+/// its own fronts eliminate directly and buffers its forward updates to
+/// every other entry in `buf` (`n_top × k`, indexed by `top_idx`).
+struct RhsView<'a, T> {
+    rhs: SharedRhs<T>,
+    buf: &'a mut [T],
+    /// Empty for an exclusive view.
+    top_idx: &'a [u32],
+    n_top: usize,
+    _borrow: core::marker::PhantomData<&'a mut T>,
+}
+
+impl<'a, T> RhsView<'a, T> {
+    /// View over a block nobody else touches while it lives.
+    fn exclusive(rhs: MatMut<'a, T>) -> Self {
+        Self {
+            rhs: SharedRhs::new(rhs),
+            buf: &mut [],
+            top_idx: &[],
+            n_top: 0,
+            _borrow: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: Scalar> SolveRhs<T> for RhsView<'_, T> {
     #[inline(always)]
-    fn get(&self, i: usize) -> T {
-        assert!(i < self.rhs.len);
-        // SAFETY: in bounds; no other task writes entry `i` in this phase
-        // (it is owned by this subtree or by the top part, see `SolvePlan`).
-        unsafe { self.rhs.ptr.add(i).read() }
+    fn ncols(&self) -> usize {
+        self.rhs.ncols
     }
     #[inline(always)]
-    fn set(&mut self, i: usize, v: T) {
-        assert!(i < self.rhs.len);
-        debug_assert_eq!(self.top_idx[i], NOT_TOP);
-        // SAFETY: in bounds; entry `i` belongs to a front in this subtree,
-        // so no other task reads or writes it.
-        unsafe { self.rhs.ptr.add(i).write(v) }
+    fn get(&self, i: usize, j: usize) -> T {
+        let o = self.rhs.offset(i, j);
+        // SAFETY: in bounds. An exclusive view owns the block; in a task,
+        // no other task writes entry `i` in this phase (it is owned by
+        // this subtree or by the top part, see `SolvePlan::solve`).
+        unsafe { self.rhs.ptr.add(o).read() }
     }
     #[inline(always)]
-    fn sub(&mut self, i: usize, v: T) {
-        match self.top_idx[i] {
+    fn set(&mut self, i: usize, j: usize, v: T) {
+        debug_assert!(self.top_idx.is_empty() || self.top_idx[i] == NOT_TOP);
+        let o = self.rhs.offset(i, j);
+        // SAFETY: in bounds. Entry `i` belongs to a front this view's
+        // owner is solving, so no other task reads or writes it.
+        unsafe { self.rhs.ptr.add(o).write(v) }
+    }
+    #[inline(always)]
+    fn sub(&mut self, i: usize, j: usize, v: T) {
+        match self.top_idx.get(i).copied().unwrap_or(NOT_TOP) {
             NOT_TOP => {
-                let x = self.get(i);
-                self.set(i, x - v);
+                let x = self.get(i, j);
+                self.set(i, j, x - v);
             }
-            k => self.buf[k as usize] += v,
+            t => self.buf[t as usize + j * self.n_top] += v,
         }
     }
 }
@@ -410,7 +537,8 @@ impl SolvePlan {
         })
     }
 
-    /// Forward, diagonal and backward solve using the partition.
+    /// Forward, diagonal and backward solve of one right-hand side block
+    /// (`n × k`, row stride 1) using the partition.
     ///
     /// 1. Subtree tasks run the forward solve concurrently. A task writes
     ///    rhs entries its own fronts eliminate (no other task touches those)
@@ -428,24 +556,18 @@ impl SolvePlan {
     fn solve<T: Scalar>(
         &self,
         factors: &[FrontFactors<T>],
-        rhs: &mut [T],
+        mut rhs: MatMut<'_, T>,
+        work: &mut [T],
+        work2: &mut [T],
         max_size: usize,
         par: Par,
     ) {
         use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
-        let shared = SharedRhs {
-            ptr: rhs.as_mut_ptr(),
-            len: rhs.len(),
-        };
+        let k = rhs.ncols();
+        let n_top = self.n_top;
+        let shared = SharedRhs::new(rhs.as_mut());
         let top_idx = self.top_idx.as_slice();
-        let workspace = || {
-            (
-                vec![T::zero(); self.n_top],
-                vec![T::zero(); max_size],
-                vec![T::zero(); max_size],
-            )
-        };
         #[cfg(feature = "diagnostic")]
         solve_profile::PER_NODE.store(false, core::sync::atomic::Ordering::Relaxed);
 
@@ -454,40 +576,59 @@ impl SolvePlan {
         let pending: Vec<Vec<T>> = self
             .tasks
             .par_iter()
-            .map_init(workspace, |(buf, work, work2), nodes| {
-                let mut view = TaskRhs {
-                    rhs: shared,
-                    buf,
-                    top_idx,
-                };
-                for &s in nodes {
-                    forward_solve_supernode(&factors[s], &mut view, work, work2, Par::Seq);
-                }
-                let root = nodes[nodes.len() - 1];
-                let out = factors[root]
-                    .row_indices()
-                    .iter()
-                    .map(|&i| {
-                        let k = top_idx[i];
-                        debug_assert_ne!(k, NOT_TOP, "task root row inside a subtree");
-                        core::mem::replace(&mut buf[k as usize], T::zero())
-                    })
-                    .collect();
-                debug_assert!(
-                    buf.iter().all(|&x| x == T::zero()),
-                    "forward update outside the task root's rows"
-                );
-                out
-            })
+            .map_init(
+                || {
+                    (
+                        vec![T::zero(); n_top * k],
+                        vec![T::zero(); max_size * k],
+                        vec![T::zero(); max_size * k],
+                    )
+                },
+                |(buf, w1, w2), nodes| {
+                    let mut view = RhsView {
+                        rhs: shared,
+                        buf: &mut buf[..],
+                        top_idx,
+                        n_top,
+                        _borrow: core::marker::PhantomData,
+                    };
+                    for &s in nodes {
+                        forward_solve_supernode(&factors[s], &mut view, w1, w2, Par::Seq);
+                    }
+                    let rows = factors[nodes[nodes.len() - 1]].row_indices();
+                    let mut out = Vec::with_capacity(rows.len() * k);
+                    for j in 0..k {
+                        for &i in rows {
+                            let t = top_idx[i];
+                            debug_assert_ne!(t, NOT_TOP, "task root row inside a subtree");
+                            let slot = &mut buf[t as usize + j * n_top];
+                            out.push(core::mem::replace(slot, T::zero()));
+                        }
+                    }
+                    debug_assert!(
+                        buf.iter().all(|&x| x == T::zero()),
+                        "forward update outside the task root's rows"
+                    );
+                    out
+                },
+            )
             .collect();
         toc!(t, 14, 0);
 
         // 2. Apply the buffered updates.
         let t = tic!();
         for (nodes, vals) in self.tasks.iter().zip(&pending) {
-            let root = nodes[nodes.len() - 1];
-            for (&i, &v) in factors[root].row_indices().iter().zip(vals) {
-                rhs[i] -= v;
+            let rows = factors[nodes[nodes.len() - 1]].row_indices();
+            for j in 0..k {
+                let col = rhs
+                    .as_mut()
+                    .col_mut(j)
+                    .try_as_col_major_mut()
+                    .expect("row stride 1");
+                let col = col.as_slice_mut();
+                for (&i, &v) in rows.iter().zip(&vals[j * rows.len()..]) {
+                    col[i] -= v;
+                }
             }
         }
         drop(pending);
@@ -496,33 +637,33 @@ impl SolvePlan {
         solve_profile::PER_NODE.store(true, core::sync::atomic::Ordering::Relaxed);
 
         // 3. Top part, front by front.
-        let mut work = vec![T::zero(); max_size];
-        let mut work2 = vec![T::zero(); max_size];
-        for &s in &self.top {
-            forward_solve_supernode(&factors[s], rhs, &mut work, &mut work2, par);
-        }
-        for &s in self.top.iter().rev() {
-            diag_backward_solve_supernode(&factors[s], rhs, &mut work, &mut work2, par);
+        {
+            let mut view = RhsView::exclusive(rhs.as_mut());
+            for &s in &self.top {
+                forward_solve_supernode(&factors[s], &mut view, work, work2, par);
+            }
+            for &s in self.top.iter().rev() {
+                diag_backward_solve_supernode(&factors[s], &mut view, work, work2, par);
+            }
         }
 
         // 4. Diagonal + backward solve in the subtrees.
         #[cfg(feature = "diagnostic")]
         solve_profile::PER_NODE.store(false, core::sync::atomic::Ordering::Relaxed);
-        let shared = SharedRhs {
-            ptr: rhs.as_mut_ptr(),
-            len: rhs.len(),
-        };
+        let shared = SharedRhs::new(rhs.as_mut());
         let t = tic!();
         self.tasks.par_iter().for_each_init(
-            || (vec![T::zero(); max_size], vec![T::zero(); max_size]),
-            |(work, work2), nodes| {
-                let mut view = TaskRhs {
+            || (vec![T::zero(); max_size * k], vec![T::zero(); max_size * k]),
+            |(w1, w2), nodes| {
+                let mut view = RhsView {
                     rhs: shared,
                     buf: &mut [],
                     top_idx,
+                    n_top,
+                    _borrow: core::marker::PhantomData,
                 };
                 for &s in nodes.iter().rev() {
-                    diag_backward_solve_supernode(&factors[s], &mut view, work, work2, Par::Seq);
+                    diag_backward_solve_supernode(&factors[s], &mut view, w1, w2, Par::Seq);
                 }
             },
         );
@@ -538,15 +679,15 @@ impl SolvePlan {
 /// Size is determined by `max_front_size` from factorization stats.
 pub fn aptp_solve_scratch<T: Scalar>(numeric: &AptpNumeric<T>, rhs_ncols: usize) -> StackReq {
     let max_size = numeric.stats().max_front_size;
-    temp_mat_scratch::<T>(max_size, rhs_ncols)
+    temp_mat_scratch::<T>(max_size, rhs_ncols.min(SOLVE_RHS_BLOCK))
 }
 
-/// Forward solve for a single supernode.
+/// Forward solve for a single supernode, for all `k` right-hand sides.
 ///
-/// 1. Gather rhs[col_indices[i]] → work buffer
-/// 2. Solve L11 * y = work (unit lower triangular, in-place)
-/// 3. Write work → rhs[col_indices[i]]
-/// 4. Scatter: rhs[row_indices[j]] -= (L21 * work)[j]
+/// 1. Gather rhs[col_indices[i], :] → work (ne × k)
+/// 2. Solve L11 * Y = work (unit lower triangular, in-place)
+/// 3. Write work → rhs[col_indices[i], :]
+/// 4. Scatter: rhs[row_indices[i], :] -= (L21 * work)[i, :]
 pub(crate) fn forward_solve_supernode<T: Scalar, R: SolveRhs<T> + ?Sized>(
     ff: &FrontFactors<T>,
     rhs: &mut R,
@@ -562,6 +703,7 @@ pub(crate) fn forward_solve_supernode<T: Scalar, R: SolveRhs<T> + ?Sized>(
     let col_indices = ff.col_indices();
     let row_indices = ff.row_indices();
     let r = row_indices.len();
+    let k = rhs.ncols();
 
     // Apply intra-node threshold: small fronts use Par::Seq
     let big = ne + r >= INTRA_NODE_THRESHOLD;
@@ -575,35 +717,40 @@ pub(crate) fn forward_solve_supernode<T: Scalar, R: SolveRhs<T> + ?Sized>(
         solve_profile::BIG_FRONTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 
-    // Gather: work[i] = rhs[col_indices[i]]
+    let work = &mut work[..ne * k];
+
+    // Gather: work[i, j] = rhs[col_indices[i], j]
     let t = if big { tic_node!() } else { None };
-    for i in 0..ne {
-        work[i] = rhs.get(col_indices[i]);
+    for (j, w) in work.chunks_exact_mut(ne).enumerate() {
+        for (wi, &c) in w.iter_mut().zip(col_indices) {
+            *wi = rhs.get(c, j);
+        }
     }
     toc!(t, 2, 0);
 
-    // Solve L11 * y = work (unit lower triangular, in-place)
+    // Solve L11 * Y = work (unit lower triangular, in-place)
     let t = if big { tic_node!() } else { None };
     if ne > 1 {
-        let local = MatMut::from_column_major_slice_mut(&mut work[..ne], ne, 1);
+        let local = MatMut::from_column_major_slice_mut(work, ne, k);
         ff.l11().solve_in_place(local, effective_par);
     }
     toc!(t, 3, l11_bytes);
 
-    // Write back: rhs[col_indices[i]] = work[i]
+    // Write back: rhs[col_indices[i], j] = work[i, j]
     let t = if big { tic_node!() } else { None };
-    for i in 0..ne {
-        rhs.set(col_indices[i], work[i]);
+    for (j, w) in work.chunks_exact(ne).enumerate() {
+        for (&wi, &c) in w.iter().zip(col_indices) {
+            rhs.set(c, j, wi);
+        }
     }
     toc!(t, 2, 0);
 
-    // Scatter: rhs[row_indices[j]] -= (L21 * work[..ne])[j]
+    // Scatter: rhs[row_indices[i], j] -= (L21 * work)[i, j]
     if r > 0 {
         let t = if big { tic_node!() } else { None };
-        let local = MatRef::from_column_major_slice(&work[..ne], ne, 1);
-        let tmp = &mut work2[..r];
-        tmp.fill(T::zero());
-        let mut tmp_mat = MatMut::from_column_major_slice_mut(tmp, r, 1);
+        let local = MatRef::from_column_major_slice(work, ne, k);
+        let tmp = &mut work2[..r * k];
+        let mut tmp_mat = MatMut::from_column_major_slice_mut(tmp, r, k);
         matmul_with_conj(
             tmp_mat.as_mut(),
             Accum::Replace,
@@ -616,8 +763,10 @@ pub(crate) fn forward_solve_supernode<T: Scalar, R: SolveRhs<T> + ?Sized>(
         );
         toc!(t, 4, l21_bytes);
         let t = if big { tic_node!() } else { None };
-        for j in 0..r {
-            rhs.sub(row_indices[j], tmp[j]);
+        for (j, u) in tmp.chunks_exact(r).enumerate() {
+            for (&ui, &row) in u.iter().zip(row_indices) {
+                rhs.sub(row, j, ui);
+            }
         }
         toc!(t, 5, 0);
     }
@@ -674,9 +823,10 @@ pub(crate) fn backward_solve_supernode<T: Scalar>(
     backward_impl(ff, rhs, work, work2, par, false);
 }
 
-/// Diagonal then backward solve for a single supernode: as
-/// [`backward_solve_supernode`], with `D11⁻¹` applied to the gathered
-/// entries first (the same as [`diagonal_solve_supernode`] beforehand).
+/// Diagonal then backward solve for a single supernode, for all `k`
+/// right-hand sides: as [`backward_solve_supernode`], with `D11⁻¹` applied
+/// to the gathered entries first (the same as [`diagonal_solve_supernode`]
+/// beforehand).
 pub(crate) fn diag_backward_solve_supernode<T: Scalar, R: SolveRhs<T> + ?Sized>(
     ff: &FrontFactors<T>,
     rhs: &mut R,
@@ -703,6 +853,7 @@ fn backward_impl<T: Scalar, R: SolveRhs<T> + ?Sized>(
     let col_indices = ff.col_indices();
     let row_indices = ff.row_indices();
     let r = row_indices.len();
+    let k = rhs.ncols();
 
     // Apply intra-node threshold: small fronts use Par::Seq
     let big = ne + r >= INTRA_NODE_THRESHOLD;
@@ -711,25 +862,32 @@ fn backward_impl<T: Scalar, R: SolveRhs<T> + ?Sized>(
     let (l11_bytes, l21_bytes) = (ne * (ne + 1) / 2 * sz, ne * r * sz);
     let t_small = if big { None } else { tic_node!() };
 
-    // Gather local: work[i] = rhs[col_indices[i]]
+    let work = &mut work[..ne * k];
+
+    // Gather local: work[i, j] = rhs[col_indices[i], j], then D⁻¹
     let t = if big { tic_node!() } else { None };
-    for i in 0..ne {
-        work[i] = rhs.get(col_indices[i]);
-    }
-    if with_diag {
-        ff.d11().solve_in_place(&mut work[..ne]);
+    for (j, w) in work.chunks_exact_mut(ne).enumerate() {
+        for (wi, &c) in w.iter_mut().zip(col_indices) {
+            *wi = rhs.get(c, j);
+        }
+        if with_diag {
+            ff.d11().solve_in_place(w);
+        }
     }
 
     // Gather-update from L21^T
     if r > 0 {
-        // Gather row values into work2
-        for j in 0..r {
-            work2[j] = rhs.get(row_indices[j]);
+        // Gather row values into work2 (r × k)
+        let tmp = &mut work2[..r * k];
+        for (j, u) in tmp.chunks_exact_mut(r).enumerate() {
+            for (ui, &row) in u.iter_mut().zip(row_indices) {
+                *ui = rhs.get(row, j);
+            }
         }
         toc!(t, 8, 0);
         let t = if big { tic_node!() } else { None };
-        let tmp = MatRef::from_column_major_slice(&work2[..r], r, 1);
-        let mut local = MatMut::from_column_major_slice_mut(&mut work[..ne], ne, 1);
+        let tmp = MatRef::from_column_major_slice(tmp, r, k);
+        let mut local = MatMut::from_column_major_slice_mut(&mut *work, ne, k);
 
         // work -= L21^T * work2
         matmul_with_conj(
@@ -747,22 +905,25 @@ fn backward_impl<T: Scalar, R: SolveRhs<T> + ?Sized>(
         toc!(t, 8, 0);
     }
 
-    // Solve L11^T * z = work (unit upper triangular via transpose)
+    // Solve L11^T * Z = work (unit upper triangular via transpose)
     let t = if big { tic_node!() } else { None };
     if ne > 1 {
-        let local = MatMut::from_column_major_slice_mut(&mut work[..ne], ne, 1);
+        let local = MatMut::from_column_major_slice_mut(&mut *work, ne, k);
         ff.l11().solve_transpose_in_place(local, effective_par);
     }
     toc!(t, 10, l11_bytes);
 
     // Write back
     let t = if big { tic_node!() } else { None };
-    for i in 0..ne {
-        rhs.set(col_indices[i], work[i]);
+    for (j, w) in work.chunks_exact(ne).enumerate() {
+        for (&wi, &c) in w.iter().zip(col_indices) {
+            rhs.set(c, j, wi);
+        }
     }
     toc!(t, 11, 0);
     toc!(t_small, 7, l11_bytes + l21_bytes);
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,5 +1359,73 @@ mod tests {
             diag_backward_solve_supernode(ff, &mut x2, &mut w1, &mut w2, Par::Seq);
         }
         assert_eq!(x1, x2);
+    }
+
+    /// Solving k columns at once gives the same result as solving each
+    /// column alone, for block sizes around `SOLVE_RHS_BLOCK`, sequential
+    /// and threaded, and for a row-strided right-hand side.
+    #[test]
+    fn multi_rhs_matches_column_by_column() {
+        let (n, lower) = grid_kkt_lower(10, 0.4, 60);
+        let a = sparse_from_lower(n, &lower);
+        let (symbolic, numeric) = factor_amd(&a);
+        let mut mem = MemBuffer::new(aptp_solve_scratch(&numeric, SOLVE_RHS_BLOCK));
+
+        for k in [1, 3, SOLVE_RHS_BLOCK, SOLVE_RHS_BLOCK + 7] {
+            let b = faer::Mat::<f64>::from_fn(n, k, |i, j| {
+                ((i * 31 + j * 17) % 97) as f64 / 48.0 - 1.0
+            });
+            for par in [Par::Seq, Par::rayon(4)] {
+                let mut x = b.clone();
+                aptp_solve_mat(
+                    &symbolic,
+                    &numeric,
+                    x.as_mut(),
+                    MemStack::new(&mut mem),
+                    par,
+                )
+                .expect("solve");
+                for j in 0..k {
+                    let bj: Vec<f64> = (0..n).map(|i| b[(i, j)]).collect();
+                    let xj = solve_with(&symbolic, &numeric, &bj, par);
+                    let scale = xj.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+                    for i in 0..n {
+                        let d = (x[(i, j)] - xj[i]).abs();
+                        assert!(
+                            d <= 1e-11 * scale,
+                            "k={k} {par:?} col {j} row {i}: diff {d:e}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Row-strided input (a transposed view) goes through a copy.
+        let k = 5;
+        let bt =
+            faer::Mat::<f64>::from_fn(k, n, |j, i| ((i * 13 + j * 7) % 89) as f64 / 44.0 - 1.0);
+        let mut xt = bt.clone();
+        aptp_solve_mat(
+            &symbolic,
+            &numeric,
+            xt.as_mut().transpose_mut(),
+            MemStack::new(&mut mem),
+            Par::rayon(3),
+        )
+        .expect("solve");
+        let mut x = bt.transpose().to_owned();
+        aptp_solve_mat(
+            &symbolic,
+            &numeric,
+            x.as_mut(),
+            MemStack::new(&mut mem),
+            Par::Seq,
+        )
+        .expect("solve");
+        for j in 0..k {
+            for i in 0..n {
+                assert!((xt[(j, i)] - x[(i, j)]).abs() <= 1e-11 * (1.0 + x[(i, j)].abs()));
+            }
+        }
     }
 }

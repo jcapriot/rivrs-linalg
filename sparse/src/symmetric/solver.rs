@@ -13,17 +13,17 @@
 // SPRAL Equivalent: `ssids_akeep` (symbolic) + `ssids_fkeep` (numeric)
 // and the `ssids_analyse`, `ssids_factor`, `ssids_solve` subroutines.
 
-use faer::Col;
 use faer::Par;
 use faer::dyn_stack::{MemBuffer, MemStack, StackReq};
 use faer::perm::Perm;
 use faer::sparse::linalg::cholesky::SymmetricOrdering;
 use faer::sparse::{SparseColMat, SymbolicSparseColMatRef};
+use faer::{Col, Mat, MatMut, MatRef};
 
 use super::factor::{AptpFallback, AptpOptions};
 use super::inertia::Inertia;
 use super::numeric::{AptpNumeric, FactorizationStats};
-use super::solve::{aptp_solve, aptp_solve_scratch};
+use super::solve::{aptp_solve_mat, aptp_solve_scratch};
 use super::symbolic::AptpSymbolic;
 use crate::error::SparseError;
 use crate::ordering::{match_order_metis, metis_ordering};
@@ -414,6 +414,70 @@ impl<T: Scalar> SparseLDLT<T> {
         stack: &mut MemStack,
         par: Par,
     ) -> Result<(), SparseError> {
+        self.solve_in_place_mat(rhs.as_mat_mut(), stack, par)
+    }
+
+    /// Solve AX = B for several right-hand sides (allocating).
+    ///
+    /// `rhs` is `n × k`, one right-hand side per column; returns X. The
+    /// columns are solved together, so each pass over the factor serves up
+    /// to 64 of them at once, which is much faster than solving them one at
+    /// a time.
+    ///
+    /// # Errors
+    ///
+    /// - `SparseError::SolveBeforeFactor` if `factor()` has not been called
+    /// - `SparseError::DimensionMismatch` if `rhs.nrows()` != matrix dimension
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use faer::dyn_stack::{MemBuffer, MemStack};
+    /// use faer::sparse::{SparseColMat, Triplet};
+    /// use faer::{Mat, Par};
+    /// use rivrs_sparse::symmetric::{AnalyzeOptions, FactorOptions, SparseLDLT};
+    ///
+    /// let triplets = vec![
+    ///     Triplet::new(0, 0, 4.0f64),
+    ///     Triplet::new(0, 1, 1.0), Triplet::new(1, 0, 1.0),
+    ///     Triplet::new(1, 1, -3.0),
+    /// ];
+    /// let a = SparseColMat::try_new_from_triplets(2, 2, &triplets).unwrap();
+    /// let mut solver = SparseLDLT::analyze_with_matrix(&a, &AnalyzeOptions::default()).unwrap();
+    /// solver.factor(&a, &FactorOptions::default()).unwrap();
+    ///
+    /// // Two right-hand sides: A * [1, 1]^T and A * [1, -1]^T.
+    /// let b = Mat::from_fn(2, 2, |i, j| [[5.0f64, 3.0], [-2.0, 4.0]][i][j]);
+    /// let mut mem = MemBuffer::new(solver.solve_scratch(b.ncols()));
+    /// let x = solver.solve_mat(b.as_ref(), MemStack::new(&mut mem), Par::Seq).unwrap();
+    /// assert!((x[(0, 0)] - 1.0f64).abs() < 1e-12 && (x[(1, 1)] + 1.0f64).abs() < 1e-12);
+    /// ```
+    pub fn solve_mat(
+        &self,
+        rhs: MatRef<'_, T>,
+        stack: &mut MemStack,
+        par: Par,
+    ) -> Result<Mat<T>, SparseError> {
+        let mut result = rhs.to_owned();
+        self.solve_in_place_mat(result.as_mut(), stack, par)?;
+        Ok(result)
+    }
+
+    /// Solve AX = B for several right-hand sides (in-place).
+    ///
+    /// `rhs` is `n × k`, one right-hand side per column, and is overwritten
+    /// with X. See [`solve_mat`](Self::solve_mat).
+    ///
+    /// # Errors
+    ///
+    /// - `SparseError::SolveBeforeFactor` if `factor()` has not been called
+    /// - `SparseError::DimensionMismatch` if `rhs.nrows()` != matrix dimension
+    pub fn solve_in_place_mat(
+        &self,
+        mut rhs: MatMut<'_, T>,
+        stack: &mut MemStack,
+        par: Par,
+    ) -> Result<(), SparseError> {
         let numeric = self
             .numeric
             .as_ref()
@@ -422,51 +486,60 @@ impl<T: Scalar> SparseLDLT<T> {
             })?;
 
         let n = self.symbolic.nrows();
+        let k = rhs.ncols();
         if rhs.nrows() != n {
             return Err(SparseError::DimensionMismatch {
-                expected: (n, 1),
-                got: (rhs.nrows(), 1),
-                context: "RHS length must match matrix dimension".to_string(),
+                expected: (n, k),
+                got: (rhs.nrows(), k),
+                context: "RHS rows must match matrix dimension".to_string(),
             });
         }
 
-        if n == 0 {
+        if n == 0 || k == 0 {
             return Ok(());
         }
 
         let perm_fwd = &self.perm_fwd;
+        let scaling = self.scaling.as_deref();
         let t_in = super::solve::tic!();
 
-        // 1. Permute: rhs_perm[new] = rhs[perm_fwd[new]]
-        //    perm_fwd[new] = old, so this gathers original RHS into permuted order.
-        let mut rhs_perm = vec![T::zero(); n];
-        for new in 0..n {
-            rhs_perm[new] = rhs[perm_fwd[new]];
-        }
-
-        // 2. Scale (if scaling present): rhs_perm[i] *= scaling[i]
-        if let Some(ref scaling) = self.scaling {
-            for i in 0..n {
-                rhs_perm[i] *= T::from_f64(scaling[i]);
+        // 1-2. Permute and scale: rhs_perm[new, j] = s[new] * rhs[perm_fwd[new], j]
+        //      (perm_fwd[new] = old, so this gathers the RHS into permuted order).
+        let mut rhs_perm = Mat::<T>::zeros(n, k);
+        for j in 0..k {
+            let src = rhs.as_ref().col(j);
+            let dst = rhs_perm
+                .col_mut(j)
+                .try_as_col_major_mut()
+                .expect("contiguous");
+            let dst = dst.as_slice_mut();
+            for (new, d) in dst.iter_mut().enumerate() {
+                let v = src[perm_fwd[new]];
+                *d = match scaling {
+                    Some(s) => v * T::from_f64(s[new]),
+                    None => v,
+                };
             }
         }
 
         super::solve::toc!(t_in, 0, 0);
 
-        // 3. Core solve: aptp_solve(symbolic, numeric, &mut rhs_perm, stack, par)
-        aptp_solve(&self.symbolic, numeric, &mut rhs_perm, stack, par)?;
+        // 3. Core solve in permuted, scaled coordinates.
+        aptp_solve_mat(&self.symbolic, numeric, rhs_perm.as_mut(), stack, par)?;
         let t_out = super::solve::tic!();
 
-        // 4. Unscale: rhs_perm[i] *= scaling[i] (symmetric: same T applied)
-        if let Some(ref scaling) = self.scaling {
-            for i in 0..n {
-                rhs_perm[i] *= T::from_f64(scaling[i]);
+        // 4-5. Unscale (symmetric: same scaling applied) and unpermute:
+        //      rhs[perm_fwd[new], j] = s[new] * rhs_perm[new, j]
+        for j in 0..k {
+            let src = rhs_perm.col(j).try_as_col_major().expect("contiguous");
+            let src = src.as_slice();
+            let mut dst = rhs.as_mut().col_mut(j);
+            for (new, &v) in src.iter().enumerate() {
+                dst[perm_fwd[new]] = match scaling {
+                    Some(s) => v * T::from_f64(s[new]),
+                    None => v,
+                };
             }
-        }
-
-        // 5. Unpermute: rhs[perm_fwd[new]] = rhs_perm[new]
-        for new in 0..n {
-            rhs[perm_fwd[new]] = rhs_perm[new];
         }
         super::solve::toc!(t_out, 12, 0);
 
