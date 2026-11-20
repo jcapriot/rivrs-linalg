@@ -45,7 +45,8 @@ use super::diagonal::{MixedDiagonal, PivotEntry};
 use super::factor::{
     AptpFactorResult, AptpOptions, advise_huge_pages, aptp_factor_in_place,
     compute_contribution_gemm_in_place, compute_contribution_gemm_rect, extract_contribution_rect,
-    extract_front_factors_rect, tpp_factor_rect, unpivoted_factor_in_place, zeros_padded,
+    extract_front_factors_rect, padded_rows, tpp_factor_rect, unpivoted_factor_in_place,
+    zeros_padded,
 };
 use super::pivot::{Block2x2, PivotType};
 use super::symbolic::AptpSymbolic;
@@ -509,7 +510,7 @@ pub(crate) struct ContributionBlock<T: Scalar = f64> {
 /// Fill packed columns `j0..j1` (whose storage is exactly `data`) of an
 /// `n × n` [`PackedLower`], splitting columns across threads.
 fn fill_packed_cols<'a, T: Scalar + 'a>(
-    data: &mut [T],
+    data: &mut [core::mem::MaybeUninit<T>],
     n: usize,
     j0: usize,
     j1: usize,
@@ -529,9 +530,95 @@ fn fill_packed_cols<'a, T: Scalar + 'a>(
     let mut pos = 0;
     for j in j0..j1 {
         let c = col(j);
-        debug_assert_eq!(c.len(), n - j, "PackedLower column {j} has wrong length");
-        data[pos..pos + c.len()].copy_from_slice(c);
+        assert_eq!(c.len(), n - j, "PackedLower column {j} has wrong length");
+        write_slice(&mut data[pos..pos + c.len()], c);
         pos += c.len();
+    }
+    assert_eq!(pos, data.len(), "packed columns do not fill their storage");
+}
+
+/// Initialize `dst` with a copy of `src` (equal lengths).
+#[inline]
+pub(crate) fn write_slice<T: Copy>(dst: &mut [core::mem::MaybeUninit<T>], src: &[T]) {
+    assert_eq!(dst.len(), src.len());
+    // SAFETY: lengths match, `MaybeUninit<T>` has the layout of `T`, and a
+    // shared and a unique borrow cannot overlap.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<T>(), src.len());
+    }
+}
+
+/// Initialize every entry of `dst` with `v`.
+#[inline]
+pub(crate) fn write_fill<T: Copy>(dst: &mut [core::mem::MaybeUninit<T>], v: T) {
+    for x in dst {
+        x.write(v);
+    }
+}
+
+/// Raw column base pointer shared by the threads of [`fill_cols_uninit`];
+/// each thread writes only its own columns.
+#[derive(Clone, Copy)]
+struct ColsPtr<T>(*mut T);
+// SAFETY: only used to hand disjoint columns to different threads.
+unsafe impl<T: Send> Send for ColsPtr<T> {}
+unsafe impl<T: Send> Sync for ColsPtr<T> {}
+
+/// Matrix with the padded stride of [`zeros_padded`] whose entries are each
+/// written once: `fill(j, col)` must initialize all `nrows` entries of column
+/// `j`. Large matrices fill their columns in parallel.
+///
+/// Building a factor or contribution block as `zeros_padded` followed by a
+/// copy writes every entry twice; this writes it once, which matters for the
+/// multi-GB, memory-bound extraction out of large fronts.
+pub(crate) fn filled_padded<T: Scalar>(
+    nrows: usize,
+    ncols: usize,
+    par: Par,
+    fill: &(impl Fn(usize, &mut [core::mem::MaybeUninit<T>]) + Sync),
+) -> Mat<T> {
+    if nrows == 0 || ncols == 0 {
+        return Mat::<T>::zeros(nrows, ncols);
+    }
+    let mut mat = Mat::<T>::with_capacity(padded_rows::<T>(nrows), ncols);
+    let stride = mat.col_stride() as usize;
+    assert!(stride >= nrows);
+    let base = mat.as_ptr_mut();
+    advise_huge_pages(base.cast(), stride * ncols * core::mem::size_of::<T>());
+    fill_cols_uninit(ColsPtr(base), stride, nrows, 0, ncols, par, fill);
+    // SAFETY: the capacity covers `nrows × ncols` at this stride, and
+    // fill_cols_uninit had `fill` initialize every entry of every column.
+    unsafe { mat.set_dims(nrows, ncols) };
+    mat
+}
+
+fn fill_cols_uninit<T: Scalar>(
+    base: ColsPtr<T>,
+    stride: usize,
+    nrows: usize,
+    j0: usize,
+    j1: usize,
+    par: Par,
+    fill: &(impl Fn(usize, &mut [core::mem::MaybeUninit<T>]) + Sync),
+) {
+    if copy_par_split(par, j1 - j0, nrows * (j1 - j0)) {
+        let mid = (j0 + j1) / 2;
+        rayon::join(
+            || fill_cols_uninit(base, stride, nrows, j0, mid, par, fill),
+            || fill_cols_uninit(base, stride, nrows, mid, j1, par, fill),
+        );
+        return;
+    }
+    for j in j0..j1 {
+        // SAFETY: column j is `nrows` entries at offset `j * stride` inside
+        // the allocation, and columns j0..j1 belong to this call alone.
+        let col = unsafe {
+            core::slice::from_raw_parts_mut(
+                base.0.add(j * stride).cast::<core::mem::MaybeUninit<T>>(),
+                nrows,
+            )
+        };
+        fill(j, col);
     }
 }
 
@@ -635,10 +722,10 @@ impl<T: Scalar> BlockedUnitLower<T> {
         let build = |b: usize| {
             let base = b * nb;
             let w = nb.min(ne - base);
-            let mut panel = zeros_padded::<T>(ne - base, w);
-            for jj in 0..w {
+            // Column jj of the panel: zeros above the diagonal, the unit
+            // diagonal, then the L entries (from `start`), each written once.
+            filled_padded(ne - base, w, Par::Seq, &|jj, col| {
                 let j = base + jj;
-                panel[(jj, jj)] = T::one();
                 let start = match d.pivot_type(j) {
                     PivotType::TwoByTwo { partner } if partner > j => j + 2,
                     PivotType::Delayed => {
@@ -646,12 +733,13 @@ impl<T: Scalar> BlockedUnitLower<T> {
                     }
                     _ => j + 1,
                 };
-                if start < ne {
-                    panel.col_as_slice_mut(jj)[start - base..]
-                        .copy_from_slice(&src.col_as_slice(j)[start..ne]);
-                }
-            }
-            panel
+                let (above, rest) = col.split_at_mut(jj);
+                write_fill(above, T::zero());
+                rest[0].write(T::one());
+                let (gap, below) = rest[1..].split_at_mut(start - j - 1);
+                write_fill(gap, T::zero());
+                write_slice(below, &src.col_as_slice(j)[start..ne]);
+            })
         };
         // Panels are independent; build them in parallel for large L11.
         let panels: Vec<Mat<T>> = if copy_par_split(par, ne, ne * ne / 2) {
@@ -799,14 +887,15 @@ impl<T: Scalar> PackedLower<T> {
         if !copy_par_split(par, n, total) {
             return Self::from_columns(n, col);
         }
-        use rayon::iter::ParallelExtend;
         let mut data = Vec::<T>::with_capacity(total);
         advise_huge_pages(
             data.as_ptr().cast(),
             data.capacity() * core::mem::size_of::<T>(),
         );
-        data.par_extend(rayon::iter::repeat_n(T::zero(), total));
-        fill_packed_cols(&mut data, n, 0, n, col, par);
+        fill_packed_cols(&mut data.spare_capacity_mut()[..total], n, 0, n, col, par);
+        // SAFETY: fill_packed_cols wrote all `total` entries (the packed
+        // columns 0..n tile exactly 0..total).
+        unsafe { data.set_len(total) };
         Self { n, data }
     }
 
@@ -3329,15 +3418,9 @@ pub(crate) fn extract_front_factors<T: Scalar>(
     // NOTE: extract_contribution also includes delayed rows (see lines below).
     // These two functions MUST be consistent in their row treatment.
     let r = m - ne;
-    let l21 = if ne > 0 && r > 0 {
-        let mut l = zeros_padded::<T>(r, ne);
-        for_each_col_mut(l.as_mut(), 0, par, &|j, dst: &mut [T]| {
-            dst.copy_from_slice(&frontal_data.col_as_slice(j)[ne..m]);
-        });
-        l
-    } else {
-        Mat::<T>::zeros(r, ne)
-    };
+    let l21 = filled_padded(r, ne, par, &|j, dst| {
+        write_slice(dst, &frontal_data.col_as_slice(j)[ne..m]);
+    });
 
     // Local permutation (maps factored position to original front-local column)
     let local_perm = result.perm[..k].to_vec();
@@ -3487,6 +3570,41 @@ mod tests {
         let mut y = b.clone();
         l.solve_transpose_in_place(y.as_mut(), Par::Seq);
         assert!((expected.transpose() * &y - &b).norm_max() < 1e-10);
+    }
+
+    #[test]
+    fn filled_padded_writes_every_entry() {
+        // Large enough to split across threads (>= 64 columns, >= 2^19 entries),
+        // with a row count whose stride would land on a page multiple.
+        let (nrows, ncols) = (8192, 80);
+        let f = |i: usize, j: usize| (i * 3 + j * 1000) as f64;
+        for par in [Par::Seq, Par::rayon(4)] {
+            let m = filled_padded::<f64>(nrows, ncols, par, &|j, col| {
+                for (i, x) in col.iter_mut().enumerate() {
+                    x.write(f(i, j));
+                }
+            });
+            assert_eq!((m.nrows(), m.ncols()), (nrows, ncols));
+            assert_eq!(m.col_stride() as usize, padded_rows::<f64>(nrows));
+            assert!(!(m.col_stride() as usize * 8).is_multiple_of(4096));
+            for j in 0..ncols {
+                for i in 0..nrows {
+                    assert_eq!(m[(i, j)], f(i, j));
+                }
+            }
+        }
+        assert_eq!(filled_padded::<f64>(0, 5, Par::Seq, &|_, _| {}).ncols(), 5);
+        assert_eq!(filled_padded::<f64>(5, 0, Par::Seq, &|_, _| {}).nrows(), 5);
+    }
+
+    #[test]
+    fn packed_lower_par_matches_seq() {
+        let n = 1500; // ~1.1M packed entries: splits across threads
+        let dense = Mat::<f64>::from_fn(n, n, |i, j| (i * n + j) as f64);
+        let col = |j: usize| &dense.col_as_slice(j)[j..n];
+        let seq = PackedLower::from_columns(n, col);
+        let par = PackedLower::from_columns_par(n, &col, Par::rayon(4));
+        assert_eq!(seq.data, par.data);
     }
     use crate::symmetric::factor::AptpOptions;
 

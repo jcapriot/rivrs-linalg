@@ -62,14 +62,8 @@ use crate::ordering::perm_from_forward;
 /// Only the stride differs from [`Mat::zeros`]: `nrows()`/`ncols()` are as
 /// requested and every column is a contiguous slice.
 pub(crate) fn zeros_padded<T: Scalar>(nrows: usize, ncols: usize) -> Mat<T> {
-    const PAGE: usize = 4096;
-    const LINE: usize = 64;
     let elem = core::mem::size_of::<T>().max(1);
-    let per_line = (LINE / elem).max(1);
-    let mut rows = nrows.next_multiple_of(per_line);
-    if rows > 0 && (rows * elem).is_multiple_of(PAGE) {
-        rows += per_line;
-    }
+    let rows = padded_rows::<T>(nrows);
     let mut mat = Mat::<T>::with_capacity(rows, ncols);
     // Advise before the first write, so the pages are faulted in as huge pages.
     let base = mat.as_ptr();
@@ -80,6 +74,21 @@ pub(crate) fn zeros_padded<T: Scalar>(nrows: usize, ncols: usize) -> Mat<T> {
         "resize_with reallocated"
     );
     mat
+}
+
+/// Row capacity used by [`zeros_padded`]: `nrows` rounded up to a whole cache
+/// line, plus one more line when the column stride in bytes would be a
+/// multiple of 4 KiB.
+pub(crate) fn padded_rows<T>(nrows: usize) -> usize {
+    const PAGE: usize = 4096;
+    const LINE: usize = 64;
+    let elem = core::mem::size_of::<T>().max(1);
+    let per_line = (LINE / elem).max(1);
+    let mut rows = nrows.next_multiple_of(per_line);
+    if rows > 0 && (rows * elem).is_multiple_of(PAGE) {
+        rows += per_line;
+    }
+    rows
 }
 
 /// Ask Linux to back a freshly allocated buffer with transparent huge pages.
@@ -3907,16 +3916,9 @@ pub(super) fn extract_front_factors_rect<T: Scalar>(
 
     // Extract L21 (r × ne) where r = m - ne
     let r = m - ne;
-    let l21 = if ne > 0 && r > 0 {
-        let mut l = Mat::<T>::zeros(r, ne);
-        for j in 0..ne {
-            let src = &l_storage.col_as_slice(j)[ne..m];
-            l.col_as_slice_mut(j)[..r].copy_from_slice(src);
-        }
-        l
-    } else {
-        Mat::<T>::zeros(r, ne)
-    };
+    let l21 = super::numeric::filled_padded(r, ne, Par::Seq, &|j, dst| {
+        super::numeric::write_slice(dst, &l_storage.col_as_slice(j)[ne..m]);
+    });
 
     // Local permutation and indices
     let local_perm = result.perm[..k].to_vec();
