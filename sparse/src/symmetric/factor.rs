@@ -1592,6 +1592,8 @@ fn update_trailing<T: Scalar>(
 
     // W = L21 * D11 for ALL trailing rows (the FS×FS region and the
     // rectangular region below both need it).
+    #[cfg(feature = "diagnostic")]
+    let t_ld = std::time::Instant::now();
     compute_ld_into(
         l21,
         d,
@@ -1599,9 +1601,13 @@ fn update_trailing<T: Scalar>(
         ld_buf.as_mut().submatrix_mut(0, 0, trailing_size, nelim),
         par,
     );
+    #[cfg(feature = "diagnostic")]
+    kernel_profile::add_big(14, t_ld, 0.0);
     let l21_fs = l21.subrows(0, fs_size);
 
     // Region 1 (FS×FS): Lower-triangular GEMM on A[ts..p, ts..p]
+    #[cfg(feature = "diagnostic")]
+    let t_g1 = std::time::Instant::now();
     {
         let w_fs = ld_buf.as_ref().submatrix(0, 0, fs_size, nelim);
         let a_fs = right
@@ -1621,9 +1627,13 @@ fn update_trailing<T: Scalar>(
             par,
         );
     }
+    #[cfg(feature = "diagnostic")]
+    kernel_profile::add_big(15, t_g1, (fs_size * fs_size * nelim) as f64);
 
     // Region 2 (rows below p × FS columns): Rectangular GEMM on A[p..m, ts..p]
     let nfs_size = m - p;
+    #[cfg(feature = "diagnostic")]
+    let t_g2 = std::time::Instant::now();
     if nfs_size > 0 {
         let w_nfs = ld_buf.as_ref().submatrix(fs_size, 0, nfs_size, nelim);
         let a_cross = right.submatrix_mut(p, 0, nfs_size, fs_size);
@@ -1638,6 +1648,8 @@ fn update_trailing<T: Scalar>(
             par,
         );
     }
+    #[cfg(feature = "diagnostic")]
+    kernel_profile::add_big(16, t_g2, (2 * nfs_size * fs_size * nelim) as f64);
 
     // Region 3 (NFS×NFS): SKIPPED — deferred to compute_contribution_gemm
 }
@@ -2374,7 +2386,7 @@ fn factor_inner<T: Scalar>(
 pub(crate) mod kernel_profile {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    pub(crate) const NAMES: [&str; 10] = [
+    pub(crate) const NAMES: [&str; 19] = [
         "backup",
         "factor diag block",
         "permute panel + rows",
@@ -2385,13 +2397,35 @@ pub(crate) mod kernel_profile {
         "deferred update (rank-nb)",
         "rows below tile (perm+TRSM+check)",
         "rollback (restore+update)",
+        "BIG tile factor_inner",
+        "BIG rows-below copy+perm",
+        "BIG rows-below TRSM",
+        "BIG rows-below scale+colmax",
+        "BIG trailing L*D",
+        "BIG trailing GEMM lower (FSxFS)",
+        "BIG trailing GEMM rect (NFSxFS)",
+        "BIG row-perm propagation",
+        "BIG two_level_factor total",
     ];
-    pub(crate) static NANOS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+    pub(crate) static NANOS: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
+    pub(crate) static FLOPS: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
     pub(crate) static CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Set while a large (m >= 4096) parallel front is in two_level_factor;
+    /// slots 10.. only accumulate then (phase B runs one front at a time).
+    pub(crate) static BIG: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     #[inline]
     pub(crate) fn add(i: usize, t: std::time::Instant) {
         NANOS[i].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn add_big(i: usize, t: std::time::Instant, flops: f64) {
+        if BIG.load(Relaxed) {
+            NANOS[i].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            FLOPS[i].fetch_add(flops as u64, Relaxed);
+        }
     }
 }
 
@@ -2399,12 +2433,22 @@ pub(crate) mod kernel_profile {
 /// `(step name, seconds)`, plus the number of inner blocks processed
 /// (feature `diagnostic`).
 #[cfg(feature = "diagnostic")]
-pub fn take_kernel_profile() -> (Vec<(&'static str, f64)>, u64) {
+pub fn take_kernel_profile() -> (Vec<(&'static str, f64, f64)>, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let steps = kernel_profile::NAMES
         .iter()
-        .zip(kernel_profile::NANOS.iter())
-        .map(|(n, a)| (*n, a.swap(0, Relaxed) as f64 * 1e-9))
+        .zip(
+            kernel_profile::NANOS
+                .iter()
+                .zip(kernel_profile::FLOPS.iter()),
+        )
+        .map(|(n, (a, f))| {
+            (
+                *n,
+                a.swap(0, Relaxed) as f64 * 1e-9,
+                f.swap(0, Relaxed) as f64,
+            )
+        })
         .collect();
     (steps, kernel_profile::CALLS.swap(0, Relaxed))
 }
@@ -2434,6 +2478,39 @@ fn copy_cols<T: Scalar>(dst: MatMut<'_, T>, src: MatRef<'_, T>, map: Option<&[us
     for j in 0..nc {
         let s = map.map_or(j, |m| m[j]);
         dst.rb_mut().col_mut(j).copy_from(src.col(s));
+    }
+}
+
+/// `perm[i] == i` for every position.
+fn is_identity(perm: &[usize]) -> bool {
+    perm.iter().enumerate().all(|(i, &p)| i == p)
+}
+
+/// Row permutation of the leading rows of every column:
+/// `a[i, c] = a_old[perm[i], c]` for `i < perm.len()`, splitting columns
+/// across threads for large blocks. Used to carry a tile's pivoting
+/// permutation into the already-factored columns left of the tile.
+fn permute_rows<T: Scalar>(a: MatMut<'_, T>, perm: &[usize], par: Par) {
+    let (nr, nc) = (a.nrows(), a.ncols());
+    if par.degree() > 1 && nc >= 64 && perm.len() * nc >= 1 << 16 {
+        let (left, right) = a.split_at_col_mut(nc / 2);
+        rayon::join(
+            || permute_rows(left, perm, par),
+            || permute_rows(right, perm, par),
+        );
+        return;
+    }
+    debug_assert!(perm.iter().all(|&p| p < nr));
+    let mut a = a;
+    let mut temp = vec![T::zero(); perm.len()];
+    for c in 0..nc {
+        let mut col = a.rb_mut().col_mut(c);
+        for (t, &p) in temp.iter_mut().zip(perm) {
+            *t = col[p];
+        }
+        for (i, &t) in temp.iter().enumerate() {
+            col[i] = t;
+        }
     }
 }
 
@@ -2661,6 +2738,20 @@ fn two_level_factor<T: Scalar>(
     let m = a.nrows();
     let nb = options.outer_block_size;
     let p = num_fully_summed;
+    #[cfg(feature = "diagnostic")]
+    let _big = {
+        struct Big(std::time::Instant);
+        impl Drop for Big {
+            fn drop(&mut self) {
+                kernel_profile::add_big(18, self.0, 0.0);
+                kernel_profile::BIG.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if m >= 4096 && options.par.degree() > 1 {
+            kernel_profile::BIG.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Big(std::time::Instant::now())
+    };
 
     let mut col_order: Vec<usize> = (0..m).collect();
     let mut global_d = MixedDiagonal::new(p);
@@ -2703,12 +2794,16 @@ fn two_level_factor<T: Scalar>(
         // The tile is at most nb x nb (256 x 256): too small for intra-tile
         // parallelism to pay off, so it runs sequentially. The rows below
         // and the deferred update carry the parallel work.
+        #[cfg(feature = "diagnostic")]
+        let t_tile = std::time::Instant::now();
         let mut block_result = {
             let tile_view = a
                 .rb_mut()
                 .submatrix_mut(col_start, col_start, block_cols, block_cols);
             factor_inner(tile_view, block_cols, &tile_options, kernel_ws)?
         };
+        #[cfg(feature = "diagnostic")]
+        kernel_profile::add_big(10, t_tile, (block_cols as f64).powi(3) / 3.0);
         let tile_nelim = block_result.num_eliminated;
         let mut block_nelim = tile_nelim;
 
@@ -2734,21 +2829,37 @@ fn two_level_factor<T: Scalar>(
             let mut saved = panel_backup
                 .as_mut()
                 .submatrix_mut(0, 0, rows_below, block_cols);
+            #[cfg(feature = "diagnostic")]
+            let t_cp = std::time::Instant::now();
             copy_cols(saved.rb_mut(), panel.rb(), None, options.par);
-            copy_cols(panel.rb_mut(), saved.rb(), Some(perm), options.par);
+            // Without pivoting inside the tile the permuted copy is the
+            // panel itself.
+            if !is_identity(perm) {
+                copy_cols(panel.rb_mut(), saved.rb(), Some(perm), options.par);
+            }
+            #[cfg(feature = "diagnostic")]
+            kernel_profile::add_big(11, t_cp, 0.0);
 
             if tile_nelim > 0 {
+                #[cfg(feature = "diagnostic")]
+                let t_trsm = std::time::Instant::now();
                 triangular_solve::solve_unit_lower_triangular_in_place(
                     tile.submatrix(0, 0, tile_nelim, tile_nelim),
                     panel.rb_mut().subcols_mut(0, tile_nelim).transpose_mut(),
                     options.par,
                 );
+                #[cfg(feature = "diagnostic")]
+                kernel_profile::add_big(12, t_trsm, (tile_nelim * tile_nelim * rows_below) as f64);
+                #[cfg(feature = "diagnostic")]
+                let t_sc = std::time::Instant::now();
                 let col_max = scale_rows_col_max(
                     panel.rb_mut().subcols_mut(0, tile_nelim),
                     &block_result.d,
                     tile_nelim,
                     options.par,
                 );
+                #[cfg(feature = "diagnostic")]
+                kernel_profile::add_big(13, t_sc, 0.0);
                 let bound = real::<T>(1.0) / real::<T>(options.threshold);
                 block_nelim = adjust_for_2x2_boundary(
                     first_failing_pivot(&col_max, &block_result.d, tile_nelim, bound),
@@ -2882,20 +2993,18 @@ fn two_level_factor<T: Scalar>(
         // are NOT rearranged by these swaps. We must apply the same row
         // permutation to those columns so that extract_l reads consistent
         // L entries across all blocks.
-        if col_start > 0 {
-            let block_perm = &block_result.perm;
-            let mut temp = vec![T::zero(); block_cols];
-            for c in 0..col_start {
-                // Gather: temp[i] = row that ended up at local position i
-                for i in 0..block_cols {
-                    temp[i] = a[(col_start + block_perm[i], c)];
-                }
-                // Scatter: write to sequential positions
-                for i in 0..block_cols {
-                    a[(col_start + i, c)] = temp[i];
-                }
-            }
+        #[cfg(feature = "diagnostic")]
+        let t_rp = std::time::Instant::now();
+        if col_start > 0 && !is_identity(&block_result.perm[..block_cols]) {
+            permute_rows(
+                a.rb_mut()
+                    .submatrix_mut(col_start, 0, m - col_start, col_start),
+                &block_result.perm[..block_cols],
+                options.par,
+            );
         }
+        #[cfg(feature = "diagnostic")]
+        kernel_profile::add_big(17, t_rp, 0.0);
 
         // Update col_order BEFORE delay swap: factor_inner may have permuted
         // columns within the block. We must capture the pre-swap col_order so
