@@ -1173,6 +1173,9 @@ pub struct AptpNumeric<T: Scalar = f64> {
     per_supernode_stats: Vec<PerSupernodeStats>,
     /// Matrix dimension.
     n: usize,
+    /// Parent of each supernode in the assembly tree (postorder, so
+    /// `parent[s] > s`), `None` for roots. Used by the tree-parallel solve.
+    sn_parent: Vec<Option<usize>>,
     /// Profiling session from factorization (Chrome Trace export).
     #[cfg(feature = "diagnostic")]
     profile_session: Option<FinishedSession>,
@@ -1228,6 +1231,11 @@ impl<T: Scalar> AptpNumeric<T> {
     /// Per-supernode factors, indexed by supernode ID.
     pub fn front_factors(&self) -> &[FrontFactors<T>] {
         &self.front_factors
+    }
+
+    /// Parent of each supernode in the assembly tree (`None` for roots).
+    pub(crate) fn supernode_parents(&self) -> &[Option<usize>] {
+        &self.sn_parent
     }
 
     /// Aggregate factorization statistics.
@@ -1459,11 +1467,14 @@ impl<T: Scalar> AptpNumeric<T> {
         #[cfg(feature = "diagnostic")]
         let finished_session = session.finish();
 
+        let sn_parent = supernodes.iter().map(|sn| sn.parent).collect();
+
         Ok(AptpNumeric {
             front_factors,
             stats,
             per_supernode_stats: per_sn_stats,
             n,
+            sn_parent,
             #[cfg(feature = "diagnostic")]
             profile_session: Some(finished_session),
         })

@@ -41,6 +41,8 @@ pub use factor::{
     AptpFactorResult, AptpFactorization, AptpFallback, AptpOptions, AptpPivotRecord,
     AptpStatistics, FailedPivotMethod, aptp_factor, aptp_factor_in_place,
 };
+#[cfg(feature = "diagnostic")]
+pub use solve::take_solve_profile;
 
 pub use numeric::{
     AptpNumeric, BlockedUnitLower, FactorStorage, FactorizationStats, FrontFactors,

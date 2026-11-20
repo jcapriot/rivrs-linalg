@@ -435,6 +435,7 @@ impl<T: Scalar> SparseLDLT<T> {
         }
 
         let perm_fwd = &self.perm_fwd;
+        let t_in = super::solve::tic!();
 
         // 1. Permute: rhs_perm[new] = rhs[perm_fwd[new]]
         //    perm_fwd[new] = old, so this gathers original RHS into permuted order.
@@ -450,8 +451,11 @@ impl<T: Scalar> SparseLDLT<T> {
             }
         }
 
+        super::solve::toc!(t_in, 0, 0);
+
         // 3. Core solve: aptp_solve(symbolic, numeric, &mut rhs_perm, stack, par)
         aptp_solve(&self.symbolic, numeric, &mut rhs_perm, stack, par)?;
+        let t_out = super::solve::tic!();
 
         // 4. Unscale: rhs_perm[i] *= scaling[i] (symmetric: same T applied)
         if let Some(ref scaling) = self.scaling {
@@ -464,6 +468,7 @@ impl<T: Scalar> SparseLDLT<T> {
         for new in 0..n {
             rhs[perm_fwd[new]] = rhs_perm[new];
         }
+        super::solve::toc!(t_out, 12, 0);
 
         Ok(())
     }
