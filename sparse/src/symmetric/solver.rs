@@ -218,17 +218,20 @@ pub struct SparseLDLT<T: Scalar = f64> {
     scaling: Option<Vec<f64>>,
     /// Cached forward permutation (perm_fwd[new] = old). Computed once during analyze.
     perm_fwd: Vec<usize>,
+    /// Cached inverse permutation (perm_inv[old] = new).
+    perm_inv: Vec<usize>,
 }
 
 impl<T: Scalar> SparseLDLT<T> {
     /// Build a `SparseLDLT` with cached permutation vectors from symbolic analysis.
     fn new_with_cached_perm(symbolic: AptpSymbolic, scaling: Option<Vec<f64>>) -> Self {
-        let (perm_fwd, _) = symbolic.perm_vecs();
+        let (perm_fwd, perm_inv) = symbolic.perm_vecs();
         SparseLDLT {
             symbolic,
             numeric: None,
             scaling,
             perm_fwd,
+            perm_inv,
         }
     }
 
@@ -458,8 +461,21 @@ impl<T: Scalar> SparseLDLT<T> {
         stack: &mut MemStack,
         par: Par,
     ) -> Result<Mat<T>, SparseError> {
-        let mut result = rhs.to_owned();
-        self.solve_in_place_mat(result.as_mut(), stack, par)?;
+        let numeric = self.numeric_for_solve(rhs.nrows(), rhs.ncols())?;
+        let (n, k) = (rhs.nrows(), rhs.ncols());
+        let mut result = Mat::<T>::zeros(n, k);
+        if n == 0 || k == 0 {
+            return Ok(result);
+        }
+        let mut rhs_perm = self.permute_in(rhs, par);
+        aptp_solve_mat(
+            &self.symbolic,
+            numeric,
+            MatMut::from_column_major_slice_mut(&mut rhs_perm, n, k),
+            stack,
+            par,
+        )?;
+        self.permute_out(&rhs_perm, result.as_mut(), par);
         Ok(result)
     }
 
@@ -474,76 +490,102 @@ impl<T: Scalar> SparseLDLT<T> {
     /// - `SparseError::DimensionMismatch` if `rhs.nrows()` != matrix dimension
     pub fn solve_in_place_mat(
         &self,
-        mut rhs: MatMut<'_, T>,
+        rhs: MatMut<'_, T>,
         stack: &mut MemStack,
         par: Par,
     ) -> Result<(), SparseError> {
+        let numeric = self.numeric_for_solve(rhs.nrows(), rhs.ncols())?;
+        let (n, k) = (rhs.nrows(), rhs.ncols());
+        if n == 0 || k == 0 {
+            return Ok(());
+        }
+
+        let mut rhs_perm = self.permute_in(rhs.as_ref(), par);
+        aptp_solve_mat(
+            &self.symbolic,
+            numeric,
+            MatMut::from_column_major_slice_mut(&mut rhs_perm, n, k),
+            stack,
+            par,
+        )?;
+        self.permute_out(&rhs_perm, rhs, par);
+        Ok(())
+    }
+
+    /// The factorization, after checking it exists and that an `nrows × k`
+    /// right-hand side matches it.
+    fn numeric_for_solve(&self, nrows: usize, k: usize) -> Result<&AptpNumeric<T>, SparseError> {
         let numeric = self
             .numeric
             .as_ref()
             .ok_or_else(|| SparseError::SolveBeforeFactor {
                 context: "factor() must be called before solve()".to_string(),
             })?;
-
         let n = self.symbolic.nrows();
-        let k = rhs.ncols();
-        if rhs.nrows() != n {
+        if nrows != n {
             return Err(SparseError::DimensionMismatch {
                 expected: (n, k),
-                got: (rhs.nrows(), k),
+                got: (nrows, k),
                 context: "RHS rows must match matrix dimension".to_string(),
             });
         }
+        Ok(numeric)
+    }
 
-        if n == 0 || k == 0 {
-            return Ok(());
-        }
-
-        let perm_fwd = &self.perm_fwd;
-        let scaling = self.scaling.as_deref();
+    /// Gather `rhs` into elimination order and scale it:
+    /// `out[new, j] = s[new] * rhs[perm_fwd[new], j]`, as an `n × k`
+    /// column-major buffer.
+    fn permute_in(&self, rhs: MatRef<'_, T>, par: Par) -> Vec<T> {
         let t_in = super::solve::tic!();
-
-        // 1-2. Permute and scale: rhs_perm[new, j] = s[new] * rhs[perm_fwd[new], j]
-        //      (perm_fwd[new] = old, so this gathers the RHS into permuted order).
-        let mut rhs_perm = Mat::<T>::zeros(n, k);
-        for j in 0..k {
-            let src = rhs.as_ref().col(j);
-            let dst = rhs_perm
-                .col_mut(j)
-                .try_as_col_major_mut()
-                .expect("contiguous");
-            let dst = dst.as_slice_mut();
-            for (new, d) in dst.iter_mut().enumerate() {
-                let v = src[perm_fwd[new]];
-                *d = match scaling {
-                    Some(s) => v * T::from_f64(s[new]),
-                    None => v,
-                };
-            }
-        }
-
+        let (n, k) = (rhs.nrows(), rhs.ncols());
+        let mut buf = Vec::<T>::with_capacity(n * k);
+        let scaling = self.scaling.as_deref();
+        gather_rows(
+            &mut buf.spare_capacity_mut()[..n * k],
+            n,
+            rhs,
+            &self.perm_fwd,
+            |new, _| scaling.map(|s| s[new]),
+            par,
+        );
+        // SAFETY: gather_rows wrote every entry of the first n * k slots.
+        unsafe { buf.set_len(n * k) };
         super::solve::toc!(t_in, 0, 0);
+        buf
+    }
 
-        // 3. Core solve in permuted, scaled coordinates.
-        aptp_solve_mat(&self.symbolic, numeric, rhs_perm.as_mut(), stack, par)?;
+    /// Unscale (the scaling is symmetric, so the same factors apply) and
+    /// scatter back to the original order:
+    /// `rhs[old, j] = s[perm_inv[old]] * x[perm_inv[old], j]`.
+    fn permute_out(&self, x: &[T], mut rhs: MatMut<'_, T>, par: Par) {
         let t_out = super::solve::tic!();
-
-        // 4-5. Unscale (symmetric: same scaling applied) and unpermute:
-        //      rhs[perm_fwd[new], j] = s[new] * rhs_perm[new, j]
-        for j in 0..k {
-            let src = rhs_perm.col(j).try_as_col_major().expect("contiguous");
-            let src = src.as_slice();
-            let mut dst = rhs.as_mut().col_mut(j);
-            for (new, &v) in src.iter().enumerate() {
-                dst[perm_fwd[new]] = match scaling {
-                    Some(s) => v * T::from_f64(s[new]),
-                    None => v,
-                };
+        let (n, k) = (rhs.nrows(), rhs.ncols());
+        let src = MatRef::from_column_major_slice(x, n, k);
+        let scaling = self.scaling.as_deref();
+        let scale = |_old: usize, new: usize| scaling.map(|s| s[new]);
+        if rhs.row_stride() == 1 && rhs.col_stride() == n as isize {
+            // SAFETY: contiguous n × k column-major storage; writing initialized
+            // values through MaybeUninit<T> is sound.
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(
+                    rhs.as_ptr_mut().cast::<core::mem::MaybeUninit<T>>(),
+                    n * k,
+                )
+            };
+            gather_rows(dst, n, src, &self.perm_inv, scale, par);
+        } else {
+            for j in 0..k {
+                for old in 0..n {
+                    let new = self.perm_inv[old];
+                    let v = src[(new, j)];
+                    rhs[(old, j)] = match scale(old, new) {
+                        Some(s) => v * T::from_f64(s),
+                        None => v,
+                    };
+                }
             }
         }
         super::solve::toc!(t_out, 12, 0);
-
-        Ok(())
     }
 
     /// Workspace requirement for solve.
@@ -694,4 +736,55 @@ fn magnitude_matrix<T: Scalar>(
         })?;
     let vals = matrix.val().iter().map(|v| to_f64(v.mag())).collect();
     Ok(SparseColMat::new(symbolic, vals))
+}
+
+/// Rows per parallel task in [`gather_rows`].
+const GATHER_CHUNK: usize = 1 << 14;
+
+/// `dst[i, j] = scale(i, idx[i]) * src[idx[i], j]` for an `n × k` column-major
+/// `dst` (fully written). Splits columns into row chunks across rayon threads
+/// when `par` allows and the copy is large.
+fn gather_rows<T: Scalar>(
+    dst: &mut [core::mem::MaybeUninit<T>],
+    n: usize,
+    src: MatRef<'_, T>,
+    idx: &[usize],
+    scale: impl Fn(usize, usize) -> Option<f64> + Sync,
+    par: Par,
+) {
+    debug_assert_eq!(dst.len(), n * src.ncols());
+    debug_assert_eq!(idx.len(), n);
+    if n == 0 {
+        return;
+    }
+    let fill = |j: usize, row0: usize, out: &mut [core::mem::MaybeUninit<T>]| {
+        let col = src.col(j);
+        for (r, d) in out.iter_mut().enumerate() {
+            let i = row0 + r;
+            let v = col[idx[i]];
+            d.write(match scale(i, idx[i]) {
+                Some(s) => v * T::from_f64(s),
+                None => v,
+            });
+        }
+    };
+    if par.degree() > 1 && dst.len() >= 2 * GATHER_CHUNK {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let tasks: Vec<(usize, usize, &mut [core::mem::MaybeUninit<T>])> = dst
+            .chunks_mut(n)
+            .enumerate()
+            .flat_map(|(j, col)| {
+                col.chunks_mut(GATHER_CHUNK)
+                    .enumerate()
+                    .map(move |(c, out)| (j, c * GATHER_CHUNK, out))
+            })
+            .collect();
+        tasks
+            .into_par_iter()
+            .for_each(|(j, row0, out)| fill(j, row0, out));
+    } else {
+        for (j, col) in dst.chunks_mut(n).enumerate() {
+            fill(j, 0, col);
+        }
+    }
 }

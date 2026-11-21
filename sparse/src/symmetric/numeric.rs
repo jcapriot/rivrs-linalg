@@ -39,7 +39,7 @@ use faer::linalg::triangular_solve::{
 };
 use faer::sparse::SparseColMat;
 use faer::sparse::linalg::cholesky::SymbolicCholeskyRaw;
-use faer::{Accum, Conj, Mat, MatMut, Par};
+use faer::{Accum, Conj, Mat, MatMut, MatRef, Par};
 
 use super::diagonal::{MixedDiagonal, PivotEntry};
 use super::factor::{
@@ -814,16 +814,7 @@ impl<T: Scalar> BlockedUnitLower<T> {
             let (top, rest) = rhs.as_mut().split_at_row_mut(base + w);
             let mut x_b = top.subrows_mut(base, w);
             if below.nrows() > 0 {
-                matmul_with_conj(
-                    x_b.as_mut(),
-                    Accum::Add,
-                    below.transpose(),
-                    Conj::No,
-                    rest.as_ref(),
-                    Conj::No,
-                    T::from_f64(-1.0),
-                    par,
-                );
+                sub_at_b(x_b.as_mut(), below, rest.as_ref(), par);
             }
             solve_unit_upper_triangular_in_place_with_conj(
                 diag.transpose(),
@@ -832,6 +823,62 @@ impl<T: Scalar> BlockedUnitLower<T> {
                 par,
             );
         }
+    }
+}
+
+/// Minimum rows of `a` per task in [`sub_at_b`]'s split-K product.
+const SPLIT_K_MIN_ROWS: usize = 512;
+
+/// `c -= aᵀ b` for a short, wide product: `a` is `m × w`, `b` is `m × k`, and
+/// the `w × k` result is small (`w` ≤ 64), so splitting the output across
+/// threads (as faer does) leaves most of them idle. Instead the inner
+/// dimension `m` is split into chunks, each thread forms its partial product
+/// in its own buffer, and the partials are subtracted in a fixed order (so
+/// the result is deterministic for a given thread count).
+///
+/// # References
+///
+/// - Goto & van de Geijn (2008), "Anatomy of high-performance matrix
+///   multiplication": parallelizing the k loop with a reduction for small
+///   output blocks
+fn sub_at_b<T: Scalar>(mut c: MatMut<'_, T>, a: MatRef<'_, T>, b: MatRef<'_, T>, par: Par) {
+    let m = a.nrows();
+    let chunks = par.degree().min(m / SPLIT_K_MIN_ROWS);
+    if chunks < 2 {
+        matmul_with_conj(
+            c,
+            Accum::Add,
+            a.transpose(),
+            Conj::No,
+            b,
+            Conj::No,
+            T::from_f64(-1.0),
+            par,
+        );
+        return;
+    }
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let (w, k) = (c.nrows(), c.ncols());
+    let partials: Vec<Mat<T>> = (0..chunks)
+        .into_par_iter()
+        .map(|t| {
+            let (r0, r1) = (t * m / chunks, (t + 1) * m / chunks);
+            let mut acc = Mat::<T>::zeros(w, k);
+            matmul_with_conj(
+                acc.as_mut(),
+                Accum::Replace,
+                a.subrows(r0, r1 - r0).transpose(),
+                Conj::No,
+                b.subrows(r0, r1 - r0),
+                Conj::No,
+                T::one(),
+                Par::Seq,
+            );
+            acc
+        })
+        .collect();
+    for p in &partials {
+        c -= p;
     }
 }
 
@@ -3529,6 +3576,23 @@ pub(crate) fn extract_contribution<T: Scalar>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_k_product_matches_matmul() {
+        // m large enough that sub_at_b takes the split-K path at 4 threads.
+        for (m, w, k) in [(5000, 64, 1), (3001, 37, 16), (600, 64, 3)] {
+            let a = Mat::<f64>::from_fn(m, w, |i, j| ((i * 7 + j * 13) % 29) as f64 / 29.0 - 0.5);
+            let b = Mat::<f64>::from_fn(m, k, |i, j| ((i * 11 + j * 5) % 31) as f64 / 31.0 - 0.5);
+            let c0 = Mat::<f64>::from_fn(w, k, |i, j| (i + 2 * j) as f64);
+            let expect = &c0 - a.transpose() * &b;
+            for par in [Par::Seq, Par::rayon(4)] {
+                let mut c = c0.clone();
+                sub_at_b(c.as_mut(), a.as_ref(), b.as_ref(), par);
+                let err = (&c - &expect).norm_max();
+                assert!(err < 1e-10, "m={m} w={w} k={k} {par:?}: err {err}");
+            }
+        }
+    }
 
     #[test]
     fn blocked_unit_lower_matches_dense() {

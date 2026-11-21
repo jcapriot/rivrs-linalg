@@ -1888,6 +1888,29 @@ fn test_solve_mat_ci_subset() {
                     meta.name
                 );
             }
+            // In place on a strided view (the k columns of a wider matrix,
+            // so the column stride is not n).
+            let mut wide = Mat::<f64>::zeros(n + 3, k + 1);
+            wide.as_mut()
+                .submatrix_mut(0, 1, n, k)
+                .copy_from(b.as_ref());
+            solver
+                .solve_in_place_mat(
+                    wide.as_mut().submatrix_mut(0, 1, n, k),
+                    MemStack::new(&mut mem),
+                    par,
+                )
+                .expect("solve_in_place_mat");
+            let diff = (0..k)
+                .flat_map(|j| (0..n).map(move |i| (i, j)))
+                .fold(0.0f64, |m, (i, j)| {
+                    m.max((wide[(i, j + 1)] - x[(i, j)]).abs())
+                });
+            assert!(
+                diff == 0.0,
+                "'{}' {par:?} strided: diff {diff:e}",
+                meta.name
+            );
         }
     }
 }

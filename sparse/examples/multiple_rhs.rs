@@ -106,7 +106,10 @@ fn main() {
         let be = sparse_backward_error(&a, &x, b);
         assert!(be < 1e-12, "solve_mat column {j}: backward error {be:.2e}");
     }
-    println!("solve_mat: all {} columns at once, same results", b_all.ncols());
+    println!(
+        "solve_mat: all {} columns at once, same results",
+        b_all.ncols()
+    );
 
     println!("\nAll solves passed (backward error < 1e-12).");
 }

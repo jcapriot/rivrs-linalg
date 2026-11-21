@@ -66,6 +66,12 @@ pub(crate) mod solve_profile {
     pub(crate) static PER_NODE: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(true);
 
+    /// With `RIVRS_SOLVE_TASK_NODES` set, per-front slots also accumulate
+    /// inside subtree tasks (then they are thread time, not wall clock).
+    pub(crate) fn task_nodes() -> bool {
+        std::env::var_os("RIVRS_SOLVE_TASK_NODES").is_some()
+    }
+
     #[inline]
     pub(crate) fn add(i: usize, t: std::time::Instant, bytes: usize) {
         NANOS[i].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
@@ -569,7 +575,10 @@ impl SolvePlan {
         let shared = SharedRhs::new(rhs.as_mut());
         let top_idx = self.top_idx.as_slice();
         #[cfg(feature = "diagnostic")]
-        solve_profile::PER_NODE.store(false, core::sync::atomic::Ordering::Relaxed);
+        solve_profile::PER_NODE.store(
+            solve_profile::task_nodes(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
 
         // 1. Forward solve in the subtrees.
         let t = tic!();
@@ -649,7 +658,10 @@ impl SolvePlan {
 
         // 4. Diagonal + backward solve in the subtrees.
         #[cfg(feature = "diagnostic")]
-        solve_profile::PER_NODE.store(false, core::sync::atomic::Ordering::Relaxed);
+        solve_profile::PER_NODE.store(
+            solve_profile::task_nodes(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
         let shared = SharedRhs::new(rhs.as_mut());
         let t = tic!();
         self.tasks.par_iter().for_each_init(
