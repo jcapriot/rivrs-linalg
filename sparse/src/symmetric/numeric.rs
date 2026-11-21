@@ -2835,6 +2835,24 @@ fn dfs_postorder(
     order
 }
 
+/// `f64` with a total order (for subtree costs in a heap).
+#[derive(Clone, Copy, PartialEq)]
+struct OrdF64(f64);
+
+impl Eq for OrdF64 {}
+
+impl PartialOrd for OrdF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrdF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
 /// Choose the L0 layer: roots of independent subtrees for phase A.
 ///
 /// Starting from the tree roots, any node whose subtree contains a front of
@@ -2876,23 +2894,29 @@ fn select_l0_layer(
         }
     }
 
-    // Load-balance rule: split the largest subtree while it dominates.
-    let max_layer = 32 * threads;
-    while !layer.is_empty() && layer.len() < max_layer {
-        let total: f64 = layer.iter().map(|&r| cost[r]).sum();
-        let (idx, r) = layer
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by(|a, b| cost[a.1].total_cmp(&cost[b.1]))
-            .unwrap_or((0, layer[0]));
+    // Load-balance rule: split the largest subtree while it dominates. There
+    // is no cap on the number of splits: a tree can be a long spine of
+    // medium fronts with tiny subtrees hanging off it (aug3dcqp: about 3400
+    // supernodes, the spine holds nearly all the flops), and the walk must
+    // reach the bottom of the spine so the side subtrees run in parallel
+    // while the spine moves to the top part. A heap keeps each split
+    // O(log layer).
+    let mut heap: std::collections::BinaryHeap<(OrdF64, usize)> =
+        layer.iter().map(|&r| (OrdF64(cost[r]), r)).collect();
+    let mut total: f64 = layer.iter().map(|&r| cost[r]).sum();
+    while let Some(&(OrdF64(c), r)) = heap.peek() {
         let splittable = !children[r].is_empty() && !supernodes[r].in_small_leaf;
-        if !splittable || cost[r] * threads as f64 <= total {
+        if !splittable || c * threads as f64 <= total {
             break;
         }
-        layer.swap_remove(idx);
-        layer.extend(children[r].iter().copied());
+        heap.pop();
+        total -= c;
+        for &ch in &children[r] {
+            total += cost[ch];
+            heap.push((OrdF64(cost[ch]), ch));
+        }
     }
+    let mut layer: Vec<usize> = heap.into_iter().map(|(_, r)| r).collect();
 
     layer.sort_by(|a, b| cost[*b].total_cmp(&cost[*a]));
     layer
@@ -4562,6 +4586,65 @@ mod tests {
             owned_ranges: vec![col_begin..col_begin + ncols],
             in_small_leaf: false,
         }
+    }
+
+    /// A forest with many tiny roots plus one spine of medium fronts carrying
+    /// small side subtrees (the shape of aug3dcqp). The L0 layer must walk
+    /// down the spine, so the side leaves run in parallel and the spine goes
+    /// to the top part, even though the forest starts with more roots than
+    /// `32 * threads`.
+    #[test]
+    fn l0_layer_splits_spine_in_wide_forest() {
+        let mut sn = Vec::new();
+        let mut col = 0;
+        for _ in 0..300 {
+            sn.push(make_snode(col, 1, 2, None));
+            col += 1;
+        }
+        let mut spine = Vec::new();
+        let mut prev_spine: Option<usize> = None;
+        for _ in 0..40 {
+            let first_leaf = sn.len();
+            for _ in 0..10 {
+                sn.push(make_snode(col, 2, 4, None));
+                col += 2;
+            }
+            let me = sn.len();
+            sn.push(make_snode(col, 50, 350, None));
+            col += 50;
+            for leaf in &mut sn[first_leaf..me] {
+                leaf.parent = Some(me);
+            }
+            if let Some(p) = prev_spine {
+                sn[p].parent = Some(me);
+            }
+            prev_spine = Some(me);
+            spine.push(me);
+        }
+        let mut children = vec![Vec::new(); sn.len()];
+        for (s, node) in sn.iter().enumerate() {
+            if let Some(p) = node.parent {
+                children[p].push(s);
+            }
+        }
+
+        let layer = select_l0_layer(&sn, &children, 8, 4096);
+        let top = *spine.last().unwrap();
+        assert!(!layer.contains(&top), "spine root left in the L0 layer");
+        let spine_in_layer = layer.iter().filter(|r| spine.contains(r)).count();
+        assert!(
+            spine_in_layer <= 1,
+            "{spine_in_layer} spine nodes in the layer"
+        );
+        // Every node is covered exactly once by a layer subtree or the top part.
+        let mut covered = vec![0u32; sn.len()];
+        let mut stack = layer.clone();
+        while let Some(r) = stack.pop() {
+            covered[r] += 1;
+            stack.extend(children[r].iter().copied());
+        }
+        assert!(covered.iter().all(|&c| c <= 1));
+        assert!(spine.iter().filter(|s| covered[**s] == 0).count() >= 39);
     }
 
     /// Linear chain of 5 small supernodes — all should be in_small_leaf.
