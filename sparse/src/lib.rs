@@ -39,7 +39,7 @@
 //!     Triplet::new(1, 0, 1.0), Triplet::new(0, 1, 1.0),
 //!     Triplet::new(1, 1, -1.0),
 //! ];
-//! let a = SparseColMat::try_new_from_triplets(2, 2, &triplets).unwrap();
+//! let a: SparseColMat<usize, f64> = SparseColMat::try_new_from_triplets(2, 2, &triplets).unwrap();
 //! let b = Col::from_fn(2, |i| [3.0, 0.0][i]);
 //!
 //! let x = SparseLDLT::solve_full(&a, &b, &SolverOptions::default()).unwrap();
@@ -71,7 +71,7 @@
 //!     Triplet::new(1, 0, 1.0), Triplet::new(0, 1, 1.0),
 //!     Triplet::new(1, 1, 3.0),
 //! ];
-//! let a = SparseColMat::try_new_from_triplets(2, 2, &triplets).unwrap();
+//! let a: SparseColMat<usize, f64> = SparseColMat::try_new_from_triplets(2, 2, &triplets).unwrap();
 //!
 //! // Phase 1: Symbolic analysis
 //! let mut solver = SparseLDLT::analyze_with_matrix(&a, &AnalyzeOptions::default())?;

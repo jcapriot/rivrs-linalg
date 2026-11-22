@@ -169,7 +169,7 @@ impl Default for SolverOptions {
 ///     Triplet::new(1, 0, 1.0),
 ///     Triplet::new(1, 1, 3.0),
 /// ];
-/// let a = SparseColMat::try_new_from_triplets(2, 2, &triplets).unwrap();
+/// let a: SparseColMat<usize, f64> = SparseColMat::try_new_from_triplets(2, 2, &triplets).unwrap();
 /// let b = Col::from_fn(2, |i| [5.0, 4.0][i]);
 /// let x = SparseLDLT::solve_full(&a, &b, &SolverOptions::default()).unwrap();
 /// // A = [[4, 1], [1, 3]], b = [5, 4] => x = [1, 1]
@@ -465,7 +465,7 @@ impl<T: Scalar> SparseLDLT<T> {
     ///     Triplet::new(0, 1, 1.0), Triplet::new(1, 0, 1.0),
     ///     Triplet::new(1, 1, 3.0),
     /// ];
-    /// let a = SparseColMat::try_new_from_triplets(2, 2, &triplets).unwrap();
+    /// let a: SparseColMat<usize, f64> = SparseColMat::try_new_from_triplets(2, 2, &triplets).unwrap();
     /// let b = Col::from_fn(2, |i| [5.0, 4.0][i]);
     /// let x = SparseLDLT::solve_full(&a, &b, &SolverOptions::default()).unwrap();
     /// assert!((x[0] - 1.0).abs() < 1e-12);
