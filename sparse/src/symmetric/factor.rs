@@ -2709,28 +2709,82 @@ pub(crate) fn unpivoted_factor_in_place<T: Scalar>(
     })
 }
 
-/// Rows below a tile: `panel <- panel · L11⁻ᵀ` (`L11` unit lower).
+/// Rows below a tile, in one pass over row chunks: back up the panel into
+/// `saved`, apply the tile's column permutation (`perm`, `None` for the
+/// identity), then for the `nelim = l11.ncols()` passed columns compute
+/// `panel <- panel · L11⁻ᵀ · D⁻¹` (`L11` unit lower) and return their column
+/// maxima for the a posteriori check.
 ///
-/// Each row of the panel is an independent triangular solve, so with
-/// threads the rows are split into chunks solved concurrently with
-/// sequential kernels. faer's parallel solve with this shape (a short
-/// `nb × nb` triangle against a long, row-major right-hand side `panelᵀ`)
-/// ran at about 260 GF/s on 8 threads of a quiet i9-14900K (and under
-/// 90 GF/s with one core busy), while the row split reaches about 390 GF/s
-/// and degrades much less under contention.
-fn solve_rows_below<T: Scalar>(l11: MatRef<'_, T>, panel: MatMut<'_, T>, par: Par) {
-    use rayon::iter::ParallelIterator;
-    let (rows, threads) = (panel.nrows(), par.degree());
-    // Chunks of at least 64 rows: nb² · 64 flops each.
+/// Every step works on whole rows, so each chunk (at most about 1 MB) is
+/// copied, permuted, solved and scaled while it sits in L2. Done as separate
+/// passes over the full panel (a 15000 × 256 panel is 30 MB, about the size
+/// of L3), the backup and permuted copies were DRAM-bandwidth bound. The
+/// chunks also replace faer's parallel triangular solve, which for this
+/// shape ran at about 260 GF/s on 8 threads of a quiet i9-14900K (and under
+/// 90 GF/s with one core busy) against about 390 GF/s for chunks solved
+/// concurrently with sequential kernels.
+fn process_rows_below<T: Scalar>(
+    panel: MatMut<'_, T>,
+    saved: MatMut<'_, T>,
+    perm: Option<&[usize]>,
+    l11: MatRef<'_, T>,
+    d: &MixedDiagonal<T>,
+    par: Par,
+) -> Vec<T::Real> {
+    use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+    let (rows, cols) = (panel.nrows(), panel.ncols());
+    let nelim = l11.ncols();
+    let chunk_rows = |mut p: MatMut<'_, T>, mut s: MatMut<'_, T>| -> Vec<T::Real> {
+        s.copy_from(p.rb());
+        if let Some(perm) = perm {
+            for (j, &src) in perm.iter().enumerate() {
+                p.rb_mut().col_mut(j).copy_from(s.rb().col(src));
+            }
+        }
+        if nelim == 0 {
+            return Vec::new();
+        }
+        let mut passed = p.subcols_mut(0, nelim);
+        triangular_solve::solve_unit_lower_triangular_in_place(
+            l11,
+            passed.rb_mut().transpose_mut(),
+            Par::Seq,
+        );
+        scale_rows_col_max(passed, d, nelim, Par::Seq)
+    };
+    // Chunks of at least 64 rows (nb² · 64 solve flops each), at most about
+    // 1 MB, and about four per thread.
     const MIN_ROWS: usize = 64;
-    if threads < 2 || rows < 2 * MIN_ROWS {
-        triangular_solve::solve_unit_lower_triangular_in_place(l11, panel.transpose_mut(), par);
-        return;
+    let max_rows = ((1 << 20) / (cols.max(1) * core::mem::size_of::<T>())).max(MIN_ROWS);
+    let chunk = rows
+        .div_ceil(4 * par.degree())
+        .clamp(MIN_ROWS, max_rows)
+        .next_multiple_of(8);
+    let max_of = |mut a: Vec<T::Real>, b: Vec<T::Real>| {
+        if a.is_empty() {
+            return b;
+        }
+        for (x, y) in a.iter_mut().zip(b) {
+            *x = x.max(y);
+        }
+        a
+    };
+    if par.degree() < 2 || rows < 2 * MIN_ROWS {
+        let (mut panel, mut saved, mut col_max) = (panel, saved, Vec::new());
+        while panel.nrows() > 0 {
+            let r = chunk.min(panel.nrows());
+            let (p, p_rest) = panel.split_at_row_mut(r);
+            let (s, s_rest) = saved.split_at_row_mut(r);
+            col_max = max_of(col_max, chunk_rows(p, s));
+            (panel, saved) = (p_rest, s_rest);
+        }
+        return col_max;
     }
-    let chunk = rows.div_ceil(4 * threads).max(MIN_ROWS).next_multiple_of(8);
-    panel.par_row_chunks_mut(chunk).for_each(|rows| {
-        triangular_solve::solve_unit_lower_triangular_in_place(l11, rows.transpose_mut(), Par::Seq);
-    });
+    panel
+        .par_row_chunks_mut(chunk)
+        .zip(saved.par_row_chunks_mut(chunk))
+        .map(|(p, s)| chunk_rows(p, s))
+        .reduce(Vec::new, max_of)
 }
 
 /// Two-level outer block loop for large frontal matrices.
@@ -2859,40 +2913,28 @@ fn two_level_factor<T: Scalar>(
             let mut panel = below
                 .rb_mut()
                 .submatrix_mut(0, col_start, rows_below, block_cols);
-            let mut saved = panel_backup
+            let saved = panel_backup
                 .as_mut()
                 .submatrix_mut(0, 0, rows_below, block_cols);
-            #[cfg(feature = "diagnostic")]
-            let t_cp = std::time::Instant::now();
-            copy_cols(saved.rb_mut(), panel.rb(), None, options.par);
             // Without pivoting inside the tile the permuted copy is the
             // panel itself.
-            if !is_identity(perm) {
-                copy_cols(panel.rb_mut(), saved.rb(), Some(perm), options.par);
-            }
+            let perm = (!is_identity(perm)).then_some(perm);
             #[cfg(feature = "diagnostic")]
-            kernel_profile::add_big(11, t_cp, 0.0);
+            let t_trsm = std::time::Instant::now();
+            let col_max = process_rows_below(
+                panel.rb_mut(),
+                saved,
+                perm,
+                tile.submatrix(0, 0, tile_nelim, tile_nelim),
+                &block_result.d,
+                options.par,
+            );
+            // Backup, permutation, solve and scaling are one pass now: the
+            // diagnostic "TRSM" slot carries all of it.
+            #[cfg(feature = "diagnostic")]
+            kernel_profile::add_big(12, t_trsm, (tile_nelim * tile_nelim * rows_below) as f64);
 
             if tile_nelim > 0 {
-                #[cfg(feature = "diagnostic")]
-                let t_trsm = std::time::Instant::now();
-                solve_rows_below(
-                    tile.submatrix(0, 0, tile_nelim, tile_nelim),
-                    panel.rb_mut().subcols_mut(0, tile_nelim),
-                    options.par,
-                );
-                #[cfg(feature = "diagnostic")]
-                kernel_profile::add_big(12, t_trsm, (tile_nelim * tile_nelim * rows_below) as f64);
-                #[cfg(feature = "diagnostic")]
-                let t_sc = std::time::Instant::now();
-                let col_max = scale_rows_col_max(
-                    panel.rb_mut().subcols_mut(0, tile_nelim),
-                    &block_result.d,
-                    tile_nelim,
-                    options.par,
-                );
-                #[cfg(feature = "diagnostic")]
-                kernel_profile::add_big(13, t_sc, 0.0);
                 let bound = real::<T>(1.0) / real::<T>(options.threshold);
                 block_nelim = adjust_for_2x2_boundary(
                     first_failing_pivot(&col_max, &block_result.d, tile_nelim, bound),
@@ -6733,6 +6775,17 @@ mod tests {
                 diag_scale: 0.1,
                 poison: &[(0, &[2, 3]), (2, &[11])],
             },
+            // Enough rows below each tile that the parallel run splits them
+            // into several chunks.
+            Case {
+                m: 600,
+                p: 400,
+                nb: 64,
+                ib: 8,
+                seed: 99,
+                diag_scale: 0.5,
+                poison: &[(0, &[5, 40]), (3, &[17])],
+            },
         ];
 
         for (idx, c) in cases.iter().enumerate() {
@@ -6753,12 +6806,16 @@ mod tests {
                 }
             }
 
-            for method in [FailedPivotMethod::Pass, FailedPivotMethod::Tpp] {
+            let runs = [FailedPivotMethod::Pass, FailedPivotMethod::Tpp]
+                .into_iter()
+                .flat_map(|method| [(method, Par::Seq), (method, Par::rayon(4))]);
+            for (method, par) in runs {
                 let opts = AptpOptions {
                     outer_block_size: c.nb,
                     inner_block_size: c.ib,
                     threshold: 0.01,
                     failed_pivot_method: method,
+                    par,
                     ..AptpOptions::default()
                 };
                 let delayed_of = |mat: &Mat<f64>| {
@@ -6773,13 +6830,13 @@ mod tests {
                     result.stats.num_1x1 + 2 * result.stats.num_2x2 + result.stats.num_delayed;
                 assert_eq!(
                     sum, c.p,
-                    "case {idx} {method:?}: statistics invariant {sum} != {}",
+                    "case {idx} {method:?} {par:?}: statistics invariant {sum} != {}",
                     c.p
                 );
                 let err = check_partial_factorization_in_place(&poisoned, &factored, c.p, &result);
                 assert!(
                     err < 1e-10,
-                    "case {idx} {method:?}: reconstruction error {err:.2e}"
+                    "case {idx} {method:?} {par:?}: reconstruction error {err:.2e}"
                 );
                 if method == FailedPivotMethod::Pass {
                     assert!(
