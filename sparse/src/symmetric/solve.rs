@@ -26,6 +26,7 @@ use faer::linalg::temp_mat_scratch;
 use faer::mat::{MatMut, MatRef};
 use faer::{Accum, Conj, Par};
 
+use super::narrow::sub_tr_narrow;
 use super::numeric::{AptpNumeric, FrontFactors, INTRA_NODE_THRESHOLD};
 use super::symbolic::AptpSymbolic;
 use crate::error::SparseError;
@@ -38,7 +39,7 @@ use crate::scalar::Scalar;
 pub(crate) mod solve_profile {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    pub(crate) const NAMES: [&str; 17] = [
+    pub(crate) const NAMES: [&str; 24] = [
         "perm + scale (in)",
         "fwd small fronts (seq)",
         "fwd big gather/writeback",
@@ -56,10 +57,17 @@ pub(crate) mod solve_profile {
         "fwd subtree tasks (wall)",
         "fwd subtree reduce",
         "bwd subtree tasks (wall)",
+        "fwd task buffers (thread)",
+        "fwd task fronts (thread)",
+        "fwd task drain (thread)",
+        "fwd longest task",
+        "bwd task buffers (thread)",
+        "bwd task fronts (thread)",
+        "bwd longest task",
     ];
-    pub(crate) static NANOS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+    pub(crate) static NANOS: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
     /// Factor bytes read by the slot (L11 lower triangle or L21).
-    pub(crate) static BYTES: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+    pub(crate) static BYTES: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
     pub(crate) static BIG_FRONTS: AtomicU64 = AtomicU64::new(0);
     /// Per-front slots (1..=5, 7..=11) only accumulate while this is set;
     /// it is cleared while subtree tasks run so those slots stay wall clock.
@@ -76,6 +84,12 @@ pub(crate) mod solve_profile {
     pub(crate) fn add(i: usize, t: std::time::Instant, bytes: usize) {
         NANOS[i].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
         BYTES[i].fetch_add(bytes as u64, Relaxed);
+    }
+
+    /// Keep the longest time seen in slot `i` (bytes: the plan size).
+    #[inline]
+    pub(crate) fn max(i: usize, t: std::time::Instant) {
+        NANOS[i].fetch_max(t.elapsed().as_nanos() as u64, Relaxed);
     }
 }
 
@@ -248,12 +262,13 @@ pub fn aptp_solve_mat<T: Scalar>(
     let kb = k_all.min(SOLVE_RHS_BLOCK);
     let mut work = vec![T::zero(); max_size * kb];
     let mut work2 = vec![T::zero(); max_size * kb];
+    let pool = TaskPool::new(if plan.is_some() { par.degree() } else { 0 });
     let mut c0 = 0;
     while c0 < k_all {
         let c1 = (c0 + SOLVE_RHS_BLOCK).min(k_all);
         let block = rhs.as_mut().subcols_mut(c0, c1 - c0);
         match &plan {
-            Some(plan) => plan.solve(factors, block, &mut work, &mut work2, max_size, par),
+            Some(plan) => plan.solve(factors, block, &mut work, &mut work2, &pool, max_size, par),
             None => {
                 let mut view = RhsView::exclusive(block);
                 // Forward solve (postorder = index order), then the diagonal
@@ -432,6 +447,66 @@ impl<T: Scalar> SolveRhs<T> for RhsView<'_, T> {
     }
 }
 
+/// Buffers of one subtree-task thread: the pending-update buffer
+/// (`n_top × k`, all zero between tasks) and two front workspaces.
+struct TaskBufs<T> {
+    pending: Vec<T>,
+    w1: Vec<T>,
+    w2: Vec<T>,
+}
+
+impl<T: Scalar> TaskBufs<T> {
+    const fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            w1: Vec::new(),
+            w2: Vec::new(),
+        }
+    }
+
+    /// Grow to at least `pending` and `work` entries. New pending entries
+    /// are zero, and the existing ones are zero by the drain invariant.
+    fn reserve(&mut self, pending: usize, work: usize) {
+        if self.pending.len() < pending {
+            self.pending.resize(pending, T::zero());
+        }
+        for w in [&mut self.w1, &mut self.w2] {
+            if w.len() < work {
+                w.resize(work, T::zero());
+            }
+        }
+    }
+}
+
+/// Per-thread [`TaskBufs`], kept for a whole solve so subtree tasks don't
+/// allocate and zero an `n_top × k` buffer each time rayon splits the work
+/// (on DC 1M at `k = 16` that was a quarter of the forward task time).
+struct TaskPool<T> {
+    slots: Vec<std::sync::Mutex<TaskBufs<T>>>,
+}
+
+impl<T: Scalar> TaskPool<T> {
+    fn new(threads: usize) -> Self {
+        Self {
+            slots: (0..threads)
+                .map(|_| std::sync::Mutex::new(TaskBufs::new()))
+                .collect(),
+        }
+    }
+
+    /// Run `f` with this thread's buffers (fresh ones if the slot is taken,
+    /// which only happens if more threads than slots run tasks).
+    fn with<R>(&self, f: impl FnOnce(&mut TaskBufs<T>) -> R) -> R {
+        let slot = rayon::current_thread_index()
+            .filter(|_| !self.slots.is_empty())
+            .and_then(|i| self.slots[i % self.slots.len()].try_lock().ok());
+        match slot {
+            Some(mut b) => f(&mut b),
+            None => f(&mut TaskBufs::new()),
+        }
+    }
+}
+
 /// `top_idx` value for entries owned by a front inside some subtree task.
 const NOT_TOP: u32 = u32::MAX;
 
@@ -535,6 +610,28 @@ impl SolvePlan {
             *t = u32::try_from(n_top).ok().filter(|&k| k != NOT_TOP)?;
             n_top += 1;
         }
+        #[cfg(feature = "diagnostic")]
+        if std::env::var_os("RIVRS_SOLVE_PLAN").is_some() {
+            let top_cost: f64 = top
+                .iter()
+                .map(|&s| {
+                    let ne = factors[s].num_eliminated() as f64;
+                    let r = factors[s].row_indices().len() as f64;
+                    ne * (ne + 1.0) / 2.0 + ne * r + 1.0
+                })
+                .sum();
+            let big = layer.first().map_or(0.0, |&r| cost[r]);
+            eprintln!(
+                "solve plan: {} tasks ({} fronts), top {} fronts, n_top {}, top share {:.3}, largest task {:.3}, target {:.3}",
+                tasks.len(),
+                tasks.iter().map(Vec::len).sum::<usize>(),
+                top.len(),
+                n_top,
+                top_cost / total,
+                big / total,
+                target / total
+            );
+        }
         Some(Self {
             tasks,
             top,
@@ -559,12 +656,14 @@ impl SolvePlan {
     /// 4. Subtree tasks run diagonal + backward concurrently. They read top
     ///    entries (final, and nobody writes them now) and their own entries,
     ///    and write only their own.
+    #[allow(clippy::too_many_arguments)]
     fn solve<T: Scalar>(
         &self,
         factors: &[FrontFactors<T>],
         mut rhs: MatMut<'_, T>,
         work: &mut [T],
         work2: &mut [T],
+        pool: &TaskPool<T>,
         max_size: usize,
         par: Par,
     ) {
@@ -585,15 +684,13 @@ impl SolvePlan {
         let pending: Vec<Vec<T>> = self
             .tasks
             .par_iter()
-            .map_init(
-                || {
-                    (
-                        vec![T::zero(); n_top * k],
-                        vec![T::zero(); max_size * k],
-                        vec![T::zero(); max_size * k],
-                    )
-                },
-                |(buf, w1, w2), nodes| {
+            .map(|nodes| {
+                pool.with(|b| {
+                    let t = tic!();
+                    b.reserve(n_top * k, max_size * k);
+                    toc!(t, 17, 0);
+                    let (buf, w1, w2) = (&mut b.pending[..n_top * k], &mut b.w1, &mut b.w2);
+                    let t_task = tic!();
                     let mut view = RhsView {
                         rhs: shared,
                         buf: &mut buf[..],
@@ -604,6 +701,10 @@ impl SolvePlan {
                     for &s in nodes {
                         forward_solve_supernode(&factors[s], &mut view, w1, w2, Par::Seq);
                     }
+                    toc!(t_task, 18, 0);
+                    // Drain the root's rows, which leaves the buffer zero for
+                    // the next task on this thread.
+                    let t_drain = tic!();
                     let rows = factors[nodes[nodes.len() - 1]].row_indices();
                     let mut out = Vec::with_capacity(rows.len() * k);
                     for j in 0..k {
@@ -618,9 +719,14 @@ impl SolvePlan {
                         buf.iter().all(|&x| x == T::zero()),
                         "forward update outside the task root's rows"
                     );
+                    toc!(t_drain, 19, 0);
+                    #[cfg(feature = "diagnostic")]
+                    if let Some(t) = t_task {
+                        solve_profile::max(20, t);
+                    }
                     out
-                },
-            )
+                })
+            })
             .collect();
         toc!(t, 14, 0);
 
@@ -664,9 +770,13 @@ impl SolvePlan {
         );
         let shared = SharedRhs::new(rhs.as_mut());
         let t = tic!();
-        self.tasks.par_iter().for_each_init(
-            || (vec![T::zero(); max_size * k], vec![T::zero(); max_size * k]),
-            |(w1, w2), nodes| {
+        self.tasks.par_iter().for_each(|nodes| {
+            pool.with(|b| {
+                let t = tic!();
+                b.reserve(0, max_size * k);
+                toc!(t, 21, 0);
+                let (w1, w2) = (&mut b.w1, &mut b.w2);
+                let t_task = tic!();
                 let mut view = RhsView {
                     rhs: shared,
                     buf: &mut [],
@@ -677,8 +787,13 @@ impl SolvePlan {
                 for &s in nodes.iter().rev() {
                     diag_backward_solve_supernode(&factors[s], &mut view, w1, w2, Par::Seq);
                 }
-            },
-        );
+                toc!(t_task, 22, 0);
+                #[cfg(feature = "diagnostic")]
+                if let Some(t) = t_task {
+                    solve_profile::max(23, t);
+                }
+            })
+        });
         toc!(t, 16, 0);
         #[cfg(feature = "diagnostic")]
         solve_profile::PER_NODE.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -901,17 +1016,20 @@ fn backward_impl<T: Scalar, R: SolveRhs<T> + ?Sized>(
         let tmp = MatRef::from_column_major_slice(tmp, r, k);
         let mut local = MatMut::from_column_major_slice_mut(&mut *work, ne, k);
 
-        // work -= L21^T * work2
-        matmul_with_conj(
-            local.as_mut(),
-            Accum::Add,
-            ff.l21().as_ref().transpose(),
-            Conj::No,
-            tmp,
-            Conj::No,
-            T::from_f64(-1.0),
-            effective_par,
-        );
+        // work -= L21^T * work2 (narrow blocks use a dedicated kernel, see
+        // `narrow`).
+        if !sub_tr_narrow(local.as_mut(), ff.l21().as_ref(), tmp, effective_par) {
+            matmul_with_conj(
+                local.as_mut(),
+                Accum::Add,
+                ff.l21().as_ref().transpose(),
+                Conj::No,
+                tmp,
+                Conj::No,
+                T::from_f64(-1.0),
+                effective_par,
+            );
+        }
         toc!(t, 9, l21_bytes);
     } else {
         toc!(t, 8, 0);

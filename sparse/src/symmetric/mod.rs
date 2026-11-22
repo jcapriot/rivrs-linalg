@@ -24,6 +24,7 @@ pub(crate) mod amalgamation;
 pub mod diagonal;
 pub mod factor;
 pub mod inertia;
+pub(crate) mod narrow;
 pub mod numeric;
 pub mod pivot;
 pub mod solve;
