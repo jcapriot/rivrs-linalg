@@ -137,34 +137,6 @@ impl<T: Scalar> FactorizationWorkspace<T> {
         }
     }
 
-    /// Zero the lower triangle of the m × m subregion of `frontal_data`.
-    ///
-    /// Called after the front size `m` is known and row indices are populated.
-    /// Does NOT clear `frontal_row_indices` or `delayed_cols_buf` — those
-    /// are managed by the caller before determining `m`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `m > self.frontal_data.nrows()`.
-    fn zero_frontal(&mut self, m: usize, par: Par) {
-        assert!(
-            m <= self.frontal_data.nrows(),
-            "front size {} exceeds workspace capacity {}",
-            m,
-            self.frontal_data.nrows()
-        );
-        // Zero the lower triangle of the m × m subregion via per-column fill.
-        // col_as_slice_mut gives a contiguous &mut [f64] for each column of the
-        // owned Mat, so fill(0.0) compiles to memset — much faster than indexed writes.
-        // Large fronts zero their columns in parallel (see `for_each_col_mut`).
-        for_each_col_mut(
-            self.frontal_data.as_mut().submatrix_mut(0, 0, m, m),
-            0,
-            par,
-            &|j, col: &mut [T]| col[j..].fill(T::zero()),
-        );
-    }
-
     /// Ensure `global_to_local` mapping is at least `n` entries.
     ///
     /// Used by the parallel path where frontal_data grows on demand in
@@ -1775,11 +1747,46 @@ fn factor_single_supernode<T: Scalar>(
         workspace.frontal_data = zeros_padded(m, m);
     }
 
+    // Children assembled in the same pass as the zeroing: no delays on either
+    // side and a strictly increasing row map (the usual case). The rest go
+    // through the extend-add loop below.
+    let ea_children_begin = assembly_maps.ea_snode_child_begin[s];
+    let child_map = |i: usize, cb: &ContributionBlock<T>| -> &[u32] {
+        let start = assembly_maps.ea_offsets[ea_children_begin + i];
+        &assembly_maps.ea_map[start..start + cb.row_indices.len()]
+    };
+    let no_delays_in = workspace.delayed_cols_buf.is_empty();
+    let fused: Vec<bool> = child_contributions
+        .iter()
+        .enumerate()
+        .map(|(i, opt_cb)| {
+            opt_cb.as_ref().is_some_and(|cb| {
+                no_delays_in
+                    && cb.num_delayed == 0
+                    && child_map(i, cb).windows(2).all(|w| w[0] < w[1])
+            })
+        })
+        .collect();
+
     #[cfg(feature = "diagnostic")]
     let zero_start = std::time::Instant::now();
 
-    workspace.zero_frontal(m, effective_par);
+    {
+        let children: Vec<(&PackedLower<T>, &[u32])> = child_contributions
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| fused[i])
+            .filter_map(|(i, opt_cb)| opt_cb.as_ref().map(|cb| (&cb.data, child_map(i, cb))))
+            .collect();
+        zero_and_extend_add(
+            workspace.frontal_data.as_mut().submatrix_mut(0, 0, m, m),
+            &children,
+            effective_par,
+        );
+    }
 
+    // With the diagnostic feature, `zero_time` includes the extend-add of the
+    // children assembled in the zeroing pass.
     #[cfg(feature = "diagnostic")]
     let zero_time = zero_start.elapsed();
 
@@ -1858,11 +1865,10 @@ fn factor_single_supernode<T: Scalar>(
     #[cfg(feature = "diagnostic")]
     let ea_start_time = std::time::Instant::now();
 
-    let ea_children_begin = assembly_maps.ea_snode_child_begin[s];
     let mut ea_child_idx = ea_children_begin;
 
-    for opt_cb in child_contributions {
-        if let Some(cb) = opt_cb {
+    for (opt_cb, done) in child_contributions.into_iter().zip(fused) {
+        if let Some(cb) = opt_cb.filter(|_| !done) {
             // Check if this child had delays — if so, fall back to g2l
             if cb.num_delayed > 0 || ndelay_in > 0 {
                 extend_add(&mut frontal, cb, &workspace.global_to_local);
@@ -3420,6 +3426,32 @@ fn extend_add_mapped_par<T: Scalar>(
             }
         }
     }
+}
+
+/// Zero the lower triangle of a front and add children's contribution blocks
+/// into it in the same column pass.
+///
+/// Each child's row map must be strictly increasing, so child column `j`
+/// lands in parent column `map[j]` at rows `map[j..] >= map[j]`, and a parent
+/// column receives at most one column from each child (found by binary
+/// search). Zeroing and assembling a column while it is in cache saves one
+/// trip of the front through memory compared with zeroing the whole front
+/// first; on the large fronts both steps are DRAM-bandwidth bound.
+fn zero_and_extend_add<T: Scalar>(
+    front: MatMut<'_, T>,
+    children: &[(&PackedLower<T>, &[u32])],
+    par: Par,
+) {
+    for_each_col_mut(front, 0, par, &|c, col: &mut [T]| {
+        col[c..].fill(T::zero());
+        for &(cb, map) in children {
+            if let Ok(j) = map.binary_search(&(c as u32)) {
+                for (&li, &v) in map[j..].iter().zip(cb.col(j)) {
+                    col[li as usize] += v;
+                }
+            }
+        }
+    });
 }
 
 /// Scatter a single extend-add value into the parent's lower triangle.
