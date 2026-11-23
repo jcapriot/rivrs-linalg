@@ -6850,6 +6850,117 @@ mod tests {
         }
     }
 
+    /// The kernel never reads or writes the NFS×NFS block (`a[k.., k..]`),
+    /// which the multifrontal code leaves to `compute_contribution_gemm_in_place`.
+    /// Covers TPP, `factor_inner`, `two_level_factor`, delays with both
+    /// failed-pivot methods, the parallel paths and the unpivoted kernel.
+    #[test]
+    fn test_kernel_leaves_nfs_block_alone() {
+        // (m, k, outer, inner, delay scale, failed-pivot method, pivoting)
+        let configs = [
+            (40, 12, 256, 32, 1.0, FailedPivotMethod::Tpp, true), // TPP
+            (120, 50, 64, 16, 1.0, FailedPivotMethod::Tpp, true), // factor_inner
+            (120, 50, 64, 16, 1e3, FailedPivotMethod::Tpp, true), // + delays
+            (300, 150, 64, 16, 1.0, FailedPivotMethod::Tpp, true), // two_level
+            (300, 150, 64, 16, 1e3, FailedPivotMethod::Tpp, true), // + delays
+            (300, 150, 64, 16, 1e3, FailedPivotMethod::Pass, true),
+            (300, 137, 64, 16, 1e3, FailedPivotMethod::Tpp, true), // k mid-block
+            (900, 600, 256, 32, 1e3, FailedPivotMethod::Tpp, true), // larger tiles
+            // m >= 4096: the parallel rows-below, L·D and scale paths
+            (5000, 700, 256, 32, 1e3, FailedPivotMethod::Tpp, true),
+            (200, 90, 64, 16, 1.0, FailedPivotMethod::Tpp, false), // unpivoted
+        ];
+        let runs = configs
+            .iter()
+            .flat_map(|c| [(c, Par::Seq), (c, Par::rayon(4))])
+            .enumerate();
+        for (ci, (&(m, k, nb, ib, scale, fpm, pivoting), par)) in runs {
+            let mut a = deterministic_indefinite_matrix(m, 7 + ci as u64 / 2, 1.0);
+            if !pivoting {
+                for i in 0..m {
+                    a[(i, i)] = m as f64; // diagonally dominant, SPD
+                }
+            } else if scale != 1.0 {
+                cause_delays(&mut a, 11 + ci as u64 / 2, scale);
+            }
+            let opts = AptpOptions {
+                par,
+                outer_block_size: nb,
+                inner_block_size: ib,
+                failed_pivot_method: fpm,
+                pivoting,
+                ..AptpOptions::default()
+            };
+
+            let mut sq = a.clone();
+            for j in k..m {
+                for i in k..m {
+                    sq[(i, j)] = f64::NAN;
+                }
+            }
+            let result = aptp_factor_in_place(sq.as_mut(), k, &opts).unwrap();
+            for j in k..m {
+                for i in k..m {
+                    assert!(sq[(i, j)].is_nan(), "config {ci}: NFS ({i}, {j}) written");
+                }
+            }
+            for j in 0..k {
+                for i in j..m {
+                    assert!(sq[(i, j)].is_finite(), "config {ci}: ({i}, {j}) not finite");
+                }
+            }
+
+            if pivoting && scale != 1.0 && fpm == FailedPivotMethod::Pass {
+                assert!(result.num_eliminated < k, "config {ci}: expected delays");
+            }
+        }
+    }
+
+    /// The in-place contribution GEMM (used by the multifrontal code) matches
+    /// the copy-into-buffer version, sequential and parallel, with delays.
+    #[test]
+    fn test_contribution_gemm_in_place_matches_copy() {
+        // (m, k, delay scale, par)
+        let configs = [
+            (150, 40, 1.0, Par::Seq),
+            (600, 120, 1e3, Par::Seq),
+            // nfs >= 4096: the parallel L·D product
+            (4600, 300, 1e3, Par::rayon(4)),
+        ];
+        for (ci, &(m, k, scale, par)) in configs.iter().enumerate() {
+            let mut a = deterministic_indefinite_matrix(m, 3 + ci as u64, 1.0);
+            if scale != 1.0 {
+                cause_delays(&mut a, 5 + ci as u64, scale);
+            }
+            let opts = AptpOptions {
+                par,
+                ..AptpOptions::default()
+            };
+            let mut front = zeros_padded::<f64>(m, m);
+            front.copy_from(&a);
+            let result = aptp_factor_in_place(front.as_mut(), k, &opts).unwrap();
+            let ne = result.num_eliminated;
+            let nfs = m - k;
+
+            let mut expect = Mat::<f64>::zeros(nfs, nfs);
+            let mut ld = Mat::<f64>::new();
+            compute_contribution_gemm(&front, k, ne, m, &result.d, &mut expect, &mut ld, Par::Seq);
+
+            let mut ld = Mat::<f64>::new();
+            compute_contribution_gemm_in_place(&mut front, k, ne, m, &result.d, &mut ld, par);
+            let tol = 1e-12 * expect.norm_max().max(1.0);
+            for j in 0..nfs {
+                for i in j..nfs {
+                    let (v, e) = (front[(k + i, k + j)], expect[(i, j)]);
+                    assert!((v - e).abs() <= tol, "config {ci}: ({i}, {j}) {v} vs {e}");
+                }
+            }
+            if scale != 1.0 {
+                assert!(ne < k, "config {ci}: expected delays");
+            }
+        }
+    }
+
     #[test]
     fn test_two_level_nfs_boundary_mid_block() {
         // Exercises the local nfs_boundary = p - col_start computation in
