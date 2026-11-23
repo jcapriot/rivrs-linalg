@@ -44,7 +44,7 @@ use faer::{Accum, Conj, Mat, MatMut, MatRef, Par};
 use super::diagonal::{MixedDiagonal, PivotEntry};
 use super::factor::{
     AptpFactorResult, AptpOptions, advise_huge_pages, aptp_factor_in_place,
-    compute_contribution_gemm_in_place, compute_contribution_gemm_rect, extract_contribution_rect,
+    compute_contribution_gemm_blocked, compute_contribution_gemm_rect, extract_contribution_rect,
     extract_front_factors_rect, padded_rows, tpp_factor_rect, unpivoted_factor_in_place,
     zeros_padded,
 };
@@ -80,7 +80,9 @@ const NOT_IN_FRONT: usize = usize::MAX;
 /// - Duff, Hogg & Lopez (2020), Section 5: workspace reuse strategy
 /// - Liu (1992), Section 4: multifrontal workspace management
 pub(crate) struct FactorizationWorkspace<T: Scalar = f64> {
-    /// Dense buffer, max_front × max_front. Reused as each supernode's frontal matrix.
+    /// Dense buffer for the fully-summed columns of each front (`m × k`),
+    /// sized max_front × max fully-summed columns and grown on demand. The
+    /// NFS×NFS block of a front lives in its own contribution-block panels.
     frontal_data: Mat<T>,
     /// Buffer for frontal matrix row indices, capacity max_front.
     frontal_row_indices: Vec<usize>,
@@ -88,7 +90,7 @@ pub(crate) struct FactorizationWorkspace<T: Scalar = f64> {
     delayed_cols_buf: Vec<usize>,
     /// Global-to-local row index mapping, length n (matrix dimension).
     global_to_local: Vec<usize>,
-    /// Pre-allocated L·D product workspace for `compute_contribution_gemm_in_place`.
+    /// Pre-allocated L·D product workspace for `compute_contribution_gemm_blocked`.
     /// Sized nfs × ne (grows on demand). Eliminates per-supernode allocation
     /// in the hot loop.
     ld_workspace: Mat<T>,
@@ -106,8 +108,9 @@ impl<T: Scalar> FactorizationWorkspace<T> {
     /// # Arguments
     ///
     /// - `max_front`: Maximum frontal matrix dimension across all supernodes
+    /// - `max_fs`: Maximum number of fully-summed columns (before delays)
     /// - `n`: Matrix dimension (for global-to-local mapping)
-    pub(crate) fn new(max_front: usize, n: usize) -> Self {
+    pub(crate) fn new(max_front: usize, max_fs: usize, n: usize) -> Self {
         if max_front == 0 {
             return Self {
                 frontal_data: Mat::<T>::zeros(0, 0),
@@ -118,7 +121,7 @@ impl<T: Scalar> FactorizationWorkspace<T> {
             };
         }
         Self {
-            frontal_data: zeros_padded(max_front, max_front),
+            frontal_data: zeros_padded(max_front, max_fs),
             frontal_row_indices: Vec::with_capacity(max_front),
             delayed_cols_buf: Vec::with_capacity(max_front),
             global_to_local: vec![NOT_IN_FRONT; n],
@@ -460,9 +463,45 @@ pub(crate) struct FrontalMatrix<'a, T: Scalar = f64> {
     pub num_fully_summed: usize,
 }
 
+/// Destination of extend-add: accumulates into lower-triangle entry
+/// `(r, c)`, `r >= c`, of a front.
+pub(crate) trait AssemblyTarget<T> {
+    fn add_lower(&mut self, r: usize, c: usize, v: T);
+}
+
+impl<T: Scalar> AssemblyTarget<T> for FrontalMatrix<'_, T> {
+    #[inline(always)]
+    fn add_lower(&mut self, r: usize, c: usize, v: T) {
+        self.data[(r, c)] += v;
+    }
+}
+
+/// A front stored as its `m × k` fully-summed columns plus its NFS×NFS
+/// block in separate [`BlockedLower`] panels, which after the contribution
+/// GEMM becomes the contribution block without a copy.
+pub(crate) struct SplitFront<'a, T: Scalar> {
+    /// Fully-summed columns `0..k` (all `m` rows).
+    pub fs: MatMut<'a, T>,
+    /// NFS×NFS block: front entry `(r, c)`, `r >= c >= k`, is entry
+    /// `(r - k, c - k)` here. Dimension 0 when `k == m`.
+    pub nfs: &'a mut BlockedLower<T>,
+}
+
+impl<T: Scalar> AssemblyTarget<T> for SplitFront<'_, T> {
+    #[inline(always)]
+    fn add_lower(&mut self, r: usize, c: usize, v: T) {
+        let k = self.fs.ncols();
+        if c < k {
+            self.fs[(r, c)] += v;
+        } else {
+            self.nfs.col_mut(c - k)[r - c] += v;
+        }
+    }
+}
+
 /// Schur complement and delayed columns from a factored supernode.
 ///
-/// Created by [`extract_contribution`] and consumed by [`extend_add`] into
+/// Created by the factorization of a front and consumed by [`extend_add`] into
 /// the parent supernode's frontal matrix.
 ///
 /// # Structure
@@ -471,42 +510,12 @@ pub(crate) struct FrontalMatrix<'a, T: Scalar = f64> {
 /// - Positions `num_delayed..size`: non-fully-summed rows with Schur complement
 pub(crate) struct ContributionBlock<T: Scalar = f64> {
     /// Lower triangle of the (m - ne) × (m - ne) trailing submatrix of the
-    /// factored frontal matrix, packed and exactly sized.
-    pub data: PackedLower<T>,
+    /// factored frontal matrix, in column panels.
+    pub data: BlockedLower<T>,
     /// Global permuted column indices for rows/columns of the contribution.
     pub row_indices: Vec<usize>,
     /// Number of delayed columns at the start of this block.
     pub num_delayed: usize,
-}
-
-/// Fill packed columns `j0..j1` (whose storage is exactly `data`) of an
-/// `n × n` [`PackedLower`], splitting columns across threads.
-fn fill_packed_cols<'a, T: Scalar + 'a>(
-    data: &mut [core::mem::MaybeUninit<T>],
-    n: usize,
-    j0: usize,
-    j1: usize,
-    col: &(impl Fn(usize) -> &'a [T] + Sync),
-    par: Par,
-) {
-    let offset = |j: usize| j * n - j * j.saturating_sub(1) / 2;
-    if copy_par_split(par, j1 - j0, data.len()) {
-        let mid = (j0 + j1) / 2;
-        let (left, right) = data.split_at_mut(offset(mid) - offset(j0));
-        rayon::join(
-            || fill_packed_cols(left, n, j0, mid, col, par),
-            || fill_packed_cols(right, n, mid, j1, col, par),
-        );
-        return;
-    }
-    let mut pos = 0;
-    for j in j0..j1 {
-        let c = col(j);
-        assert_eq!(c.len(), n - j, "PackedLower column {j} has wrong length");
-        write_slice(&mut data[pos..pos + c.len()], c);
-        pos += c.len();
-    }
-    assert_eq!(pos, data.len(), "packed columns do not fill their storage");
 }
 
 /// Initialize `dst` with a copy of `src` (equal lengths).
@@ -604,7 +613,7 @@ impl<T: Scalar> ContributionBlock<T> {
     ) -> Self {
         let n = row_indices.len();
         Self {
-            data: PackedLower::from_columns(n, |j| &dense.col_as_slice(j)[j..n]),
+            data: BlockedLower::from_columns(n, |j| &dense.col_as_slice(j)[j..n]),
             row_indices,
             num_delayed,
         }
@@ -854,46 +863,90 @@ fn sub_at_b<T: Scalar>(mut c: MatMut<'_, T>, a: MatRef<'_, T>, b: MatRef<'_, T>,
     }
 }
 
-/// Lower triangle (diagonal included) of a symmetric `n × n` matrix, packed
-/// column by column: column `j` holds rows `j..n` contiguously, so the block
-/// uses `n(n+1)/2` entries — half a dense square — and is allocated exactly.
+/// Panel width of a [`BlockedLower`] contribution block of dimension `n`
+/// built and updated with parallelism `par`. Always a power of two. Fronts
+/// pass their parallelism through [`cb_par`].
+///
+/// Rectangular panels waste the upper triangle of their diagonal blocks,
+/// about `w/n` of the packed size, so the width scales with `n`:
+///
+/// - Sequential fronts: `n/16` within `32..=256`. On one core, faer's complex
+///   GEMM into 256-wide panels matched a single square buffer for 200-2000
+///   rows.
+/// - Fronts with intra-node parallelism: `n/8` within `512..=1024`. With all
+///   threads on one panel at a time, 512-wide panels were within 2-3% of a
+///   square buffer at 4000 rows, and 1024-wide panels matched it at
+///   8000-12000 rows, while 256-wide panels were 5-10% slower.
+pub(crate) fn contrib_panel_width(n: usize, par: Par) -> usize {
+    if par.degree() > 1 {
+        (n / 8).next_power_of_two().clamp(512, 1024)
+    } else {
+        (n / 16).next_power_of_two().clamp(32, 256)
+    }
+}
+
+/// Front size from which the contribution block is built and updated with
+/// the front's own parallelism. Fronts of this size (the default
+/// `l0_max_front`) are factored one at a time with all threads on their
+/// contribution GEMM, which needs the wide panels of
+/// [`contrib_panel_width`] (narrow ones cost 5-10%). Smaller fronts run
+/// concurrently in the parallel subtrees, one per thread: splitting each
+/// panel's GEMM across threads there only adds overhead, and wide panels
+/// would waste up to half of a small block.
+const CB_WIDE_PANEL_MIN_FRONT: usize = 4096;
+
+/// Parallelism for the contribution block of an `m`-row front factored with
+/// `par`: its panel width, its fill and its contribution GEMM.
+fn cb_par(m: usize, par: Par) -> Par {
+    if m >= CB_WIDE_PANEL_MIN_FRONT {
+        par
+    } else {
+        Par::Seq
+    }
+}
+
+/// Lower triangle (diagonal included) of a symmetric `n × n` matrix, stored
+/// as column panels: the panel starting at column `j0` holds rows `j0..n` of
+/// columns `j0..j0 + w` as a dense column-major matrix with the padded stride
+/// of [`zeros_padded`]. Column `j` therefore has rows `j..n` contiguously,
+/// and each panel is a valid GEMM destination. All panels share one
+/// allocation, so large blocks get huge pages.
 ///
 /// Used for contribution blocks, which wait in memory until their parent is
 /// assembled and only ever need their lower triangle (column-oriented
-/// extend-add reads exactly these slices).
+/// extend-add reads exactly these slices). Only the upper triangle of each
+/// diagonal block is wasted, about `n·w/2` entries for panel width `w`.
 ///
 /// # References
 ///
 /// - Anderson et al., LAPACK Users' Guide (1999), Section 5.3.2: packed
 ///   storage for symmetric matrices (`UPLO = 'L'`)
-#[derive(Debug, Clone, Default)]
-pub(crate) struct PackedLower<T> {
+/// - Gustavson, Karlsson & Kågström (2009): blocked packed formats, trading
+///   a block of waste for dense kernels
+#[derive(Debug, Clone)]
+pub(crate) struct BlockedLower<T> {
     n: usize,
+    /// log2 of the panel width.
+    shift: u32,
+    /// Start of each panel in `data`.
+    offsets: Vec<usize>,
+    /// Column stride of each panel.
+    strides: Vec<usize>,
     data: Vec<T>,
 }
 
-impl<T: Scalar> PackedLower<T> {
-    /// Build from per-column slices; `col(j)` must return rows `j..n` of
-    /// column `j` (length `n - j`).
-    pub(crate) fn from_columns<'a>(n: usize, mut col: impl FnMut(usize) -> &'a [T]) -> Self
+impl<T: Scalar> BlockedLower<T> {
+    /// Build from per-column slices with the sequential panel width;
+    /// `col(j)` must return rows `j..n` of column `j` (length `n - j`).
+    pub(crate) fn from_columns<'a>(n: usize, col: impl Fn(usize) -> &'a [T] + Sync) -> Self
     where
         T: 'a,
     {
-        let mut data = Vec::<T>::with_capacity(n * (n + 1) / 2);
-        advise_huge_pages(
-            data.as_ptr().cast(),
-            data.capacity() * core::mem::size_of::<T>(),
-        );
-        for j in 0..n {
-            let c = col(j);
-            debug_assert_eq!(c.len(), n - j, "PackedLower column {j} has wrong length");
-            data.extend_from_slice(c);
-        }
-        Self { n, data }
+        Self::from_columns_par(n, &col, Par::Seq)
     }
 
-    /// Like [`from_columns`](Self::from_columns), filling columns in parallel
-    /// for large blocks.
+    /// Like [`from_columns`](Self::from_columns), with the panel width for
+    /// `par` and the columns of large panels filled in parallel.
     pub(crate) fn from_columns_par<'a>(
         n: usize,
         col: &(impl Fn(usize) -> &'a [T] + Sync),
@@ -902,39 +955,142 @@ impl<T: Scalar> PackedLower<T> {
     where
         T: 'a,
     {
-        let total = n * (n + 1) / 2;
-        if !copy_par_split(par, n, total) {
-            return Self::from_columns(n, col);
+        Self::build(n, contrib_panel_width(n, par), par, &|j, jj, dst| {
+            let c = col(j);
+            assert_eq!(c.len(), n - j, "BlockedLower column {j} has wrong length");
+            let (above, rest) = dst.split_at_mut(jj);
+            let (body, pad) = rest.split_at_mut(c.len());
+            write_fill(above, T::zero());
+            write_slice(body, c);
+            write_fill(pad, T::zero());
+        })
+    }
+
+    /// Zeroed block with panel width `width` (a power of two), then
+    /// `f(j, rows j..n of column j)` for every column while it is in cache.
+    /// Columns of large panels are processed in parallel.
+    pub(crate) fn zeroed_with(
+        n: usize,
+        width: usize,
+        par: Par,
+        f: &(impl Fn(usize, &mut [T]) + Sync),
+    ) -> Self {
+        Self::build(n, width, par, &|j, jj, dst| {
+            write_fill(dst, T::zero());
+            // SAFETY: every entry of `dst` was initialized just above.
+            let col = unsafe { &mut *(dst as *mut [core::mem::MaybeUninit<T>] as *mut [T]) };
+            f(j, &mut col[jj..jj + (n - j)]);
+        })
+    }
+
+    /// Allocate the panels of an `n × n` block with panel width `width` and
+    /// have `init(j, jj, storage)` initialize column `j` (column `jj` of its
+    /// panel), all `stride` entries of it, padding included.
+    fn build(
+        n: usize,
+        width: usize,
+        par: Par,
+        init: &(impl Fn(usize, usize, &mut [core::mem::MaybeUninit<T>]) + Sync),
+    ) -> Self {
+        debug_assert!(width.is_power_of_two());
+        let starts: Vec<usize> = (0..n).step_by(width).collect();
+        let strides: Vec<usize> = starts.iter().map(|&j0| padded_rows::<T>(n - j0)).collect();
+        let mut offsets = Vec::with_capacity(starts.len());
+        let mut total = 0;
+        for (&j0, &stride) in starts.iter().zip(&strides) {
+            offsets.push(total);
+            total += stride * width.min(n - j0);
         }
+
         let mut data = Vec::<T>::with_capacity(total);
         advise_huge_pages(
             data.as_ptr().cast(),
             data.capacity() * core::mem::size_of::<T>(),
         );
-        fill_packed_cols(&mut data.spare_capacity_mut()[..total], n, 0, n, col, par);
-        // SAFETY: fill_packed_cols wrote all `total` entries (the packed
-        // columns 0..n tile exactly 0..total).
+        let base = data.as_mut_ptr();
+        for ((&j0, &stride), &off) in starts.iter().zip(&strides).zip(&offsets) {
+            // SAFETY: the panel's columns lie inside `data`'s capacity at
+            // `off`, and panels do not overlap.
+            let panel = ColsPtr(unsafe { base.add(off) });
+            let ncols = width.min(n - j0);
+            fill_cols_uninit(panel, stride, stride, 0, ncols, par, &|jj, dst| {
+                init(j0 + jj, jj, dst)
+            });
+        }
+        // SAFETY: every panel column, padding included, was initialized by
+        // `init`, and the panels tile `0..total`.
         unsafe { data.set_len(total) };
-        Self { n, data }
+        Self {
+            n,
+            shift: width.trailing_zeros(),
+            offsets,
+            strides,
+            data,
+        }
     }
 
-    /// Offset of column `j`: sum of the lengths of columns `0..j`.
+    /// The `0 × 0` block.
+    pub(crate) fn empty() -> Self {
+        Self {
+            n: 0,
+            shift: 0,
+            offsets: Vec::new(),
+            strides: Vec::new(),
+            data: Vec::new(),
+        }
+    }
+
+    /// Number of column panels.
+    pub(crate) fn num_panels(&self) -> usize {
+        self.offsets.len()
+    }
+
+    /// Panel `p` as a dense matrix: rows `j0..n` of columns `j0..j0 + w`,
+    /// returned with its first column `j0`. Entries above the diagonal of
+    /// its top `w × w` block are not part of the lower triangle.
+    pub(crate) fn panel_mut(&mut self, p: usize) -> (usize, MatMut<'_, T>) {
+        let j0 = p << self.shift;
+        let ncols = (1usize << self.shift).min(self.n - j0);
+        let nrows = self.n - j0;
+        let stride = self.strides[p];
+        let start = self.offsets[p];
+        assert!(start + stride * ncols <= self.data.len());
+        // SAFETY: the panel's `ncols` columns of `stride` entries lie inside
+        // `data` (checked above), and the view borrows `self` mutably.
+        let mat = unsafe {
+            MatMut::from_raw_parts_mut(
+                self.data.as_mut_ptr().add(start),
+                nrows,
+                ncols,
+                1,
+                stride as isize,
+            )
+        };
+        (j0, mat)
+    }
+
+    /// Rows `j..n` of column `j`, mutably.
     #[inline(always)]
-    fn col_start(&self, j: usize) -> usize {
-        j * self.n - j * j.saturating_sub(1) / 2
+    pub(crate) fn col_mut(&mut self, j: usize) -> &mut [T] {
+        let p = j >> self.shift;
+        let jj = j & ((1 << self.shift) - 1);
+        let start = self.offsets[p] + jj * self.strides[p] + jj;
+        &mut self.data[start..start + (self.n - j)]
     }
 
     /// Rows `j..n` of column `j`.
     #[inline(always)]
     pub(crate) fn col(&self, j: usize) -> &[T] {
-        let start = self.col_start(j);
+        let p = j >> self.shift;
+        let jj = j & ((1 << self.shift) - 1);
+        let start = self.offsets[p] + jj * self.strides[p] + jj;
         &self.data[start..start + (self.n - j)]
     }
 
     /// Entry `(i, j)` with `i >= j`.
     #[inline(always)]
     pub(crate) fn get(&self, i: usize, j: usize) -> T {
-        debug_assert!(i >= j, "PackedLower::get({i}, {j}) above the diagonal");
+        debug_assert!(i >= j, "BlockedLower::get({i}, {j}) above the diagonal");
         self.col(j)[i - j]
     }
 
@@ -944,7 +1100,7 @@ impl<T: Scalar> PackedLower<T> {
         self.n
     }
 
-    /// Entries allocated (for memory accounting).
+    /// Entries allocated, padding included (for memory accounting).
     #[allow(dead_code)]
     pub(crate) fn allocated(&self) -> usize {
         self.data.capacity()
@@ -1645,22 +1801,26 @@ impl<T: Scalar> AptpNumeric<T> {
             let ne = result.num_eliminated;
 
             if sn.parent.is_some() && ne < m {
+                let mut nfs_block = BlockedLower::from_columns(m - k, |j| {
+                    &frontal_data.col_as_slice(k + j)[k + j..m]
+                });
                 let mut ld_ws = Mat::<T>::new();
-                compute_contribution_gemm_in_place(
-                    &mut frontal_data,
+                compute_contribution_gemm_blocked(
+                    frontal_data.as_ref(),
                     k,
                     ne,
-                    m,
                     &result.d,
+                    &mut nfs_block,
                     &mut ld_ws,
                     Par::Seq,
                 );
-                contributions[s] = Some(extract_contribution(
+                contributions[s] = Some(extract_contribution_split(
                     &frontal_data,
                     m,
                     k,
                     &frontal_rows,
                     &result,
+                    &nfs_block,
                     Par::Seq,
                 ));
             }
@@ -1743,8 +1903,11 @@ fn factor_single_supernode<T: Scalar>(
 
     // 3. Ensure workspace capacity and zero frontal data for this supernode
     // If delayed columns make this front larger than estimated, grow the workspace
-    if m > workspace.frontal_data.nrows() {
-        workspace.frontal_data = zeros_padded(m, m);
+    if m > workspace.frontal_data.nrows() || k > workspace.frontal_data.ncols() {
+        workspace.frontal_data = zeros_padded(
+            m.max(workspace.frontal_data.nrows()),
+            k.max(workspace.frontal_data.ncols()),
+        );
     }
 
     // Children assembled in the same pass as the zeroing: no delays on either
@@ -1771,19 +1934,32 @@ fn factor_single_supernode<T: Scalar>(
     #[cfg(feature = "diagnostic")]
     let zero_start = std::time::Instant::now();
 
-    {
-        let children: Vec<(&PackedLower<T>, &[u32])> = child_contributions
+    // The front is stored split: fully-summed columns 0..k in the workspace
+    // (m × k), and the NFS×NFS block in its own panels, which become the
+    // contribution block after the contribution GEMM (no copy). The kernel
+    // never touches the NFS×NFS block.
+    let nfs = m - k;
+    let mut nfs_block = {
+        let children: Vec<(&BlockedLower<T>, &[u32])> = child_contributions
             .iter()
             .enumerate()
             .filter(|&(i, _)| fused[i])
             .filter_map(|(i, opt_cb)| opt_cb.as_ref().map(|cb| (&cb.data, child_map(i, cb))))
             .collect();
         zero_and_extend_add(
-            workspace.frontal_data.as_mut().submatrix_mut(0, 0, m, m),
+            workspace.frontal_data.as_mut().submatrix_mut(0, 0, m, k),
             &children,
             effective_par,
         );
-    }
+        if nfs > 0 {
+            let par = cb_par(m, effective_par);
+            BlockedLower::zeroed_with(nfs, contrib_panel_width(nfs, par), par, &|jc, col| {
+                add_children_col(k + jc, col, &children)
+            })
+        } else {
+            BlockedLower::empty()
+        }
+    };
 
     // With the diagnostic feature, `zero_time` includes the extend-add of the
     // children assembled in the zeroing pass.
@@ -1807,82 +1983,94 @@ fn factor_single_supernode<T: Scalar>(
 
     let ndelay_in = workspace.delayed_cols_buf.len();
 
-    let mut frontal = FrontalMatrix {
-        data: workspace.frontal_data.as_mut().submatrix_mut(0, 0, m, m),
-        row_indices: &workspace.frontal_row_indices,
-        num_fully_summed: k,
-    };
-
-    // 5a. Scatter original CSC entries
+    // 5a. Scatter original CSC entries. They lie in the supernode's own
+    //     columns (< k), so only the fully-summed columns are touched.
     #[cfg(feature = "diagnostic")]
     let scatter_start = std::time::Instant::now();
 
-    // Use precomputed amap when no delays shift row positions
-    if ndelay_in == 0 {
-        // Fast path: scatter using precomputed index tuples (4 u32 per entry)
-        let amap_start = assembly_maps.amap_offsets[s];
-        let amap_end = assembly_maps.amap_offsets[s + 1];
-        let values = matrix.val();
-        let amap = &assembly_maps.amap_entries[amap_start * 4..amap_end * 4];
+    {
+        let mut fs = workspace.frontal_data.as_mut().submatrix_mut(0, 0, m, k);
+        // Use precomputed amap when no delays shift row positions
+        if ndelay_in == 0 {
+            // Fast path: scatter using precomputed index tuples (4 u32 per entry)
+            let amap_start = assembly_maps.amap_offsets[s];
+            let amap_end = assembly_maps.amap_offsets[s + 1];
+            let values = matrix.val();
+            let amap = &assembly_maps.amap_entries[amap_start * 4..amap_end * 4];
 
-        if let Some(sc) = scaling {
-            for entry in amap.chunks_exact(4) {
-                let src_idx = entry[0] as usize;
-                let dest_linear = entry[1] as usize;
-                let scale_row = entry[2] as usize;
-                let scale_col = entry[3] as usize;
-                let val = values[src_idx] * T::from_f64(sc[scale_row] * sc[scale_col]);
-                let dest_col = dest_linear / m;
-                let dest_row = dest_linear % m;
-                frontal.data[(dest_row, dest_col)] += val;
+            if let Some(sc) = scaling {
+                for entry in amap.chunks_exact(4) {
+                    let src_idx = entry[0] as usize;
+                    let dest_linear = entry[1] as usize;
+                    let scale_row = entry[2] as usize;
+                    let scale_col = entry[3] as usize;
+                    let val = values[src_idx] * T::from_f64(sc[scale_row] * sc[scale_col]);
+                    let dest_col = dest_linear / m;
+                    let dest_row = dest_linear % m;
+                    fs[(dest_row, dest_col)] += val;
+                }
+            } else {
+                for entry in amap.chunks_exact(4) {
+                    let src_idx = entry[0] as usize;
+                    let dest_linear = entry[1] as usize;
+                    let dest_col = dest_linear / m;
+                    let dest_row = dest_linear % m;
+                    fs[(dest_row, dest_col)] += values[src_idx];
+                }
             }
         } else {
-            for entry in amap.chunks_exact(4) {
-                let src_idx = entry[0] as usize;
-                let dest_linear = entry[1] as usize;
-                let dest_col = dest_linear / m;
-                let dest_row = dest_linear % m;
-                frontal.data[(dest_row, dest_col)] += values[src_idx];
-            }
+            // Fallback: delayed columns shift positions, use per-entry assembly
+            let mut frontal = FrontalMatrix {
+                data: fs,
+                row_indices: &workspace.frontal_row_indices,
+                num_fully_summed: k,
+            };
+            scatter_original_entries_multi(
+                &mut frontal,
+                matrix,
+                perm_fwd,
+                perm_inv,
+                &workspace.global_to_local,
+                &sn.owned_ranges,
+                scaling,
+            );
         }
-    } else {
-        // Fallback: delayed columns shift positions, use per-entry assembly
-        scatter_original_entries_multi(
-            &mut frontal,
-            matrix,
-            perm_fwd,
-            perm_inv,
-            &workspace.global_to_local,
-            &sn.owned_ranges,
-            scaling,
-        );
     }
 
     #[cfg(feature = "diagnostic")]
     let scatter_time = scatter_start.elapsed();
 
-    // 5b. Extend-add: merge child contributions into parent frontal matrix
+    // 5b. Extend-add the children not assembled in the zeroing pass
     #[cfg(feature = "diagnostic")]
     let ea_start_time = std::time::Instant::now();
 
-    let mut ea_child_idx = ea_children_begin;
-
-    for (opt_cb, done) in child_contributions.into_iter().zip(fused) {
-        if let Some(cb) = opt_cb.filter(|_| !done) {
-            // Check if this child had delays — if so, fall back to g2l
-            if cb.num_delayed > 0 || ndelay_in > 0 {
-                extend_add(&mut frontal, cb, &workspace.global_to_local);
-            } else {
-                // Fast path: use precomputed row mapping
-                let ea_start = assembly_maps.ea_offsets[ea_child_idx];
-                let ea_end = assembly_maps.ea_offsets[ea_child_idx + 1];
-                let ea_row_map = &assembly_maps.ea_map[ea_start..ea_end];
-                extend_add_mapped(&mut frontal, cb, ea_row_map, effective_par);
+    {
+        let mut target = SplitFront {
+            fs: workspace.frontal_data.as_mut().submatrix_mut(0, 0, m, k),
+            nfs: &mut nfs_block,
+        };
+        let mut ea_child_idx = ea_children_begin;
+        for (opt_cb, done) in child_contributions.into_iter().zip(fused) {
+            if let Some(cb) = opt_cb.filter(|_| !done) {
+                // Check if this child had delays — if so, fall back to g2l
+                if cb.num_delayed > 0 || ndelay_in > 0 {
+                    extend_add(&mut target, cb, &workspace.global_to_local);
+                } else {
+                    // Fast path: use precomputed row mapping
+                    let ea_start = assembly_maps.ea_offsets[ea_child_idx];
+                    let ea_end = assembly_maps.ea_offsets[ea_child_idx + 1];
+                    let ea_row_map = &assembly_maps.ea_map[ea_start..ea_end];
+                    extend_add_mapped_seq(
+                        &mut target,
+                        &cb.data,
+                        &ea_row_map[..cb.row_indices.len()],
+                    );
+                }
             }
+            // Always increment: ea_offsets indexes all children, including those
+            // with no contribution (fully eliminated, ne == m).
+            ea_child_idx += 1;
         }
-        // Always increment: ea_offsets indexes all children, including those
-        // with no contribution (fully eliminated, ne == m).
-        ea_child_idx += 1;
     }
 
     #[cfg(feature = "diagnostic")]
@@ -1891,7 +2079,7 @@ fn factor_single_supernode<T: Scalar>(
     #[cfg(feature = "diagnostic")]
     let assembly_time = assembly_start.elapsed();
 
-    // 6. Factor the frontal matrix
+    // 6. Factor the fully-summed columns
     #[cfg(feature = "diagnostic")]
     let kernel_start = std::time::Instant::now();
 
@@ -1900,7 +2088,7 @@ fn factor_single_supernode<T: Scalar>(
         ..options.clone()
     };
     let result = aptp_factor_in_place(
-        workspace.frontal_data.as_mut().submatrix_mut(0, 0, m, m),
+        workspace.frontal_data.as_mut().submatrix_mut(0, 0, m, k),
         k,
         &per_sn_options,
     )?;
@@ -1909,35 +2097,32 @@ fn factor_single_supernode<T: Scalar>(
     #[cfg(feature = "diagnostic")]
     let kernel_time = kernel_start.elapsed();
 
-    // 6b. Deferred contribution GEMM: apply the NFS×NFS Schur complement update
-    //     in place in the front. This replaces the per-block NFS×NFS updates
-    //     that were skipped during the blocking loop.
+    // 6b. Deferred contribution GEMM: apply the NFS×NFS Schur complement
+    //     update to the NFS×NFS panels.
     #[cfg(feature = "diagnostic")]
     let contrib_gemm_start = std::time::Instant::now();
 
-    let nfs = m - k;
-    if sn.parent.is_some() && ne < m && nfs > 0 {
-        compute_contribution_gemm_in_place(
-            &mut workspace.frontal_data,
+    if sn.parent.is_some() && nfs > 0 {
+        compute_contribution_gemm_blocked(
+            workspace.frontal_data.as_ref().submatrix(0, 0, m, k),
             k,
             ne,
-            m,
             &result.d,
+            &mut nfs_block,
             &mut workspace.ld_workspace,
-            effective_par,
+            cb_par(m, effective_par),
         );
     }
 
     #[cfg(feature = "diagnostic")]
     let contrib_gemm_time = contrib_gemm_start.elapsed();
 
-    // 7. Extract front factors (reads from workspace frontal data)
+    // 7. Extract front factors (reads columns 0..ne of the workspace)
     #[cfg(feature = "diagnostic")]
     let extraction_start = std::time::Instant::now();
     #[cfg(feature = "diagnostic")]
     let extract_factors_start = std::time::Instant::now();
 
-    // Use owned Mat<f64> directly for col_as_slice-based bulk extraction
     let ff = extract_front_factors(
         &workspace.frontal_data,
         m,
@@ -1950,21 +2135,30 @@ fn factor_single_supernode<T: Scalar>(
     #[cfg(feature = "diagnostic")]
     let extract_factors_time = extract_factors_start.elapsed();
 
-    // 8. Prepare contribution for parent (if not root and not fully eliminated)
-    //    Delayed and updated NFS columns are all in workspace.frontal_data;
-    //    pack their lower triangle into an exactly sized block.
+    // 8. Contribution for the parent (if not root and not fully eliminated).
+    //    Without delayed columns it is the NFS×NFS block itself; delayed
+    //    columns are prepended by copying.
     #[cfg(feature = "diagnostic")]
     let extract_contrib_start = std::time::Instant::now();
 
     let contribution = if sn.parent.is_some() && ne < m {
-        Some(extract_contribution(
-            &workspace.frontal_data,
-            m,
-            k,
-            &workspace.frontal_row_indices,
-            &result,
-            effective_par,
-        ))
+        Some(if ne == k {
+            ContributionBlock {
+                data: nfs_block,
+                row_indices: workspace.frontal_row_indices[k..m].to_vec(),
+                num_delayed: 0,
+            }
+        } else {
+            extract_contribution_split(
+                &workspace.frontal_data,
+                m,
+                k,
+                &workspace.frontal_row_indices,
+                &result,
+                &nfs_block,
+                cb_par(m, effective_par),
+            )
+        })
     } else {
         None
     };
@@ -2664,12 +2858,11 @@ fn factor_tree<T: Scalar>(
         .filter(|&s| supernodes[s].parent.is_none())
         .collect();
     let order = dfs_postorder(&roots, &visit, |s| !is_layer_root[s]);
-    let max_front = order
+    let (max_fs, max_front) = order
         .iter()
-        .map(|&s| front_dims(&supernodes[s]).1)
-        .max()
-        .unwrap_or(0);
-    let mut ws = FactorizationWorkspace::new(max_front, n);
+        .map(|&s| front_dims(&supernodes[s]))
+        .fold((0, 0), |(a, b), (k, m)| (a.max(k), b.max(m)));
+    let mut ws = FactorizationWorkspace::new(max_front, max_fs, n);
     all_results.extend(factor_in_order(&ctx, &order, &mut ws, &mut pending)?);
 
     #[cfg(feature = "diagnostic")]
@@ -3270,7 +3463,7 @@ fn scatter_original_entries_multi<T: Scalar>(
 ///
 /// - Liu (1992), Section 4.2: extend-add operator
 pub(crate) fn extend_add<T: Scalar>(
-    parent: &mut FrontalMatrix<'_, T>,
+    parent: &mut impl AssemblyTarget<T>,
     child: ContributionBlock<T>,
     global_to_local: &[usize],
 ) {
@@ -3300,59 +3493,24 @@ pub(crate) fn extend_add<T: Scalar>(
                 );
                 // Map to parent: ensure lower triangle (li >= lj)
                 if li >= lj {
-                    parent.data[(li, lj)] += val;
+                    parent.add_lower(li, lj, val);
                 } else {
-                    parent.data[(lj, li)] += val;
+                    parent.add_lower(lj, li, val);
                 }
             }
         }
     }
 }
 
-/// Extend-add using a precomputed child→parent row mapping.
-///
-/// Used when the child had zero delayed columns, so the contribution block
-/// rows correspond exactly to the child's symbolic pattern and the precomputed
-/// `ea_row_map` provides direct local index lookup without `global_to_local`.
-///
-/// Uses column-oriented processing: for each child
-/// column `j`, scatters the lower-triangle entries `(j..cb_size, j)` into
-/// the parent. Source reads are contiguous in column-major layout.
-///
-/// # References
-///
-/// - SPRAL `assemble.hxx:27-38` — `asm_col` column-oriented scatter (BSD-3)
-///
-/// # Arguments
-///
-/// - `parent`: Parent frontal matrix to accumulate into (lower triangle).
-/// - `child`: Child contribution block.
-/// - `ea_row_map`: Precomputed mapping from child contribution row index to
-///   parent frontal local row index. Length equals the child's pattern size.
-fn extend_add_mapped<T: Scalar>(
-    parent: &mut FrontalMatrix<'_, T>,
-    child: ContributionBlock<T>,
+/// Sequential column-oriented extend-add of `child` through `ea_row_map`
+/// (child row -> parent local row), with the symmetry swap for a
+/// non-monotonic map.
+fn extend_add_mapped_seq<T: Scalar>(
+    parent: &mut impl AssemblyTarget<T>,
+    child: &BlockedLower<T>,
     ea_row_map: &[u32],
-    par: Par,
 ) {
-    let cb_size = child.row_indices.len();
-    debug_assert!(
-        ea_row_map.len() >= cb_size,
-        "extend_add_mapped: ea_row_map len {} < cb_size {}",
-        ea_row_map.len(),
-        cb_size
-    );
-
-    // Parallel path: when the child→parent row map is strictly increasing
-    // (the usual case), child column j writes only to parent column map[j]
-    // and only at rows map[j..] >= map[j], so contiguous ranges of child
-    // columns write to disjoint ranges of parent columns.
-    let map = &ea_row_map[..cb_size];
-    if copy_par_split(par, cb_size, cb_size * cb_size / 2) && map.windows(2).all(|w| w[0] < w[1]) {
-        extend_add_mapped_par(parent.data.as_mut(), 0, &child.data, map, 0, cb_size, par);
-        return;
-    }
-
+    let cb_size = ea_row_map.len();
     // Column-oriented scatter.
     // For each child column j, scatter lower-triangle entries (rows j..cb_size)
     // into the parent. Source reads via col_as_slice are contiguous in column-
@@ -3361,69 +3519,22 @@ fn extend_add_mapped<T: Scalar>(
     for j in 0..cb_size {
         let lj = ea_row_map[j] as usize;
         let row_map = &ea_row_map[j..cb_size];
-        let src = child.data.col(j);
+        let src = child.col(j);
 
         // 4× unrolled inner loop for ILP
         let n = cb_size - j;
         let n4 = n / 4 * 4;
         let mut k = 0;
         while k < n4 {
-            ea_scatter_one(&mut parent.data, row_map[k] as usize, lj, src[k]);
-            ea_scatter_one(&mut parent.data, row_map[k + 1] as usize, lj, src[k + 1]);
-            ea_scatter_one(&mut parent.data, row_map[k + 2] as usize, lj, src[k + 2]);
-            ea_scatter_one(&mut parent.data, row_map[k + 3] as usize, lj, src[k + 3]);
+            ea_scatter_one(parent, row_map[k] as usize, lj, src[k]);
+            ea_scatter_one(parent, row_map[k + 1] as usize, lj, src[k + 1]);
+            ea_scatter_one(parent, row_map[k + 2] as usize, lj, src[k + 2]);
+            ea_scatter_one(parent, row_map[k + 3] as usize, lj, src[k + 3]);
             k += 4;
         }
         while k < n {
-            ea_scatter_one(&mut parent.data, row_map[k] as usize, lj, src[k]);
+            ea_scatter_one(parent, row_map[k] as usize, lj, src[k]);
             k += 1;
-        }
-    }
-}
-
-/// Column-parallel extend-add for a strictly increasing row map.
-///
-/// `parent` views parent columns `pcol0..pcol0 + parent.ncols()` (all rows);
-/// child columns `j0..j1` are scattered into it. Splitting child columns at
-/// `mid` splits the parent at column `map[mid]`: every column before `mid`
-/// maps below it and every column from `mid` on maps at or above it.
-fn extend_add_mapped_par<T: Scalar>(
-    parent: MatMut<'_, T>,
-    pcol0: usize,
-    child: &PackedLower<T>,
-    map: &[u32],
-    j0: usize,
-    j1: usize,
-    par: Par,
-) {
-    let cb_size = map.len();
-    if copy_par_split(par, j1 - j0, (j1 - j0) * (cb_size - j0)) {
-        let mid = (j0 + j1) / 2;
-        let split = map[mid] as usize - pcol0;
-        let (left, right) = parent.split_at_col_mut(split);
-        rayon::join(
-            || extend_add_mapped_par(left, pcol0, child, map, j0, mid, par),
-            || extend_add_mapped_par(right, pcol0 + split, child, map, mid, j1, par),
-        );
-        return;
-    }
-    let mut parent = parent;
-    for j in j0..j1 {
-        let lj = map[j] as usize - pcol0;
-        let rows = &map[j..cb_size];
-        let src = child.col(j);
-        match parent.as_mut().col_mut(lj).try_as_col_major_mut() {
-            Some(col) => {
-                let col = col.as_slice_mut();
-                for (&li, &v) in rows.iter().zip(src) {
-                    col[li as usize] += v;
-                }
-            }
-            None => {
-                for (&li, &v) in rows.iter().zip(src) {
-                    parent[(li as usize, lj)] += v;
-                }
-            }
         }
     }
 }
@@ -3439,28 +3550,37 @@ fn extend_add_mapped_par<T: Scalar>(
 /// first; on the large fronts both steps are DRAM-bandwidth bound.
 fn zero_and_extend_add<T: Scalar>(
     front: MatMut<'_, T>,
-    children: &[(&PackedLower<T>, &[u32])],
+    children: &[(&BlockedLower<T>, &[u32])],
     par: Par,
 ) {
     for_each_col_mut(front, 0, par, &|c, col: &mut [T]| {
-        col[c..].fill(T::zero());
-        for &(cb, map) in children {
-            if let Ok(j) = map.binary_search(&(c as u32)) {
-                for (&li, &v) in map[j..].iter().zip(cb.col(j)) {
-                    col[li as usize] += v;
-                }
+        let col = &mut col[c..];
+        col.fill(T::zero());
+        add_children_col(c, col, children);
+    });
+}
+
+/// Add each child's column that maps to parent column `c` into `col`, which
+/// holds rows `c..` of that column (`col[0]` is the diagonal). Row maps must
+/// be strictly increasing.
+#[inline]
+fn add_children_col<T: Scalar>(c: usize, col: &mut [T], children: &[(&BlockedLower<T>, &[u32])]) {
+    for &(cb, map) in children {
+        if let Ok(j) = map.binary_search(&(c as u32)) {
+            for (&li, &v) in map[j..].iter().zip(cb.col(j)) {
+                col[li as usize - c] += v;
             }
         }
-    });
+    }
 }
 
 /// Scatter a single extend-add value into the parent's lower triangle.
 #[inline(always)]
-fn ea_scatter_one<T: Scalar>(parent: &mut MatMut<'_, T>, li: usize, lj: usize, val: T) {
+fn ea_scatter_one<T: Scalar>(parent: &mut impl AssemblyTarget<T>, li: usize, lj: usize, val: T) {
     if li >= lj {
-        parent[(li, lj)] += val;
+        parent.add_lower(li, lj, val);
     } else {
-        parent[(lj, li)] += val;
+        parent.add_lower(lj, li, val);
     }
 }
 
@@ -3529,7 +3649,7 @@ pub(crate) fn extract_front_factors<T: Scalar>(
     //
     // Uses per-column copy_from_slice for bulk extraction.
     //
-    // NOTE: extract_contribution also includes delayed rows (see lines below).
+    // NOTE: extract_contribution_split also includes delayed rows (see lines below).
     // These two functions MUST be consistent in their row treatment.
     let r = m - ne;
     let l21 = filled_padded(r, ne, par, &|j, dst| {
@@ -3551,7 +3671,7 @@ pub(crate) fn extract_front_factors<T: Scalar>(
     // First num_delayed entries: delayed fully-summed columns (ne..k), mapped through
     // result.perm and frontal_row_indices to get global permuted indices.
     // Remaining entries: non-fully-summed rows (k..m).
-    // This matches extract_contribution's row_indices construction.
+    // This matches extract_contribution_split's row_indices construction.
     let mut row_indices = Vec::with_capacity(m - ne);
     for &lp in &result.perm[ne..k] {
         row_indices.push(frontal_row_indices[lp]);
@@ -3569,50 +3689,36 @@ pub(crate) fn extract_front_factors<T: Scalar>(
     }
 }
 
-/// Extract the contribution block from a factored frontal matrix.
+/// Contribution block of a split front with delayed columns: the delayed
+/// columns `ne..k` (rows `ne..m`) of the fully-summed columns, followed by
+/// the updated NFS×NFS block, copied into one [`BlockedLower`].
 ///
-/// After the APTP kernel and [`compute_contribution_gemm_in_place`], the
-/// trailing `(m − ne) × (m − ne)` block of `frontal_data` holds the whole
-/// contribution, in the order `[delayed columns | NFS rows]`:
-///
-/// ```text
-/// [0..nd, 0..nd]       delayed × delayed      = frontal[ne..k, ne..k]
-/// [nd..size, 0..nd]    NFS × delayed          = frontal[k..m, ne..k]
-/// [nd..size, nd..size] updated NFS × NFS      = frontal[k..m, k..m]
-/// ```
-///
-/// so column `j` of the contribution is the contiguous slice
-/// `frontal[ne+j..m, ne+j]`. Each column is copied once into an exactly sized
-/// [`PackedLower`] block.
-///
-/// # Arguments
-///
-/// - `frontal_data`: The factored frontal matrix data, with the NFS×NFS update applied.
-/// - `m`: Front size (number of rows/columns used).
-/// - `k`: Number of fully-summed rows/columns.
-/// - `frontal_row_indices`: Global permuted column indices for each local row.
-/// - `result`: APTP factorization result.
-pub(crate) fn extract_contribution<T: Scalar>(
-    frontal_data: &Mat<T>,
+/// Without delays the NFS×NFS block is the contribution block as is.
+fn extract_contribution_split<T: Scalar>(
+    front: &Mat<T>,
     m: usize,
     k: usize,
     frontal_row_indices: &[usize],
     result: &AptpFactorResult<T>,
+    nfs_block: &BlockedLower<T>,
     par: Par,
 ) -> ContributionBlock<T> {
     let ne = result.num_eliminated;
     let size = m - ne;
     let num_delayed = k - ne;
 
-    let data = PackedLower::from_columns_par(
+    let data = BlockedLower::from_columns_par(
         size,
-        &|j| &frontal_data.col_as_slice(ne + j)[ne + j..m],
+        &|j| {
+            if j < num_delayed {
+                &front.col_as_slice(ne + j)[ne + j..m]
+            } else {
+                nfs_block.col(j - num_delayed)
+            }
+        },
         par,
     );
 
-    // Build row indices:
-    // - First num_delayed entries: delayed columns mapped through result.perm and frontal_row_indices
-    // - Remaining entries: non-fully-summed rows from frontal_row_indices[k..m]
     let mut row_indices = Vec::with_capacity(size);
     for &lp in &result.perm[ne..k] {
         row_indices.push(frontal_row_indices[lp]);
@@ -3729,13 +3835,31 @@ mod tests {
     }
 
     #[test]
-    fn packed_lower_par_matches_seq() {
-        let n = 1500; // ~1.1M packed entries: splits across threads
-        let dense = Mat::<f64>::from_fn(n, n, |i, j| (i * n + j) as f64);
-        let col = |j: usize| &dense.col_as_slice(j)[j..n];
-        let seq = PackedLower::from_columns(n, col);
-        let par = PackedLower::from_columns_par(n, &col, Par::rayon(4));
-        assert_eq!(seq.data, par.data);
+    fn blocked_lower_matches_dense() {
+        // Sizes straddle the sequential widths (32..256) and the 512-1024-wide
+        // parallel panels, with partial last panels.
+        for n in [0usize, 1, 31, 33, 300, 1500, 2049, 4500] {
+            let dense = Mat::<f64>::from_fn(n, n, |i, j| (i * n + j) as f64);
+            let col = |j: usize| &dense.col_as_slice(j)[j..n];
+            let seq = BlockedLower::from_columns(n, col);
+            let par = BlockedLower::from_columns_par(n, &col, Par::rayon(4));
+            for b in [&seq, &par] {
+                assert_eq!(b.dim(), n);
+                assert!(b.allocated() >= n * (n + 1) / 2);
+                for j in 0..n {
+                    assert_eq!(b.col(j), col(j), "n {n} col {j}");
+                }
+                if n > 0 {
+                    assert_eq!(b.get(n - 1, 0), dense[(n - 1, 0)]);
+                }
+            }
+        }
+        assert_eq!(contrib_panel_width(1000, Par::Seq), 64);
+        assert_eq!(contrib_panel_width(100, Par::Seq), 32);
+        assert_eq!(contrib_panel_width(10_000, Par::Seq), 256);
+        assert_eq!(contrib_panel_width(1000, Par::rayon(8)), 512);
+        assert_eq!(contrib_panel_width(8000, Par::rayon(8)), 1024);
+        assert_eq!(contrib_panel_width(12_000, Par::rayon(8)), 1024);
     }
     use crate::symmetric::factor::AptpOptions;
 
@@ -3858,7 +3982,7 @@ mod tests {
         }
     }
 
-    /// Test that delayed rows in extract_front_factors and extract_contribution
+    /// Test that delayed rows in extract_front_factors and extract_contribution_split
     /// have consistent row_indices. Both functions MUST agree on which global
     /// indices correspond to delayed rows.
     #[test]
@@ -3881,17 +4005,27 @@ mod tests {
 
         if num_delayed > 0 {
             let ff = extract_front_factors(&data, m, k, &row_indices, &result, Par::Seq);
+            let mut nfs_block =
+                BlockedLower::from_columns(m - k, |j| &data.col_as_slice(k + j)[k + j..m]);
             let mut ld_ws = Mat::<f64>::new();
-            compute_contribution_gemm_in_place(
-                &mut data,
+            compute_contribution_gemm_blocked(
+                data.as_ref(),
                 k,
                 ne,
-                m,
                 &result.d,
+                &mut nfs_block,
                 &mut ld_ws,
                 Par::Seq,
             );
-            let cb = extract_contribution(&data, m, k, &row_indices, &result, Par::Seq);
+            let cb = extract_contribution_split(
+                &data,
+                m,
+                k,
+                &row_indices,
+                &result,
+                &nfs_block,
+                Par::Seq,
+            );
 
             // Both must have the same number of delayed rows
             assert_eq!(cb.num_delayed, num_delayed);
@@ -3902,7 +4036,7 @@ mod tests {
             assert_eq!(
                 ff_delayed_indices, cb_delayed_indices,
                 "Delayed row indices must be identical between extract_front_factors \
-                 and extract_contribution.\n  front_factors: {:?}\n  contribution:  {:?}",
+                 and extract_contribution_split.\n  front_factors: {:?}\n  contribution:  {:?}",
                 ff_delayed_indices, cb_delayed_indices
             );
 
@@ -4376,10 +4510,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // extend_add_mapped: precomputed-map scatter (zero-delay fast path)
+    // extend_add_mapped_seq: precomputed-map scatter (zero-delay fast path)
     // -----------------------------------------------------------------------
 
-    /// Test that `extend_add_mapped` correctly scatters a child contribution
+    /// Test that `extend_add_mapped_seq` correctly scatters a child contribution
     /// into a parent frontal matrix using a precomputed u32 row mapping,
     /// handling the lower-triangle symmetry swap when child ordering differs
     /// from parent ordering (non-monotonic map from amalgamated supernodes).
@@ -4412,10 +4546,10 @@ mod tests {
         //                  child row 1 → parent local 0 (global 10),
         //                  child row 2 → parent local 3 (global 40).
         // Note: child row 1 maps to a LOWER parent index than child row 0,
-        // so extend_add_mapped must handle the li < lj swap case.
+        // so extend_add_mapped_seq must handle the li < lj swap case.
         let ea_row_map: Vec<u32> = vec![2, 0, 3];
 
-        extend_add_mapped(&mut parent, child, &ea_row_map, Par::Seq);
+        extend_add_mapped_seq(&mut parent, &child.data, &ea_row_map);
 
         // Expected scatter (lower triangle of parent):
         //
@@ -4441,7 +4575,7 @@ mod tests {
         assert_eq!(p[(4, 4)], 0.0, "row 4 untouched");
     }
 
-    /// Test column-oriented `extend_add_mapped` with a larger 10×10
+    /// Test column-oriented `extend_add_mapped_seq` with a larger 10×10
     /// contribution (monotonic map), comparing against a naive reference.
     #[test]
     fn test_extend_add_mapped_10x10_vs_reference() {
@@ -4475,7 +4609,7 @@ mod tests {
             }
         }
 
-        // Actual: column-oriented extend_add_mapped
+        // Actual: column-oriented extend_add_mapped_seq
         let mut parent_data = Mat::<f64>::zeros(parent_size, parent_size);
         let parent_row_indices: Vec<usize> = (0..parent_size).collect();
         let mut parent = FrontalMatrix {
@@ -4484,7 +4618,7 @@ mod tests {
             num_fully_summed: 5,
         };
         let child = ContributionBlock::from_dense_lower(&child_data, (0..cb_size).collect(), 0);
-        extend_add_mapped(&mut parent, child, &ea_row_map, Par::Seq);
+        extend_add_mapped_seq(&mut parent, &child.data, &ea_row_map);
 
         // Compare every element
         for j in 0..parent_size {
@@ -4500,7 +4634,7 @@ mod tests {
         }
     }
 
-    /// Test column-oriented `extend_add_mapped` with a non-monotonic map
+    /// Test column-oriented `extend_add_mapped_seq` with a non-monotonic map
     /// (simulating post-amalgamation parent with non-contiguous owned ranges).
     #[test]
     fn test_extend_add_mapped_non_monotonic() {
@@ -4542,7 +4676,7 @@ mod tests {
             num_fully_summed: 4,
         };
         let child = ContributionBlock::from_dense_lower(&child_data, (0..cb_size).collect(), 0);
-        extend_add_mapped(&mut parent, child, &ea_row_map, Par::Seq);
+        extend_add_mapped_seq(&mut parent, &child.data, &ea_row_map);
 
         // Compare every element
         for j in 0..parent_size {
@@ -4558,7 +4692,7 @@ mod tests {
         }
     }
 
-    /// Test that `extend_add_mapped` accumulates contributions from multiple
+    /// Test that `extend_add_mapped_seq` accumulates contributions from multiple
     /// children into the same parent.
     #[test]
     fn test_extend_add_mapped_accumulates() {
@@ -4578,7 +4712,7 @@ mod tests {
         let child1 = ContributionBlock::from_dense_lower(&c1_data, vec![1, 3], 0);
         let map1: Vec<u32> = vec![1, 3];
 
-        extend_add_mapped(&mut parent, child1, &map1, Par::Seq);
+        extend_add_mapped_seq(&mut parent, &child1.data, &map1);
 
         // Second child: 2×2, also maps to parent rows [1, 3]
         let mut c2_data = Mat::<f64>::zeros(2, 2);
@@ -4588,7 +4722,7 @@ mod tests {
         let child2 = ContributionBlock::from_dense_lower(&c2_data, vec![1, 3], 0);
         let map2: Vec<u32> = vec![1, 3];
 
-        extend_add_mapped(&mut parent, child2, &map2, Par::Seq);
+        extend_add_mapped_seq(&mut parent, &child2.data, &map2);
 
         let p = parent.data.as_ref();
         assert_eq!(p[(1, 1)], 15.0, "10 + 5 accumulated");

@@ -371,14 +371,18 @@ pub struct AptpPivotRecord {
 ///
 /// Performs partial LDL^T factorization of the first `num_fully_summed`
 /// columns of the input matrix `a`. The L factor is stored in-place in the
-/// lower triangle of `a`. The contribution block (trailing submatrix after
-/// the fully-summed columns) is updated with the Schur complement.
+/// lower triangle of `a`. The trailing `(m - p) × (m - p)` block (rows and
+/// columns at or after `num_fully_summed`) is neither read nor written: its
+/// Schur complement update is left to the caller (see
+/// `compute_contribution_gemm_blocked`).
 ///
 /// # Arguments
-/// - `a`: Dense symmetric matrix (m x m), mutated in place. Only the lower
-///   triangle is read; the upper triangle may contain arbitrary values.
-///   On return, the lower triangle of the first `num_eliminated` columns
-///   contains the L factor entries (unit diagonal implicit).
+/// - `a`: Dense symmetric matrix, mutated in place: either the whole
+///   `m × m` matrix or just its first `num_fully_summed` columns
+///   (`m × p`). Only the lower triangle is read; the upper triangle may
+///   contain arbitrary values. On return, the lower triangle of the first
+///   `num_eliminated` columns contains the L factor entries (unit diagonal
+///   implicit).
 /// - `num_fully_summed`: Number of columns eligible for elimination (p <= m).
 ///   For full factorization, pass `a.nrows()`.
 /// - `options`: APTP configuration (threshold, fallback strategy).
@@ -399,9 +403,14 @@ pub fn aptp_factor_in_place<T: Scalar>(
     options: &AptpOptions,
 ) -> Result<AptpFactorResult<T>, SparseError> {
     let m = a.nrows();
-    if a.ncols() != m {
+    if a.ncols() != m && a.ncols() != num_fully_summed {
         return Err(SparseError::InvalidInput {
-            reason: format!("matrix must be square, got {}x{}", m, a.ncols()),
+            reason: format!(
+                "matrix must be m x m or m x num_fully_summed, got {}x{} with num_fully_summed {}",
+                m,
+                a.ncols(),
+                num_fully_summed
+            ),
         });
     }
     if num_fully_summed > m {
@@ -1847,59 +1856,79 @@ pub(crate) fn compute_contribution_gemm<T: Scalar>(
     );
 }
 
-/// Apply the deferred Schur-complement update to the front's NFS×NFS block,
-/// in place: `F22 ← F22 − L21_NFS · D · L21_NFSᵀ` (lower triangle only).
+/// Apply the deferred Schur-complement update to a contribution block held
+/// in its own [`BlockedLower`](super::numeric::BlockedLower) panels:
+/// `C ← C − L21_NFS · D · L21_NFSᵀ` (lower triangle only).
 ///
-/// `frontal_data[p..m, p..m]` holds the assembled, not yet updated NFS×NFS
-/// block (the APTP kernel defers it); `frontal_data[p..m, 0..ne]` holds
-/// `L21_NFS`. Updating in place lets the contribution block be packed straight
-/// out of the front, so no separate m × m contribution buffer is needed.
+/// `front` holds the factored fully-summed columns (`m × p`, or the whole
+/// front), so `L21_NFS = front[p..m, 0..ne]`. `cb` is the `nfs × nfs`
+/// assembled, not yet updated NFS×NFS block. Each panel (columns
+/// `j0..j0 + w`) gets a triangular product for its `w × w` diagonal block
+/// and a rectangular one below it. Panels are updated one at a time, each
+/// with all of `par`'s threads (splitting panels across threads instead was
+/// much slower in benchmarks).
 ///
 /// # References
 ///
 /// - Duff, Hogg & Lopez (2020), Section 3: deferred contribution update
-pub(crate) fn compute_contribution_gemm_in_place<T: Scalar>(
-    frontal_data: &mut Mat<T>,
+pub(crate) fn compute_contribution_gemm_blocked<T: Scalar>(
+    front: MatRef<'_, T>,
     num_fully_summed: usize,
     num_eliminated: usize,
-    m: usize,
     d: &MixedDiagonal<T>,
+    cb: &mut super::numeric::BlockedLower<T>,
     ld_workspace: &mut Mat<T>,
     par: Par,
 ) {
     let p = num_fully_summed;
     let ne = num_eliminated;
-    let nfs = m - p;
+    let nfs = front.nrows() - p;
+    debug_assert_eq!(cb.dim(), nfs);
     if nfs == 0 || ne == 0 {
         return;
     }
 
-    let (left, right) = frontal_data
-        .as_mut()
-        .submatrix_mut(0, 0, m, m)
-        .split_at_col_mut(p);
-    let l21_nfs = left.rb().submatrix(p, 0, nfs, ne);
-
+    let l21_nfs = front.submatrix(p, 0, nfs, ne);
     if ld_workspace.nrows() < nfs || ld_workspace.ncols() < ne {
         *ld_workspace = zeros_padded(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
     }
     let mut w = ld_workspace.as_mut().submatrix_mut(0, 0, nfs, ne);
     w.fill(T::zero());
     compute_ld_into(l21_nfs, d, ne, w.rb_mut(), par);
+    let w = ld_workspace.as_ref().submatrix(0, 0, nfs, ne);
 
-    tri_matmul::matmul_with_conj(
-        right.submatrix_mut(p, 0, nfs, nfs),
-        BlockStructure::TriangularLower,
-        Accum::Add,
-        w.as_ref(),
-        BlockStructure::Rectangular,
-        Conj::No,
-        l21_nfs.transpose(),
-        BlockStructure::Rectangular,
-        Conj::No,
-        T::from_f64(-1.0),
-        par,
-    );
+    for b in 0..cb.num_panels() {
+        let (j0, panel) = cb.panel_mut(b);
+        let width = panel.ncols();
+        let rows = panel.nrows();
+        let l_cols = l21_nfs.subrows(j0, width).transpose();
+        let (top, below) = panel.split_at_row_mut(width);
+        tri_matmul::matmul_with_conj(
+            top,
+            BlockStructure::TriangularLower,
+            Accum::Add,
+            w.subrows(j0, width),
+            BlockStructure::Rectangular,
+            Conj::No,
+            l_cols,
+            BlockStructure::Rectangular,
+            Conj::No,
+            T::from_f64(-1.0),
+            par,
+        );
+        if rows > width {
+            faer::linalg::matmul::matmul_with_conj(
+                below,
+                Accum::Add,
+                w.subrows(j0 + width, rows - width),
+                Conj::No,
+                l_cols,
+                Conj::No,
+                T::from_f64(-1.0),
+                par,
+            );
+        }
+    }
 }
 
 /// Apply Schur complement updates from passed columns to failed and trailing regions.
@@ -4034,7 +4063,7 @@ pub(super) fn extract_contribution_rect<T: Scalar>(
         // Column j < num_delayed: delayed rows ne+j..k then NFS rows k..m of
         // l_storage column ne+j, which are contiguous. Column num_delayed + j:
         // the updated NFS×NFS column j from contrib_buffer.
-        super::numeric::PackedLower::from_columns(size, |j| {
+        super::numeric::BlockedLower::from_columns(size, |j| {
             if j < num_delayed {
                 &l_storage.col_as_slice(ne + j)[ne + j..m]
             } else {
@@ -4043,7 +4072,9 @@ pub(super) fn extract_contribution_rect<T: Scalar>(
             }
         })
     } else {
-        super::numeric::PackedLower::from_columns(size, |j| &contrib_buffer.col_as_slice(j)[j..nfs])
+        super::numeric::BlockedLower::from_columns(size, |j| {
+            &contrib_buffer.col_as_slice(j)[j..nfs]
+        })
     };
 
     let mut row_indices = Vec::with_capacity(size);
@@ -6846,6 +6877,134 @@ mod tests {
                         base_result.stats.num_delayed
                     );
                 }
+            }
+        }
+    }
+
+    /// The panel-wise contribution GEMM matches the single square-buffer
+    /// update, for sequential (narrow) and parallel (wide) panel widths
+    /// with partial last panels, and with delayed columns.
+    #[test]
+    fn test_contribution_gemm_blocked_matches_square() {
+        use super::super::numeric::BlockedLower;
+        // (m, k, delay scale, par)
+        let configs = [
+            (150, 40, 1.0, Par::Seq),        // nfs 110: 32-wide panels
+            (600, 120, 1e3, Par::Seq),       // nfs 480: 32-wide, with delays
+            (1500, 200, 1.0, Par::rayon(4)), // nfs 1300: 512-wide panels
+        ];
+        for (ci, &(m, k, scale, par)) in configs.iter().enumerate() {
+            let mut a = deterministic_indefinite_matrix(m, 3 + ci as u64, 1.0);
+            if scale != 1.0 {
+                cause_delays(&mut a, 5 + ci as u64, scale);
+            }
+            let opts = AptpOptions {
+                par,
+                ..AptpOptions::default()
+            };
+            let result = aptp_factor_in_place(a.as_mut(), k, &opts).unwrap();
+            let ne = result.num_eliminated;
+            let nfs = m - k;
+
+            let mut expect = Mat::<f64>::zeros(nfs, nfs);
+            let mut ld = Mat::<f64>::new();
+            compute_contribution_gemm(&a, k, ne, m, &result.d, &mut expect, &mut ld, Par::Seq);
+
+            let mut cb =
+                BlockedLower::from_columns_par(nfs, &|j| &a.col_as_slice(k + j)[k + j..m], par);
+            assert!(cb.num_panels() > 2, "config {ci}: want several panels");
+            let mut ld = Mat::<f64>::new();
+            compute_contribution_gemm_blocked(a.as_ref(), k, ne, &result.d, &mut cb, &mut ld, par);
+            let scale_ref = expect.norm_max().max(1.0);
+            for j in 0..nfs {
+                for (i, &v) in cb.col(j).iter().enumerate() {
+                    let e = expect[(j + i, j)];
+                    assert!(
+                        (v - e).abs() <= 1e-12 * scale_ref,
+                        "config {ci}: ({}, {j}) {v} vs {e}",
+                        j + i
+                    );
+                }
+            }
+        }
+    }
+
+    /// The kernel never reads or writes the NFS×NFS block (`a[k.., k..]`),
+    /// which the multifrontal code leaves to the contribution GEMM, so a
+    /// front can be factored as just its `m × k` fully-summed columns.
+    /// Covers TPP, `factor_inner`, `two_level_factor`, delays with both
+    /// failed-pivot methods, and the unpivoted kernel.
+    #[test]
+    fn test_kernel_leaves_nfs_block_alone_and_accepts_m_by_k() {
+        // (m, k, outer, inner, delay scale, failed-pivot method, pivoting)
+        let configs = [
+            (40, 12, 256, 32, 1.0, FailedPivotMethod::Tpp, true), // TPP
+            (120, 50, 64, 16, 1.0, FailedPivotMethod::Tpp, true), // factor_inner
+            (120, 50, 64, 16, 1e3, FailedPivotMethod::Tpp, true), // + delays
+            (300, 150, 64, 16, 1.0, FailedPivotMethod::Tpp, true), // two_level
+            (300, 150, 64, 16, 1e3, FailedPivotMethod::Tpp, true), // + delays
+            (300, 150, 64, 16, 1e3, FailedPivotMethod::Pass, true),
+            (300, 137, 64, 16, 1e3, FailedPivotMethod::Tpp, true), // k mid-block
+            (900, 600, 256, 32, 1e3, FailedPivotMethod::Tpp, true), // larger tiles
+            // m >= 4096: the parallel rows-below, L·D and scale paths
+            (5000, 700, 256, 32, 1e3, FailedPivotMethod::Tpp, true),
+            (200, 90, 64, 16, 1.0, FailedPivotMethod::Tpp, false), // unpivoted
+        ];
+        let runs = configs
+            .iter()
+            .flat_map(|c| [(c, Par::Seq), (c, Par::rayon(4))])
+            .enumerate();
+        for (ci, (&(m, k, nb, ib, scale, fpm, pivoting), par)) in runs {
+            let mut a = deterministic_indefinite_matrix(m, 7 + ci as u64 / 2, 1.0);
+            if !pivoting {
+                for i in 0..m {
+                    a[(i, i)] = m as f64; // diagonally dominant, SPD
+                }
+            } else if scale != 1.0 {
+                cause_delays(&mut a, 11 + ci as u64 / 2, scale);
+            }
+            let opts = AptpOptions {
+                par,
+                outer_block_size: nb,
+                inner_block_size: ib,
+                failed_pivot_method: fpm,
+                pivoting,
+                ..AptpOptions::default()
+            };
+
+            let mut sq = a.clone();
+            for j in k..m {
+                for i in k..m {
+                    sq[(i, j)] = f64::NAN;
+                }
+            }
+            let rs = aptp_factor_in_place(sq.as_mut(), k, &opts).unwrap();
+            for j in k..m {
+                for i in k..m {
+                    assert!(sq[(i, j)].is_nan(), "config {ci}: NFS ({i}, {j}) written");
+                }
+            }
+            for j in 0..k {
+                for i in j..m {
+                    assert!(sq[(i, j)].is_finite(), "config {ci}: ({i}, {j}) not finite");
+                }
+            }
+
+            let mut rect = a.submatrix(0, 0, m, k).to_owned();
+            let rr = aptp_factor_in_place(rect.as_mut(), k, &opts).unwrap();
+            assert_eq!(rr.num_eliminated, rs.num_eliminated, "config {ci}");
+            assert_eq!(rr.perm, rs.perm, "config {ci}");
+            for j in 0..k {
+                for i in j..m {
+                    assert_eq!(
+                        rect[(i, j)].to_bits(),
+                        sq[(i, j)].to_bits(),
+                        "config {ci}: rect differs at ({i}, {j})"
+                    );
+                }
+            }
+            if pivoting && scale != 1.0 && fpm == FailedPivotMethod::Pass {
+                assert!(rs.num_eliminated < k, "config {ci}: expected delays");
             }
         }
     }
