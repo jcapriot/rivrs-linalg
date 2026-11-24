@@ -41,7 +41,7 @@ use faer::{c32, c64};
 /// Blanket-implemented for every `Copy` faer [`ComplexField`] whose real type
 /// is a [`Float`]; there is no per-type code. The provided methods are thin
 /// names for faer's `ComplexField` functions.
-pub trait Scalar: ComplexField<Real: Float> + Copy {
+pub trait Scalar: ComplexField<Real: Float> + Copy + 'static {
     /// Modulus `|x|` in the real type (complex modulus for complex scalars).
     #[inline(always)]
     fn mag(self) -> Self::Real {
@@ -67,7 +67,7 @@ pub trait Scalar: ComplexField<Real: Float> + Copy {
     }
 }
 
-impl<T: ComplexField<Real: Float> + Copy> Scalar for T {}
+impl<T: ComplexField<Real: Float> + Copy + 'static> Scalar for T {}
 
 /// Convert an `f64` threshold or constant to the real type of `T`.
 #[inline(always)]

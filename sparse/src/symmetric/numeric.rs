@@ -867,9 +867,104 @@ fn sub_at_b<T: Scalar>(mut c: MatMut<'_, T>, a: MatRef<'_, T>, b: MatRef<'_, T>,
 /// - Anderson et al., LAPACK Users' Guide (1999), Section 5.3.2: packed
 ///   storage for symmetric matrices (`UPLO = 'L'`)
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PackedLower<T> {
+pub(crate) struct PackedLower<T: Scalar> {
     n: usize,
     data: Vec<T>,
+}
+
+impl<T: Scalar> Drop for PackedLower<T> {
+    fn drop(&mut self) {
+        cb_pool::give(core::mem::take(&mut self.data));
+    }
+}
+
+/// SPIKE: recycle large contribution-block buffers so new blocks land in
+/// memory that is already faulted in, instead of fresh pages the kernel has
+/// to zero. `RIVRS_CB_POOL_MB` caps the pooled bytes (default 4096, 0 turns
+/// the pool off).
+pub(crate) mod cb_pool {
+    use std::any::{Any, TypeId};
+    use std::sync::{Mutex, OnceLock};
+
+    use super::Scalar;
+    use crate::symmetric::factor::advise_huge_pages;
+
+    const MIN_BYTES: usize = 1 << 20;
+
+    struct Entry {
+        ty: TypeId,
+        cap: usize,
+        bytes: usize,
+        buf: Box<dyn Any + Send>,
+    }
+
+    static POOL: Mutex<(Vec<Entry>, usize)> = Mutex::new((Vec::new(), 0));
+
+    fn cap_bytes() -> usize {
+        static CAP: OnceLock<usize> = OnceLock::new();
+        *CAP.get_or_init(|| {
+            std::env::var("RIVRS_CB_POOL_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(4096)
+                << 20
+        })
+    }
+
+    pub(crate) fn take_or_alloc<T: Scalar>(len: usize) -> Vec<T> {
+        let bytes = len * core::mem::size_of::<T>();
+        if bytes >= MIN_BYTES && cap_bytes() > 0 {
+            let ty = TypeId::of::<T>();
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let best = pool
+                .0
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.ty == ty && e.cap >= len && e.cap <= len + len / 2)
+                .min_by_key(|(_, e)| e.cap)
+                .map(|(i, _)| i);
+            if let Some(i) = best {
+                let e = pool.0.swap_remove(i);
+                pool.1 -= e.bytes;
+                drop(pool);
+                if let Ok(v) = e.buf.downcast::<Vec<T>>() {
+                    return *v;
+                }
+            }
+        }
+        let v = Vec::<T>::with_capacity(len);
+        advise_huge_pages(v.as_ptr().cast(), v.capacity() * core::mem::size_of::<T>());
+        v
+    }
+
+    pub(crate) fn give<T: Scalar>(mut v: Vec<T>) {
+        let bytes = v.capacity() * core::mem::size_of::<T>();
+        if bytes < MIN_BYTES || cap_bytes() == 0 {
+            return;
+        }
+        v.clear();
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.1 + bytes > cap_bytes() {
+            return;
+        }
+        pool.1 += bytes;
+        pool.0.push(Entry {
+            ty: TypeId::of::<T>(),
+            cap: v.capacity(),
+            bytes,
+            buf: Box::new(v),
+        });
+    }
+
+    /// Free everything in the pool.
+    pub(crate) fn release() {
+        let drained = {
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            pool.1 = 0;
+            core::mem::take(&mut pool.0)
+        };
+        drop(drained);
+    }
 }
 
 impl<T: Scalar> PackedLower<T> {
@@ -879,11 +974,7 @@ impl<T: Scalar> PackedLower<T> {
     where
         T: 'a,
     {
-        let mut data = Vec::<T>::with_capacity(n * (n + 1) / 2);
-        advise_huge_pages(
-            data.as_ptr().cast(),
-            data.capacity() * core::mem::size_of::<T>(),
-        );
+        let mut data = cb_pool::take_or_alloc::<T>(n * (n + 1) / 2);
         for j in 0..n {
             let c = col(j);
             debug_assert_eq!(c.len(), n - j, "PackedLower column {j} has wrong length");
@@ -906,11 +997,7 @@ impl<T: Scalar> PackedLower<T> {
         if !copy_par_split(par, n, total) {
             return Self::from_columns(n, col);
         }
-        let mut data = Vec::<T>::with_capacity(total);
-        advise_huge_pages(
-            data.as_ptr().cast(),
-            data.capacity() * core::mem::size_of::<T>(),
-        );
+        let mut data = cb_pool::take_or_alloc::<T>(total);
         fill_packed_cols(&mut data.spare_capacity_mut()[..total], n, 0, n, col, par);
         // SAFETY: fill_packed_cols wrote all `total` entries (the packed
         // columns 0..n tile exactly 0..total).
@@ -2659,6 +2746,9 @@ fn factor_tree<T: Scalar>(
     #[cfg(feature = "diagnostic")]
     let phase_b_start = std::time::Instant::now();
 
+    if std::env::var("RIVRS_CB_POOL_KEEP_A").is_err() {
+        cb_pool::release();
+    }
     // Phase B: the top part, depth-first, one front at a time.
     let roots: Vec<usize> = (0..n_supernodes)
         .filter(|&s| supernodes[s].parent.is_none())
@@ -2694,6 +2784,7 @@ fn factor_tree<T: Scalar>(
     #[cfg(feature = "diagnostic")]
     cb_mem.report(layer.len());
 
+    cb_pool::release();
     Ok(all_results)
 }
 
