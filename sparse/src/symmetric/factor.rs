@@ -131,7 +131,7 @@ pub(crate) fn advise_huge_pages(ptr: *const u8, bytes: usize) {
 #[inline(always)]
 pub(crate) fn advise_huge_pages(_ptr: *const u8, _bytes: usize) {}
 
-use crate::scalar::{Scalar, real, to_f64};
+use crate::scalar::{Scalar, inv_det_2x2, real, to_f64};
 
 /// Bunch-Kaufman α parameter for 2×2 determinant condition: |det| ≥ α × |a₂₁|².
 const BUNCH_KAUFMAN_ALPHA: f64 = 0.5;
@@ -857,8 +857,7 @@ fn complete_pivoting_factor<T: Scalar>(
                 let a11 = a[(k, k)];
                 let a22 = a[(k + 1, k + 1)];
                 let a21 = a[(k + 1, k)];
-                let det = a11 * a22 - a21 * a21;
-                let inv_det = T::one() / det;
+                let inv_det = inv_det_2x2(a11, a21, a22);
 
                 let block = Block2x2 {
                     first_col: k,
@@ -1143,8 +1142,7 @@ fn factor_block_diagonal<T: Scalar>(
                 let a11 = a[(cur, cur)];
                 let a22 = a[(cur + 1, cur + 1)];
                 let a21 = a[(cur + 1, cur)];
-                let det = a11 * a22 - a21 * a21;
-                let inv_det = T::one() / det;
+                let inv_det = inv_det_2x2(a11, a21, a22);
 
                 let block = Block2x2 {
                     first_col: k,
@@ -1506,7 +1504,7 @@ fn scale_rows_col_max<T: Scalar>(
                     "2x2 pivot at {col} straddles nelim {nelim}"
                 );
                 let block = d.diagonal_2x2(col);
-                let inv_det = T::one() / (block.a * block.c - block.b * block.b);
+                let inv_det = inv_det_2x2(block.a, block.b, block.c);
                 for i in 0..rows {
                     let x1 = panel[(i, col)];
                     let x2 = panel[(i, col + 1)];
@@ -3553,8 +3551,7 @@ fn tpp_apply_2x2<T: Scalar>(
     let a11 = a[(nelim, nelim)];
     let a21 = a[(nelim + 1, nelim)];
     let a22 = a[(nelim + 1, nelim + 1)];
-    let det = a11 * a22 - a21 * a21;
-    let inv_det = T::one() / det;
+    let inv_det = inv_det_2x2(a11, a21, a22);
     let p = num_fully_summed;
 
     // Compute L entries for ALL rows (FS + NFS)
