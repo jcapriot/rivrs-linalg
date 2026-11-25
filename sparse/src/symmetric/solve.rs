@@ -234,9 +234,10 @@ pub fn aptp_solve_mat<T: Scalar>(
     if n == 0 || rhs.ncols() == 0 {
         return Ok(());
     }
-    // The per-front kernels index rows directly; work on a contiguous copy
-    // if the caller's columns are strided.
-    if rhs.row_stride() != 1 {
+    // The per-front kernels index rows directly and step through columns with
+    // a positive stride; work on a contiguous copy if the caller's view has
+    // strided rows or reversed columns.
+    if rhs.row_stride() != 1 || (rhs.ncols() > 1 && rhs.col_stride() <= 0) {
         let mut tmp = rhs.to_owned();
         aptp_solve_mat(symbolic, numeric, tmp.as_mut(), _stack, par)?;
         rhs.copy_from(&tmp);
@@ -494,16 +495,43 @@ impl<T: Scalar> TaskPool<T> {
         }
     }
 
-    /// Run `f` with this thread's buffers (fresh ones if the slot is taken,
-    /// which only happens if more threads than slots run tasks).
-    fn with<R>(&self, f: impl FnOnce(&mut TaskBufs<T>) -> R) -> R {
-        let slot = rayon::current_thread_index()
-            .filter(|_| !self.slots.is_empty())
-            .and_then(|i| self.slots[i % self.slots.len()].try_lock().ok());
-        match slot {
-            Some(mut b) => f(&mut b),
-            None => f(&mut TaskBufs::new()),
-        }
+    /// Run `f(i, bufs)` for every task `i in 0..n_tasks` and return the
+    /// results in task order.
+    ///
+    /// One worker per slot (so at most `par.degree()` of them, whatever the
+    /// size of the rayon pool) claims tasks from a shared counter, in order,
+    /// which keeps the largest-first schedule, and uses its own slot's
+    /// buffers for every task it runs.
+    fn run_tasks<R: Send>(
+        &self,
+        n_tasks: usize,
+        f: impl Fn(usize, &mut TaskBufs<T>) -> R + Sync,
+    ) -> Vec<R> {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let workers = self.slots.len().min(n_tasks).max(1);
+        let next = AtomicUsize::new(0);
+        let claim = |b: &mut TaskBufs<T>| {
+            let mut out = Vec::new();
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= n_tasks {
+                    break;
+                }
+                out.push((i, f(i, b)));
+            }
+            out
+        };
+        let mut done: Vec<(usize, R)> = (0..workers)
+            .into_par_iter()
+            .flat_map_iter(|w| match self.slots.get(w) {
+                Some(slot) => claim(&mut slot.lock().unwrap_or_else(|e| e.into_inner())),
+                None => claim(&mut TaskBufs::new()),
+            })
+            .collect();
+        done.sort_unstable_by_key(|x| x.0);
+        done.into_iter().map(|x| x.1).collect()
     }
 }
 
@@ -667,8 +695,6 @@ impl SolvePlan {
         max_size: usize,
         par: Par,
     ) {
-        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-
         let k = rhs.ncols();
         let n_top = self.n_top;
         let shared = SharedRhs::new(rhs.as_mut());
@@ -681,53 +707,50 @@ impl SolvePlan {
 
         // 1. Forward solve in the subtrees.
         let t = tic!();
-        let pending: Vec<Vec<T>> = self
-            .tasks
-            .par_iter()
-            .map(|nodes| {
-                pool.with(|b| {
-                    let t = tic!();
-                    b.reserve(n_top * k, max_size * k);
-                    toc!(t, 17, 0);
-                    let (buf, w1, w2) = (&mut b.pending[..n_top * k], &mut b.w1, &mut b.w2);
-                    let t_task = tic!();
-                    let mut view = RhsView {
-                        rhs: shared,
-                        buf: &mut buf[..],
-                        top_idx,
-                        n_top,
-                        _borrow: core::marker::PhantomData,
-                    };
-                    for &s in nodes {
-                        forward_solve_supernode(&factors[s], &mut view, w1, w2, Par::Seq);
+        let pending: Vec<Vec<T>> = pool.run_tasks(self.tasks.len(), |ti, b| {
+            let nodes = &self.tasks[ti];
+            {
+                let t = tic!();
+                b.reserve(n_top * k, max_size * k);
+                toc!(t, 17, 0);
+                let (buf, w1, w2) = (&mut b.pending[..n_top * k], &mut b.w1, &mut b.w2);
+                let t_task = tic!();
+                let mut view = RhsView {
+                    rhs: shared,
+                    buf: &mut buf[..],
+                    top_idx,
+                    n_top,
+                    _borrow: core::marker::PhantomData,
+                };
+                for &s in nodes {
+                    forward_solve_supernode(&factors[s], &mut view, w1, w2, Par::Seq);
+                }
+                toc!(t_task, 18, 0);
+                // Drain the root's rows, which leaves the buffer zero for
+                // the next task on this thread.
+                let t_drain = tic!();
+                let rows = factors[nodes[nodes.len() - 1]].row_indices();
+                let mut out = Vec::with_capacity(rows.len() * k);
+                for j in 0..k {
+                    for &i in rows {
+                        let t = top_idx[i];
+                        debug_assert_ne!(t, NOT_TOP, "task root row inside a subtree");
+                        let slot = &mut buf[t as usize + j * n_top];
+                        out.push(core::mem::replace(slot, T::zero()));
                     }
-                    toc!(t_task, 18, 0);
-                    // Drain the root's rows, which leaves the buffer zero for
-                    // the next task on this thread.
-                    let t_drain = tic!();
-                    let rows = factors[nodes[nodes.len() - 1]].row_indices();
-                    let mut out = Vec::with_capacity(rows.len() * k);
-                    for j in 0..k {
-                        for &i in rows {
-                            let t = top_idx[i];
-                            debug_assert_ne!(t, NOT_TOP, "task root row inside a subtree");
-                            let slot = &mut buf[t as usize + j * n_top];
-                            out.push(core::mem::replace(slot, T::zero()));
-                        }
-                    }
-                    debug_assert!(
-                        buf.iter().all(|&x| x == T::zero()),
-                        "forward update outside the task root's rows"
-                    );
-                    toc!(t_drain, 19, 0);
-                    #[cfg(feature = "diagnostic")]
-                    if let Some(t) = t_task {
-                        solve_profile::max(20, t);
-                    }
-                    out
-                })
-            })
-            .collect();
+                }
+                debug_assert!(
+                    buf.iter().all(|&x| x == T::zero()),
+                    "forward update outside the task root's rows"
+                );
+                toc!(t_drain, 19, 0);
+                #[cfg(feature = "diagnostic")]
+                if let Some(t) = t_task {
+                    solve_profile::max(20, t);
+                }
+                out
+            }
+        });
         toc!(t, 14, 0);
 
         // 2. Apply the buffered updates.
@@ -770,8 +793,9 @@ impl SolvePlan {
         );
         let shared = SharedRhs::new(rhs.as_mut());
         let t = tic!();
-        self.tasks.par_iter().for_each(|nodes| {
-            pool.with(|b| {
+        pool.run_tasks(self.tasks.len(), |ti, b| {
+            let nodes = &self.tasks[ti];
+            {
                 let t = tic!();
                 b.reserve(0, max_size * k);
                 toc!(t, 21, 0);
@@ -792,7 +816,7 @@ impl SolvePlan {
                 if let Some(t) = t_task {
                     solve_profile::max(23, t);
                 }
-            })
+            }
         });
         toc!(t, 16, 0);
         #[cfg(feature = "diagnostic")]
@@ -1491,6 +1515,35 @@ mod tests {
         assert_eq!(x1, x2);
     }
 
+    /// The subtree phases run at most one task per pool slot at a time (the
+    /// `par` the caller passed), not one per thread of rayon's global pool,
+    /// and return results in task order.
+    #[test]
+    fn run_tasks_caps_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pool = TaskPool::<f64>::new(2);
+        let (live, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let out = pool.run_tasks(40, |i, _| {
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            live.fetch_sub(1, Ordering::SeqCst);
+            i * 10
+        });
+        assert_eq!(out, (0..40).map(|i| i * 10).collect::<Vec<_>>());
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "peak {}",
+            peak.into_inner()
+        );
+        // Fewer tasks than slots, and no tasks.
+        assert_eq!(
+            TaskPool::<f64>::new(8).run_tasks(3, |i, _| i),
+            vec![0, 1, 2]
+        );
+        assert!(pool.run_tasks(0, |i, _| i).is_empty());
+    }
+
     /// Solving k columns at once gives the same result as solving each
     /// column alone, for block sizes around `SOLVE_RHS_BLOCK`, sequential
     /// and threaded, and for a row-strided right-hand side.
@@ -1555,6 +1608,25 @@ mod tests {
         for j in 0..k {
             for i in 0..n {
                 assert!((xt[(j, i)] - x[(i, j)]).abs() <= 1e-11 * (1.0 + x[(i, j)].abs()));
+            }
+        }
+
+        // Reversed columns (negative column stride) also go through a copy
+        // instead of panicking.
+        let mut xr = x.clone();
+        xr.as_mut().reverse_cols_mut().copy_from(bt.transpose());
+        aptp_solve_mat(
+            &symbolic,
+            &numeric,
+            xr.as_mut().reverse_cols_mut(),
+            MemStack::new(&mut mem),
+            Par::rayon(3),
+        )
+        .expect("solve");
+        for j in 0..k {
+            for i in 0..n {
+                let got = xr[(i, k - 1 - j)];
+                assert!((got - x[(i, j)]).abs() <= 1e-11 * (1.0 + x[(i, j)].abs()));
             }
         }
     }

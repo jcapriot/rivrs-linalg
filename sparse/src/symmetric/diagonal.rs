@@ -10,6 +10,8 @@
 
 use super::inertia::Inertia;
 use super::pivot::{Block2x2, PivotType};
+use faer::traits::ComplexField;
+
 use crate::scalar::{Scalar, det_2x2_scaled, real};
 
 /// A single pivot entry from a [`MixedDiagonal`], yielded by [`MixedDiagonal::iter_pivots`].
@@ -371,7 +373,9 @@ impl<T: Scalar> MixedDiagonal<T> {
         }
     }
 
-    /// Compute eigenvalue sign counts from stored pivots.
+    /// Eigenvalue sign counts from the real parts of the stored pivots, the
+    /// implementation behind [`MixedDiagonal::compute_inertia`]. Meaningful
+    /// only when `T` is real; the caller checks.
     ///
     /// For 1x1 pivots, the sign of the diagonal value determines the eigenvalue
     /// sign. For 2x2 blocks, the trace and determinant classify the eigenvalue
@@ -395,9 +399,9 @@ impl<T: Scalar> MixedDiagonal<T> {
     /// - Standard eigenvalue sign classification from trace/determinant
     /// - Hogg, Duff & Lopez (2020), Section 2: inertia in APTP context
     /// - Bunch & Kaufman (1977): inertia from pivot classifications
-    pub fn compute_inertia(&self) -> Inertia {
-        // Signs are taken in the scalar's real type. For complex symmetric
-        // matrices inertia is undefined and `SparseLDLT::inertia` returns None.
+    pub(crate) fn inertia_of_real_parts(&self) -> Inertia {
+        // Signs are taken in the scalar's real type. Callers must check that
+        // `T` is real: complex symmetric matrices have no inertia.
         let real_zero = real::<T>(0.0);
         debug_assert!(
             self.num_delayed() == 0,
@@ -478,6 +482,30 @@ impl<T: Scalar> MixedDiagonal<T> {
 pub struct PivotIter<'a, T: Scalar = f64> {
     d: &'a MixedDiagonal<T>,
     col: usize,
+}
+
+impl<T: Scalar + ComplexField<Real = T>> MixedDiagonal<T> {
+    /// Compute eigenvalue sign counts (inertia) from the stored pivots.
+    ///
+    /// Only defined for real scalars: a complex symmetric matrix has complex
+    /// eigenvalues, so this method does not exist for `c32`/`c64`.
+    ///
+    /// For 1x1 pivots, the sign of the diagonal value determines the eigenvalue
+    /// sign. For 2x2 blocks, the signs of the determinant and trace classify the
+    /// pair without computing eigenvalues (Bunch & Kaufman 1977).
+    ///
+    /// ```compile_fail
+    /// use rivrs_sparse::symmetric::MixedDiagonal;
+    /// let d = MixedDiagonal::<faer::c64>::new(1);
+    /// let _ = d.compute_inertia(); // no inertia for complex scalars
+    /// ```
+    ///
+    /// # Panics (debug only)
+    ///
+    /// Any column is still [`PivotType::Delayed`].
+    pub fn compute_inertia(&self) -> Inertia {
+        self.inertia_of_real_parts()
+    }
 }
 
 impl<'a, T: Scalar> Iterator for PivotIter<'a, T> {
