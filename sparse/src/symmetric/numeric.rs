@@ -2437,7 +2437,7 @@ fn factor_single_supernode<T: Scalar>(
     // its columns can be given back while L11 is copied out of them.
     let release_front = sn.parent.is_none()
         && m * k * core::mem::size_of::<T>() >= RELEASE_MIN_BYTES
-        && cfg!(target_os = "linux");
+        && RELEASE_ENABLED;
     let ff = if release_front {
         extract_front_factors_releasing(
             &mut workspace.frontal_data,
@@ -3926,12 +3926,19 @@ const RELEASE_BATCH_COLS: usize = 512;
 
 /// Children's blocks must add up to this many bytes before their consumed
 /// columns are released during assembly (below it the syscalls are not worth
-/// it: the blocks are freed soon after anyway).
-const RELEASE_MIN_BYTES: usize = 64 << 20;
+/// it: the blocks are freed soon after anyway). The same bound decides
+/// whether a root front releases its workspace. Unit tests use 64 KB so
+/// ordinary test matrices go through the release paths.
+const RELEASE_MIN_BYTES: usize = if cfg!(test) { 64 << 10 } else { 64 << 20 };
+
+/// Whether pages are released at all: only Linux has the `madvise` path.
+/// Unit tests release everywhere, since there [`release_pages`] overwrites
+/// the pages with NaN, so any read of released memory shows in the results.
+const RELEASE_ENABLED: bool = cfg!(any(test, target_os = "linux"));
 
 fn releases_children<T: Scalar>(children: &[(&mut BlockedLower<T>, &[u32])]) -> bool {
     let entries: usize = children.iter().map(|(cb, _)| cb.allocated()).sum();
-    cfg!(target_os = "linux") && entries * core::mem::size_of::<T>() >= RELEASE_MIN_BYTES
+    RELEASE_ENABLED && entries * core::mem::size_of::<T>() >= RELEASE_MIN_BYTES
 }
 
 /// Release each child's columns that map to parent columns `< c_end`: with
@@ -4362,6 +4369,72 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// A whole factorization with every release path active (consumed child
+    /// columns during assembly, root workspace during extraction). In unit
+    /// tests released pages are overwritten with NaN on every platform and
+    /// the release threshold is 64 KB, so reading released memory anywhere
+    /// would wreck the backward error.
+    #[test]
+    fn factorization_with_released_pages_solves() {
+        use crate::symmetric::{AnalyzeOptions, FactorOptions, OrderingStrategy, SparseLDLT};
+        use faer::Col;
+        use faer::dyn_stack::{MemBuffer, MemStack};
+        use faer::sparse::Triplet;
+        use std::sync::atomic::Ordering;
+
+        // Indefinite 7-point operator on a 16^3 grid: fronts of a few hundred
+        // rows, well past the 64 KB test threshold.
+        let g = 16;
+        let id = |x: usize, y: usize, z: usize| (z * g + y) * g + x;
+        let n = g * g * g;
+        let mut t = Vec::new();
+        for z in 0..g {
+            for y in 0..g {
+                for x in 0..g {
+                    let p = id(x, y, z);
+                    t.push(Triplet::new(p, p, 6.0 - 2.5 + 0.01 * (p % 7) as f64));
+                    for (dx, dy, dz) in [(1, 0, 0), (0, 1, 0), (0, 0, 1)] {
+                        let (x2, y2, z2) = (x + dx, y + dy, z + dz);
+                        if x2 < g && y2 < g && z2 < g {
+                            let q = id(x2, y2, z2);
+                            t.push(Triplet::new(p, q, -1.0));
+                            t.push(Triplet::new(q, p, -1.0));
+                        }
+                    }
+                }
+            }
+        }
+        let a = SparseColMat::<usize, f64>::try_new_from_triplets(n, n, &t).expect("matrix");
+        let b = Col::<f64>::from_fn(n, |i| ((i * 37) % 101) as f64 / 50.0 - 1.0);
+        for par in [Par::Seq, Par::rayon(4)] {
+            let before = super::super::factor::RELEASED_ELEMENTS.load(Ordering::Relaxed);
+            let mut solver = SparseLDLT::analyze_with_matrix(
+                &a,
+                &AnalyzeOptions {
+                    ordering: OrderingStrategy::Metis,
+                },
+            )
+            .expect("analyze");
+            solver
+                .factor(
+                    &a,
+                    &FactorOptions {
+                        par,
+                        ..Default::default()
+                    },
+                )
+                .expect("factor");
+            let released = super::super::factor::RELEASED_ELEMENTS.load(Ordering::Relaxed) - before;
+            assert!(released > 0, "{par:?}: nothing was released");
+            let mut mem = MemBuffer::new(solver.solve_scratch(1));
+            let x = solver
+                .solve(&b, MemStack::new(&mut mem), par)
+                .expect("solve");
+            let be = crate::validate::sparse_backward_error(&a, &x, &b);
+            assert!(be < 1e-12, "{par:?}: backward error {be:e}");
         }
     }
 

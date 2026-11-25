@@ -183,6 +183,12 @@ pub(crate) fn release_pages<T: Scalar>(_s: &mut [T]) -> usize {
     0
 }
 
+/// Elements poisoned by the unit-test [`release_pages`], so tests can check
+/// that a release path actually ran.
+#[cfg(test)]
+pub(crate) static RELEASED_ELEMENTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Unit-test stand-in on every platform: overwrite the same whole 4 KiB
 /// pages with NaN instead of releasing them (every element that overlaps
 /// them, to be conservative). A read of released data then fails the tests
@@ -200,6 +206,7 @@ pub(crate) fn release_pages<T: Scalar>(s: &mut [T]) -> usize {
         let lo = (start - addr) / size;
         let hi = (end - addr).div_ceil(size).min(s.len());
         s[lo..hi].fill(T::from_f64(f64::NAN));
+        RELEASED_ELEMENTS.fetch_add(hi - lo, std::sync::atomic::Ordering::Relaxed);
     }
     if end > addr { (end - addr) / size } else { 0 }
 }
