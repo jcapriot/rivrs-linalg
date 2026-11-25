@@ -2598,6 +2598,9 @@ pub(crate) fn unpivoted_factor_in_place<T: Scalar>(
     let small = real::<T>(options.small);
     let mut d = MixedDiagonal::new(p);
     let mut w_buf = zeros_padded::<T>(p, UNPIVOTED_BLOCK.min(p.max(1)));
+    // Largest |L| per column, over every row of L (diagonal block, rest of
+    // the fully-summed part, and the rows below it), for the statistics.
+    let mut col_max = vec![real::<T>(0.0); p];
 
     let mut k0 = 0;
     while k0 < p {
@@ -2625,6 +2628,7 @@ pub(crate) fn unpivoted_factor_in_place<T: Scalar>(
             }
             for i in j + 1..k1 {
                 a[(i, j)] *= inv;
+                col_max[j] = col_max[j].max(a[(i, j)].mag());
             }
         }
 
@@ -2645,7 +2649,10 @@ pub(crate) fn unpivoted_factor_in_place<T: Scalar>(
             for jj in 0..w {
                 d_blk.set_1x1(jj, d.diagonal_1x1(k0 + jj));
             }
-            let _ = scale_rows_col_max(panel.rb_mut(), &d_blk, w, par);
+            let blk_max = scale_rows_col_max(panel.rb_mut(), &d_blk, w, par);
+            for (jj, v) in blk_max.into_iter().enumerate() {
+                col_max[k0 + jj] = col_max[k0 + jj].max(v);
+            }
 
             // 3. Trailing update of fully-summed columns k1..p (rows k1..p):
             //    A -= L · D · Lᵀ (lower), one rank-w GEMM with W = L · D.
@@ -2685,15 +2692,18 @@ pub(crate) fn unpivoted_factor_in_place<T: Scalar>(
             panel.rb_mut().transpose_mut(),
             par,
         );
-        let col_max = scale_rows_col_max(panel, &d, p, par);
-        stats.max_l_entry = col_max.iter().fold(0.0, |acc, &v| acc.max(to_f64(v)));
+        let below_max = scale_rows_col_max(panel, &d, p, par);
+        for (c, v) in below_max.into_iter().enumerate() {
+            col_max[c] = col_max[c].max(v);
+        }
     }
+    stats.max_l_entry = col_max.iter().fold(0.0, |acc, &v| acc.max(to_f64(v)));
 
     let pivot_log = (0..p)
         .map(|col| AptpPivotRecord {
             col,
             pivot_type: PivotType::OneByOne,
-            max_l_entry: 0.0,
+            max_l_entry: to_f64(col_max[col]),
             was_fallback: false,
         })
         .collect();
@@ -6626,6 +6636,39 @@ mod tests {
         );
         let err = check_partial_factorization_in_place(&a, &f, p, &result);
         assert!(err < 1e-12, "reconstruction error {err:.2e}");
+        // Growth statistics cover every L entry, fully-summed rows included.
+        let true_max = (0..p)
+            .flat_map(|j| (j + 1..m).map(move |i| (i, j)))
+            .fold(0.0f64, |acc, (i, j)| acc.max(f[(i, j)].abs()));
+        assert_eq!(result.stats.max_l_entry, true_max);
+        for rec in &result.pivot_log {
+            let c = rec.col;
+            let want = (c + 1..m).fold(0.0f64, |acc, i| acc.max(f[(i, c)].abs()));
+            assert_eq!(rec.max_l_entry, want, "column {c}");
+        }
+    }
+
+    /// A root front (m == p) with a tiny but nonzero pivot: its growth lies
+    /// entirely in the fully-summed rows, which the statistics used to skip.
+    #[test]
+    fn test_unpivoted_reports_growth_in_root_front() {
+        let n = 3;
+        let a = Mat::<f64>::from_fn(n, n, |i, j| match (i, j) {
+            (0, 0) => 1e-12,
+            (i, j) if i == j => 4.0,
+            _ => 1.0,
+        });
+        let opts = AptpOptions {
+            pivoting: false,
+            ..AptpOptions::default()
+        };
+        let mut f = a.clone();
+        let result = aptp_factor_in_place(f.as_mut(), n, &opts).unwrap();
+        assert!(
+            result.stats.max_l_entry > 1e11,
+            "max_l_entry {:e}",
+            result.stats.max_l_entry
+        );
     }
 
     #[test]
