@@ -32,7 +32,7 @@
 //!   1×1/2×2 pivots selected on moduli.
 
 use faer::traits::ComplexField;
-use faer::traits::num_traits::Float;
+use faer::traits::num_traits::{Float, ToPrimitive};
 #[allow(unused_imports)] // c32/c64 are referenced by the docs
 use faer::{c32, c64};
 
@@ -73,6 +73,36 @@ impl<T: ComplexField<Real: Float> + Copy> Scalar for T {}
 #[inline(always)]
 pub(crate) fn real<T: Scalar>(x: f64) -> T::Real {
     <T::Real as ComplexField>::from_f64_impl(x)
+}
+
+/// Determinant of the symmetric 2×2 block `[[a11, a21], [a21, a22]]`, as
+/// `(s, det_s)` with `det = det_s / s²`.
+///
+/// `s` is a power of two near `1/max|a_ij|`, so `det_s` is of order one.
+/// Unscaled, `det = a11·a22 − a21²` is of order `|a|²`, and complex division
+/// by it squares that again (`re² + im²`), which overflows or underflows
+/// single precision for `|a|` around `1e±9`. A power of two scales exactly,
+/// so wherever the unscaled formula stays in range, dividing by `det_s` and
+/// rescaling by `s` gives bitwise the same result. `s = 1` for a zero or
+/// non-finite block.
+#[inline]
+pub(crate) fn det_2x2_scaled<T: Scalar>(a11: T, a21: T, a22: T) -> (T, T) {
+    let maxpiv = a11.mag().max(a21.mag()).max(a22.mag());
+    let s = if maxpiv == real::<T>(0.0) || !maxpiv.is_finite() {
+        T::one()
+    } else {
+        let e = maxpiv.log2().floor().to_i32().unwrap_or(0);
+        T::from_real_impl(&real::<T>(2.0).powi(-e))
+    };
+    (s, (a11 * s) * (a22 * s) - (a21 * s) * (a21 * s))
+}
+
+/// `1/det` for the symmetric 2×2 block, without overflow (see
+/// [`det_2x2_scaled`]).
+#[inline]
+pub(crate) fn inv_det_2x2<T: Scalar>(a11: T, a21: T, a22: T) -> T {
+    let (s, det_s) = det_2x2_scaled(a11, a21, a22);
+    (s / det_s) * s
 }
 
 /// Widen a real value to `f64` for reporting (statistics, MC64 input).

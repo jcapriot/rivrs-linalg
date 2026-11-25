@@ -10,7 +10,7 @@
 
 use super::inertia::Inertia;
 use super::pivot::{Block2x2, PivotType};
-use crate::scalar::{Scalar, real};
+use crate::scalar::{Scalar, det_2x2_scaled, real};
 
 /// A single pivot entry from a [`MixedDiagonal`], yielded by [`MixedDiagonal::iter_pivots`].
 #[derive(Debug, Clone)]
@@ -356,8 +356,9 @@ impl<T: Scalar> MixedDiagonal<T> {
                             let r1 = x[col];
                             let r2 = x[partner];
                             // Cramer's rule: [[a,b],[b,c]]^-1 = (1/det) * [[c,-b],[-b,a]]
-                            x[col] = (c * r1 - b * r2) / det;
-                            x[partner] = (a * r2 - b * r1) / det;
+                            let (s, det_s) = det_2x2_scaled(a, b, c);
+                            x[col] = (((c * r1 - b * r2) * s) / det_s) * s;
+                            x[partner] = (((a * r2 - b * r1) * s) / det_s) * s;
                         }
                     }
                     // Skip partner column if we've already processed this pair
