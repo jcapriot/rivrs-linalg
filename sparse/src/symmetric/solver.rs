@@ -104,8 +104,9 @@ pub struct FactorOptions {
     ///
     /// With `par` set to more than one thread, independent subtrees whose
     /// fronts are all smaller than this are factored concurrently, each by one
-    /// worker with its own frontal buffer (at most `l0_max_front²` entries).
-    /// Larger fronts, near the root, are factored one at a time using all
+    /// worker with its own frontal buffer (about `l0_max_front²` entries at
+    /// most; delayed pivots can grow a front past its symbolic size, and
+    /// small-leaf subtrees are never split). Larger fronts, near the root, are factored one at a time using all
     /// threads inside the front. Raising it trades memory for tree-level
     /// parallelism. Ignored for `Par::Seq`.
     pub l0_max_front: usize,
