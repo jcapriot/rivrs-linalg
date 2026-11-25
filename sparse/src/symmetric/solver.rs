@@ -503,7 +503,9 @@ impl<T: Scalar> SparseLDLT<T> {
     /// (expected inertia `(n, m, 0)` for `n` primal and `m` dual variables),
     /// and detecting numerical singularity (zero eigenvalues).
     ///
-    /// Returns `None` if [`factor`](Self::factor) has not been called.
+    /// Returns `None` if [`factor`](Self::factor) has not been called, and
+    /// always for complex scalars (`c32`, `c64`): a complex symmetric matrix
+    /// has complex eigenvalues, so it has no inertia.
     pub fn inertia(&self) -> Option<Inertia> {
         // Inertia (eigenvalue sign counts) is only defined for real symmetric
         // matrices; a complex symmetric matrix has complex eigenvalues.
@@ -517,7 +519,7 @@ impl<T: Scalar> SparseLDLT<T> {
                 zero: 0,
             };
             for ff in numeric.front_factors() {
-                let local_inertia = ff.d11().compute_inertia();
+                let local_inertia = ff.d11().inertia_of_real_parts();
                 inertia.positive += local_inertia.positive;
                 inertia.negative += local_inertia.negative;
                 inertia.zero += local_inertia.zero;
