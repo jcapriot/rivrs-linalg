@@ -289,6 +289,32 @@ fn c32_helmholtz_and_kkt() {
     }
 }
 
+/// Badly scaled c32 KKT matrices without MC64 scaling. The 2×2 pivots used to
+/// divide by an unscaled determinant (order `|a|²`), and complex division
+/// squares it again, so every solution entry overflowed to NaN/Inf for a
+/// matrix scale of `1e±10`.
+#[test]
+fn c32_kkt_badly_scaled() {
+    for scale in [1e10f32, 1e-10, 1e15] {
+        let mut a = kkt::<c32>(300, 80, 9);
+        for v in a.val_mut() {
+            *v *= scale;
+        }
+        for ord in [OrderingStrategy::Amd, OrderingStrategy::Metis] {
+            let name = format!("{ord:?}");
+            let (be, _, solver) = solve_ones(&a, ord, Par::Seq);
+            let n2x2 = solver.stats().expect("stats").total_2x2_pivots;
+            assert!(n2x2 > 0, "c32 kkt x{scale:e} {name}: expected 2x2 pivots");
+            // Without MC64 scaling, single precision on this KKT matrix lands
+            // around 1e-5, so the bound only needs to catch NaN/Inf blow-up.
+            assert!(
+                be < 1e-4,
+                "c32 kkt x{scale:e} {name}: backward error {be:e}"
+            );
+        }
+    }
+}
+
 #[test]
 fn f32_helmholtz_and_kkt() {
     for ord in orderings() {

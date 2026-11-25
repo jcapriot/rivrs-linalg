@@ -47,7 +47,7 @@ use super::pivot::{Block2x2, PivotType};
 use crate::error::SparseError;
 use crate::ordering::perm_from_forward;
 
-use crate::scalar::{Scalar, real, to_f64};
+use crate::scalar::{Scalar, inv_det_2x2, real, to_f64};
 
 /// Bunch-Kaufman α parameter for 2×2 determinant condition: |det| ≥ α × |a₂₁|².
 const BUNCH_KAUFMAN_ALPHA: f64 = 0.5;
@@ -766,8 +766,7 @@ fn complete_pivoting_factor<T: Scalar>(
                 let a11 = a[(k, k)];
                 let a22 = a[(k + 1, k + 1)];
                 let a21 = a[(k + 1, k)];
-                let det = a11 * a22 - a21 * a21;
-                let inv_det = T::one() / det;
+                let inv_det = inv_det_2x2(a11, a21, a22);
 
                 let block = Block2x2 {
                     first_col: k,
@@ -1052,8 +1051,7 @@ fn factor_block_diagonal<T: Scalar>(
                 let a11 = a[(cur, cur)];
                 let a22 = a[(cur + 1, cur + 1)];
                 let a21 = a[(cur + 1, cur)];
-                let det = a11 * a22 - a21 * a21;
-                let inv_det = T::one() / det;
+                let inv_det = inv_det_2x2(a11, a21, a22);
 
                 let block = Block2x2 {
                     first_col: k,
@@ -1366,8 +1364,7 @@ fn apply_and_check<T: Scalar>(
             }
             PivotType::TwoByTwo { partner } if partner > col => {
                 let block = d.diagonal_2x2(col);
-                let det = block.a * block.c - block.b * block.b;
-                let inv_det = T::one() / det;
+                let inv_det = inv_det_2x2(block.a, block.b, block.c);
                 for i in 0..panel_rows {
                     let x1 = a[(panel_start + i, col_start + col)];
                     let x2 = a[(panel_start + i, col_start + col + 1)];
@@ -2664,8 +2661,7 @@ fn tpp_apply_2x2<T: Scalar>(
     let a11 = a[(nelim, nelim)];
     let a21 = a[(nelim + 1, nelim)];
     let a22 = a[(nelim + 1, nelim + 1)];
-    let det = a11 * a22 - a21 * a21;
-    let inv_det = T::one() / det;
+    let inv_det = inv_det_2x2(a11, a21, a22);
     let p = num_fully_summed;
 
     // Compute L entries for ALL rows (FS + NFS)
