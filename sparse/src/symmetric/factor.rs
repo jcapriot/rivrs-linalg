@@ -1459,9 +1459,10 @@ fn apply_and_check<T: Scalar>(
 /// keeps the loop scalar. Instead this takes the largest `|x_i|²` (two
 /// multiplies and an add, which vectorize) and one square root at the end.
 /// If squaring overflowed or underflowed (entries beyond about `1e154` or
-/// below about `1e-154` in `f64`) it falls back to the exact modulus, so the
-/// result never loses range. Real scalars use `|x|` directly, which already
-/// vectorizes.
+/// below about `1e-154` in `c64`, `1e19` and `1e-19` in `c32`) it falls back
+/// to the exact modulus, so the result never loses range. An all-zero slice,
+/// common for structurally zero columns, is recognized by a plain comparison
+/// scan instead. Real scalars use `|x|` directly, which already vectorizes.
 fn max_modulus<T: Scalar>(xs: &[T]) -> T::Real {
     if T::IS_REAL {
         return xs.iter().fold(real::<T>(0.0), |acc, v| acc.max(v.mag()));
@@ -1471,6 +1472,8 @@ fn max_modulus<T: Scalar>(xs: &[T]) -> T::Real {
         .fold(real::<T>(0.0), |acc, v| acc.max(T::abs2_impl(v)));
     if max2.is_finite() && max2 >= <T::Real as Float>::min_positive_value() {
         max2.sqrt()
+    } else if max2 == real::<T>(0.0) && xs.iter().all(|v| *v == T::zero()) {
+        real::<T>(0.0)
     } else {
         xs.iter().fold(real::<T>(0.0), |acc, v| acc.max(v.mag()))
     }
@@ -7176,6 +7179,40 @@ mod tests {
         }
         let reals = [-7.5f64, 2.0, 3.25];
         assert_eq!(max_modulus(&reals), 7.5);
+
+        // Squares to zero but is not all zero: must take the exact path.
+        let tiny = [
+            c64::new(0.0, 0.0),
+            c64::new(0.0, -2e-170),
+            c64::new(-0.0, 0.0),
+        ];
+        assert_eq!(max_modulus(&tiny), 2e-170);
+        assert_eq!(max_modulus(&[c64::new(-0.0, -0.0); 4]), 0.0);
+        // Inf is kept; NaN is ignored, as the exact modulus fold does.
+        assert_eq!(
+            max_modulus(&[c64::new(1.0, 0.0), c64::new(f64::INFINITY, 0.0)]),
+            f64::INFINITY
+        );
+        assert_eq!(
+            max_modulus(&[c64::new(f64::NAN, 0.0), c64::new(0.0, 2.0)]),
+            2.0
+        );
+
+        // c32 overflows and underflows its squares near 1e19 and 1e-19.
+        use faer::c32;
+        let exact32 = |xs: &[c32]| xs.iter().fold(0.0f32, |acc, v| acc.max(v.mag()));
+        for xs in [
+            vec![c32::new(3e20, 4e20), c32::new(1.0, 0.0)],
+            vec![c32::new(3e-21, 4e-21), c32::new(0.0, 0.0)],
+            vec![c32::new(0.0, 0.0); 3],
+            vec![c32::new(1.5, -2.0), c32::new(0.25, 0.0)],
+        ] {
+            let (got, want) = (max_modulus(&xs), exact32(&xs));
+            assert!(
+                (got - want).abs() <= 4.0 * f32::EPSILON * want,
+                "c32 max_modulus {got:e} vs exact {want:e} for {xs:?}"
+            );
+        }
     }
 
     /// The kernel never reads or writes the NFS×NFS block (`a[k.., k..]`),
