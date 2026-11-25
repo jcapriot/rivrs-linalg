@@ -161,6 +161,18 @@ impl<T: Scalar> ZeroedMat<T> {
         self.stride
     }
 
+    /// Give the buffer's whole pages back to the OS (see [`release_pages`]).
+    /// The contents are unspecified afterwards; the buffer stays allocated.
+    pub(crate) fn release_all(&mut self) {
+        let len = self.stride * self.ncols;
+        if len > 0 && core::mem::size_of::<T>() > 0 {
+            // SAFETY: the allocation holds `stride * ncols` entries from
+            // `ptr`, and `self` is borrowed mutably.
+            let all = unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), len) };
+            release_pages(all);
+        }
+    }
+
     pub(crate) fn as_mut_ptr(&mut self) -> *mut T {
         self.ptr.as_ptr()
     }
@@ -4005,6 +4017,10 @@ fn extract_front_factors_releasing<T: Scalar>(
     // L21 reads the same columns, so it goes first.
     let l21 = extract_l21(frontal_data.as_ref(), m, ne, par);
     let l11 = BlockedUnitLower::from_factored_releasing(frontal_data, ne, &result.d, par);
+    // A root has no contribution block, so nothing reads the workspace after
+    // this: give back the rest of it too (the last group of L11 columns, any
+    // delayed columns, and columns past k left from a wider earlier front).
+    frontal_data.release_all();
     finish_front_factors(l11, l21, m, k, frontal_row_indices, result)
 }
 
