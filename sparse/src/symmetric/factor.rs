@@ -1406,14 +1406,14 @@ fn apply_and_check<T: Scalar>(
     threshold: T::Real,
     par: Par,
     l11_buf: &mut Mat<T>,
-) -> usize {
+) -> (usize, Vec<T::Real>) {
     if block_nelim == 0 {
-        return 0;
+        return (0, Vec::new());
     }
 
     let panel_rows = m - col_start - block_cols;
     if panel_rows == 0 {
-        return block_nelim;
+        return (block_nelim, Vec::new());
     }
 
     // Step 1: TRSM — solve panel * L11^T = A21 for panel (= L21)
@@ -1449,7 +1449,33 @@ fn apply_and_check<T: Scalar>(
         .rb_mut()
         .submatrix_mut(panel_start, col_start, panel_rows, block_nelim);
     let col_max = scale_rows_col_max(panel, d, block_nelim, par);
-    first_failing_pivot(&col_max, d, block_nelim, stability_bound)
+    (
+        first_failing_pivot(&col_max, d, block_nelim, stability_bound),
+        col_max,
+    )
+}
+
+/// Largest modulus `max |x_i|` of a slice.
+///
+/// For complex scalars the modulus needs a square root per entry, which
+/// keeps the loop scalar. Instead this takes the largest `|x_i|²` (two
+/// multiplies and an add, which vectorize) and one square root at the end.
+/// If squaring overflowed or underflowed (entries beyond about `1e154` or
+/// below about `1e-154` in `f64`) it falls back to the exact modulus, so the
+/// result never loses range. Real scalars use `|x|` directly, which already
+/// vectorizes.
+fn max_modulus<T: Scalar>(xs: &[T]) -> T::Real {
+    if T::IS_REAL {
+        return xs.iter().fold(real::<T>(0.0), |acc, v| acc.max(v.mag()));
+    }
+    let max2 = xs
+        .iter()
+        .fold(real::<T>(0.0), |acc, v| acc.max(T::abs2_impl(v)));
+    if max2.is_finite() && max2 >= <T::Real as Float>::min_positive_value() {
+        max2.sqrt()
+    } else {
+        xs.iter().fold(real::<T>(0.0), |acc, v| acc.max(v.mag()))
+    }
 }
 
 /// Rows per task below which [`scale_rows_col_max`] stays sequential.
@@ -1480,10 +1506,7 @@ fn scale_rows_col_max<T: Scalar>(
 
     let col_max_of = |panel: MatRef<'_, T>, c: usize| -> T::Real {
         match panel.col(c).try_as_col_major() {
-            Some(x) => x
-                .as_slice()
-                .iter()
-                .fold(real::<T>(0.0), |acc, v| acc.max(v.mag())),
+            Some(x) => max_modulus(x.as_slice()),
             None => (0..rows).fold(real::<T>(0.0), |acc, i| acc.max(panel[(i, c)].mag())),
         }
     };
@@ -2215,7 +2238,7 @@ fn factor_inner<T: Scalar>(
         let t = std::time::Instant::now();
 
         // 7. APPLY: TRSM on panel below + threshold check
-        let mut effective_nelim = apply_and_check(
+        let (mut effective_nelim, panel_col_max) = apply_and_check(
             a.rb_mut(),
             k,
             block_nelim,
@@ -2321,13 +2344,11 @@ fn factor_inner<T: Scalar>(
         if block_stats.max_l_entry > stats.max_l_entry {
             stats.max_l_entry = block_stats.max_l_entry;
         }
-        // Check panel L entries for max_l_entry (passed columns only)
-        for c in 0..nelim {
-            for i in panel_start..m {
-                let v = a[(i, k + c)].mag();
-                if to_f64(v) > stats.max_l_entry {
-                    stats.max_l_entry = to_f64(v);
-                }
+        // Panel L entries for max_l_entry (passed columns only): the
+        // column maxima apply_and_check already computed for these rows.
+        for &v in &panel_col_max[..nelim.min(panel_col_max.len())] {
+            if to_f64(v) > stats.max_l_entry {
+                stats.max_l_entry = to_f64(v);
             }
         }
 
@@ -6848,6 +6869,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_max_modulus_matches_exact() {
+        use faer::c64;
+        let exact = |xs: &[c64]| xs.iter().fold(0.0f64, |acc, v| acc.max(v.mag()));
+        let cases: Vec<Vec<c64>> = vec![
+            vec![],
+            vec![c64::new(0.0, 0.0); 5],
+            vec![c64::new(3.0, -4.0), c64::new(-1.0, 1.0), c64::new(0.5, 4.9)],
+            // squaring overflows: falls back to the exact modulus
+            vec![c64::new(1e200, 1e200), c64::new(1.0, 0.0)],
+            // squaring underflows: falls back to the exact modulus
+            vec![c64::new(3e-170, 4e-170), c64::new(-1e-170, 0.0)],
+        ];
+        for xs in &cases {
+            let got = max_modulus(xs);
+            let want = exact(xs);
+            assert!(
+                (got - want).abs() <= 4.0 * f64::EPSILON * want,
+                "max_modulus {got:e} vs exact {want:e} for {xs:?}"
+            );
+            assert!(got.is_finite());
+        }
+        let reals = [-7.5f64, 2.0, 3.25];
+        assert_eq!(max_modulus(&reals), 7.5);
     }
 
     /// The kernel never reads or writes the NFS×NFS block (`a[k.., k..]`),
