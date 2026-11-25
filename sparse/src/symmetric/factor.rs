@@ -1698,27 +1698,41 @@ fn compute_ld_into<T: Scalar>(
     l: MatRef<'_, T>,
     d: &MixedDiagonal<T>,
     nelim: usize,
+    dst: MatMut<'_, T>,
+    par: Par,
+) {
+    compute_ld_cols(l, d, 0, nelim, dst, par);
+}
+
+/// [`compute_ld_into`] for the pivot columns `col0..col0 + ncols`: `l` and
+/// `dst` hold just those columns, while `d` is indexed globally. The range
+/// must not split a 2×2 pivot.
+fn compute_ld_cols<T: Scalar>(
+    l: MatRef<'_, T>,
+    d: &MixedDiagonal<T>,
+    col0: usize,
+    ncols: usize,
     mut dst: MatMut<'_, T>,
     par: Par,
 ) {
     let nrows = l.nrows();
     // Split rows across threads for large blocks; each half is independent.
-    if par.degree() > 1 && nrows >= 2 * LD_PAR_MIN_ROWS && nrows * nelim >= LD_PAR_MIN_ENTRIES {
+    if par.degree() > 1 && nrows >= 2 * LD_PAR_MIN_ROWS && nrows * ncols >= LD_PAR_MIN_ENTRIES {
         let mid = nrows / 2;
         let (l_top, l_bot) = l.split_at_row(mid);
         let (d_top, d_bot) = dst.split_at_row_mut(mid);
         rayon::join(
-            || compute_ld_into(l_top, d, nelim, d_top, par),
-            || compute_ld_into(l_bot, d, nelim, d_bot, par),
+            || compute_ld_cols(l_top, d, col0, ncols, d_top, par),
+            || compute_ld_cols(l_bot, d, col0, ncols, d_bot, par),
         );
         return;
     }
 
     let mut col = 0;
-    while col < nelim {
-        match d.pivot_type(col) {
+    while col < ncols {
+        match d.pivot_type(col0 + col) {
             PivotType::OneByOne => {
-                let d_val = d.diagonal_1x1(col);
+                let d_val = d.diagonal_1x1(col0 + col);
                 match (
                     l.col(col).try_as_col_major(),
                     dst.rb_mut().col_mut(col).try_as_col_major_mut(),
@@ -1736,8 +1750,8 @@ fn compute_ld_into<T: Scalar>(
                 }
                 col += 1;
             }
-            PivotType::TwoByTwo { partner } if partner > col => {
-                let block = d.diagonal_2x2(col);
+            PivotType::TwoByTwo { partner } if partner > col0 + col => {
+                let block = d.diagonal_2x2(col0 + col);
                 let (left, right) = dst.rb_mut().split_at_col_mut(col + 1);
                 match (
                     l.col(col).try_as_col_major(),
@@ -1841,31 +1855,14 @@ pub(crate) fn compute_contribution_gemm<T: Scalar>(
         return; // No rank update — all columns were delayed, copy only
     }
 
-    // Step 2: Compute W = L21_NFS * D (nfs × ne)
-    // L21_NFS = frontal_data[p..m, 0..ne]
+    // Step 2: symmetric rank-ne update contrib -= L21_NFS * D * L21_NFS^T
+    // (lower triangle), with L21_NFS = frontal_data[p..m, 0..ne].
     let l21_nfs = frontal_data.as_ref().submatrix(p, 0, nfs, ne);
-
-    // Use caller-provided workspace to avoid per-supernode allocation.
-    // Resize if needed (rare: delayed cascades may exceed initial estimate).
-    if ld_workspace.nrows() < nfs || ld_workspace.ncols() < ne {
-        *ld_workspace = zeros_padded(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
-    }
-    let mut w = ld_workspace.as_mut().submatrix_mut(0, 0, nfs, ne);
-    w.fill(T::zero());
-    compute_ld_into(l21_nfs, d, ne, w.rb_mut(), par);
-
-    // Step 3: Symmetric rank-ne update: contrib -= W * L21_NFS^T (lower triangle)
-    tri_matmul::matmul_with_conj(
+    deferred_schur_update(
         contrib_buffer.as_mut().submatrix_mut(0, 0, nfs, nfs),
-        BlockStructure::TriangularLower,
-        Accum::Add,
-        w.as_ref(),
-        BlockStructure::Rectangular,
-        Conj::No,
-        l21_nfs.transpose(),
-        BlockStructure::Rectangular,
-        Conj::No,
-        T::from_f64(-1.0),
+        l21_nfs,
+        d,
+        ld_workspace,
         par,
     );
 }
@@ -1902,27 +1899,71 @@ pub(crate) fn compute_contribution_gemm_in_place<T: Scalar>(
         .submatrix_mut(0, 0, m, m)
         .split_at_col_mut(p);
     let l21_nfs = left.rb().submatrix(p, 0, nfs, ne);
-
-    if ld_workspace.nrows() < nfs || ld_workspace.ncols() < ne {
-        *ld_workspace = zeros_padded(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
-    }
-    let mut w = ld_workspace.as_mut().submatrix_mut(0, 0, nfs, ne);
-    w.fill(T::zero());
-    compute_ld_into(l21_nfs, d, ne, w.rb_mut(), par);
-
-    tri_matmul::matmul_with_conj(
+    deferred_schur_update(
         right.submatrix_mut(p, 0, nfs, nfs),
-        BlockStructure::TriangularLower,
-        Accum::Add,
-        w.as_ref(),
-        BlockStructure::Rectangular,
-        Conj::No,
-        l21_nfs.transpose(),
-        BlockStructure::Rectangular,
-        Conj::No,
-        T::from_f64(-1.0),
+        l21_nfs,
+        d,
+        ld_workspace,
         par,
     );
+}
+
+/// Pivot columns of `W = L21·D` formed per GEMM in [`deferred_schur_update`].
+///
+/// Bounds the `W` workspace at `nfs × 513` entries instead of `nfs × ne`
+/// (0.36 GB for the largest DC front). The GEMM already blocks its inner
+/// dimension far below this, so splitting it costs little.
+const SCHUR_LD_CHUNK: usize = 512;
+
+/// `target ← target − L21 · D · L21ᵀ` on the lower triangle of the
+/// `nfs × nfs` block, for `L21` of size `nfs × ne`.
+///
+/// Forms `W = L21·D` a chunk of [`SCHUR_LD_CHUNK`] pivot columns at a time
+/// (never splitting a 2×2 pivot) and applies one rank-chunk update per chunk,
+/// so `ld_workspace` stays `nfs × (SCHUR_LD_CHUNK + 1)` at most.
+fn deferred_schur_update<T: Scalar>(
+    mut target: MatMut<'_, T>,
+    l21: MatRef<'_, T>,
+    d: &MixedDiagonal<T>,
+    ld_workspace: &mut Mat<T>,
+    par: Par,
+) {
+    let (nfs, ne) = (l21.nrows(), l21.ncols());
+    let max_w = ne.min(SCHUR_LD_CHUNK + 1);
+    if ld_workspace.nrows() < nfs || ld_workspace.ncols() < max_w {
+        *ld_workspace = zeros_padded(
+            nfs.max(ld_workspace.nrows()),
+            max_w.max(ld_workspace.ncols()),
+        );
+    }
+    let mut c0 = 0;
+    while c0 < ne {
+        let mut c1 = (c0 + SCHUR_LD_CHUNK).min(ne);
+        if c1 < ne
+            && matches!(d.pivot_type(c1 - 1), PivotType::TwoByTwo { partner } if partner == c1)
+        {
+            c1 += 1;
+        }
+        let width = c1 - c0;
+        let l_blk = l21.subcols(c0, width);
+        let mut w = ld_workspace.as_mut().submatrix_mut(0, 0, nfs, width);
+        w.fill(T::zero());
+        compute_ld_cols(l_blk, d, c0, width, w.rb_mut(), par);
+        tri_matmul::matmul_with_conj(
+            target.rb_mut(),
+            BlockStructure::TriangularLower,
+            Accum::Add,
+            w.rb(),
+            BlockStructure::Rectangular,
+            Conj::No,
+            l_blk.transpose(),
+            BlockStructure::Rectangular,
+            Conj::No,
+            T::from_f64(-1.0),
+            par,
+        );
+        c0 = c1;
+    }
 }
 
 /// Apply Schur complement updates from passed columns to failed and trailing regions.
@@ -3934,27 +3975,11 @@ pub(super) fn compute_contribution_gemm_rect<T: Scalar>(
 
     // L21_NFS = l_storage[p..m, 0..ne]
     let l21_nfs = l_storage.as_ref().submatrix(p, 0, nfs, ne);
-
-    // Use caller-provided workspace
-    if ld_workspace.nrows() < nfs || ld_workspace.ncols() < ne {
-        *ld_workspace = zeros_padded(nfs.max(ld_workspace.nrows()), ne.max(ld_workspace.ncols()));
-    }
-    let mut w = ld_workspace.as_mut().submatrix_mut(0, 0, nfs, ne);
-    w.fill(T::zero());
-    compute_ld_into(l21_nfs, d, ne, w.rb_mut(), par);
-
-    // Symmetric rank-ne update: contrib -= W * L21_NFS^T (lower triangle)
-    tri_matmul::matmul_with_conj(
+    deferred_schur_update(
         contrib_buffer.as_mut().submatrix_mut(0, 0, nfs, nfs),
-        BlockStructure::TriangularLower,
-        Accum::Add,
-        w.as_ref(),
-        BlockStructure::Rectangular,
-        Conj::No,
-        l21_nfs.transpose(),
-        BlockStructure::Rectangular,
-        Conj::No,
-        T::from_f64(-1.0),
+        l21_nfs,
+        d,
+        ld_workspace,
         par,
     );
 }
@@ -6865,6 +6890,76 @@ mod tests {
                         "case {idx}: poisoned columns were not delayed ({} vs {} baseline)",
                         result.stats.num_delayed,
                         base_result.stats.num_delayed
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_deferred_schur_update_chunks_match_dense() {
+        // ne spans three chunks, with 2x2 pivots straddling both chunk
+        // boundaries (511/512 and 1024/1025) so the chunk must grow by one.
+        let (nfs, ne) = (37, 2 * SCHUR_LD_CHUNK + 90);
+        let l21 = Mat::<f64>::from_fn(nfs, ne, |i, j| ((i * 31 + j * 17) % 23) as f64 / 23.0 - 0.4);
+        let mut d = MixedDiagonal::<f64>::new(ne);
+        let mut j = 0;
+        while j < ne {
+            let pair = j == SCHUR_LD_CHUNK - 1 || j == 2 * SCHUR_LD_CHUNK || j % 7 == 3;
+            if pair && j + 1 < ne {
+                d.set_2x2(Block2x2 {
+                    first_col: j,
+                    a: 1.5,
+                    b: -0.75 + (j % 5) as f64 * 0.1,
+                    c: -2.0,
+                });
+                j += 2;
+            } else {
+                d.set_1x1(
+                    j,
+                    if j % 3 == 0 {
+                        -1.25
+                    } else {
+                        0.5 + (j % 4) as f64
+                    },
+                );
+                j += 1;
+            }
+        }
+        assert!(
+            matches!(d.pivot_type(SCHUR_LD_CHUNK - 1), PivotType::TwoByTwo { partner } if partner == SCHUR_LD_CHUNK)
+        );
+        assert!(matches!(
+            d.pivot_type(2 * SCHUR_LD_CHUNK),
+            PivotType::TwoByTwo { .. }
+        ));
+
+        let c0 = Mat::<f64>::from_fn(nfs, nfs, |i, j| (i + 2 * j) as f64);
+        // Dense reference: C - L21 * D * L21^T with W from the unchunked helper.
+        let mut w = Mat::<f64>::zeros(nfs, ne);
+        compute_ld_into(l21.as_ref(), &d, ne, w.as_mut(), Par::Seq);
+        let expected = &c0 - &w * l21.transpose();
+
+        for par in [Par::Seq, Par::rayon(4)] {
+            let mut c = c0.clone();
+            let mut ws = Mat::<f64>::new();
+            deferred_schur_update(c.as_mut(), l21.as_ref(), &d, &mut ws, par);
+            assert!(
+                ws.ncols() <= SCHUR_LD_CHUNK + 1,
+                "workspace {} columns",
+                ws.ncols()
+            );
+            for jj in 0..nfs {
+                for ii in 0..nfs {
+                    let want = if ii >= jj {
+                        expected[(ii, jj)]
+                    } else {
+                        c0[(ii, jj)]
+                    };
+                    assert!(
+                        (c[(ii, jj)] - want).abs() < 1e-10,
+                        "({ii}, {jj}): {} vs {want}",
+                        c[(ii, jj)]
                     );
                 }
             }
