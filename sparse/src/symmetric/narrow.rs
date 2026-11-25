@@ -140,7 +140,14 @@ pub(crate) fn sub_tr_narrow<T: ComplexField + Copy>(
         (ne, k, r, ne)
     );
 
-    SCRATCH.with_borrow_mut(|(pack, zbuf)| {
+    // Take the buffers out for the call instead of holding the borrow: a
+    // rayon worker waiting in `run_chunks` can steal another job that calls
+    // this function again on the same thread, and a held `RefCell` borrow
+    // would panic. A nested call just starts from empty buffers.
+    let (mut pack, mut zbuf) =
+        SCRATCH.with_borrow_mut(|(p, z)| (std::mem::take(p), std::mem::take(z)));
+    {
+        let (pack, zbuf) = (&mut pack, &mut zbuf);
         // Real Y, `m × n` column-major (m = lv.rows).
         let m = lv.rows;
         pack.clear();
@@ -182,6 +189,10 @@ pub(crate) fn sub_tr_narrow<T: ComplexField + Copy>(
                 out[(c, j)] = from_parts(re - zbuf[c * n + j], im - zim, kind);
             }
         }
+    }
+    SCRATCH.with_borrow_mut(|(p, z)| {
+        *p = pack;
+        *z = zbuf;
     });
     true
 }
@@ -497,6 +508,17 @@ mod tests {
 
     fn val(i: usize, j: usize, s: usize) -> f64 {
         (((i * 31 + j * 17 + s * 7) % 23) as f64 - 11.0) / 7.0
+    }
+
+    /// Called from inside another parallel loop, a worker waiting on its
+    /// chunks can steal a job that re-enters `sub_tr_narrow` on the same
+    /// thread. That used to panic on the held scratch `RefCell` borrow.
+    #[test]
+    fn narrow_reentrant_under_nested_rayon() {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        (0..32).into_par_iter().for_each(|s| {
+            check::<f64>(2500, 300, 4, |i, j, t| val(i, j, t + s), Par::rayon(8));
+        });
     }
 
     #[test]
