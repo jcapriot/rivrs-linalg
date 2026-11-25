@@ -1877,7 +1877,7 @@ fn factor_single_supernode<T: Scalar>(
                 let ea_start = assembly_maps.ea_offsets[ea_child_idx];
                 let ea_end = assembly_maps.ea_offsets[ea_child_idx + 1];
                 let ea_row_map = &assembly_maps.ea_map[ea_start..ea_end];
-                extend_add_mapped(&mut frontal, cb, ea_row_map, effective_par);
+                extend_add_mapped(&mut frontal, cb, ea_row_map);
             }
         }
         // Always increment: ea_offsets indexes all children, including those
@@ -3321,11 +3321,15 @@ pub(crate) fn extend_add<T: Scalar>(
 /// - `child`: Child contribution block.
 /// - `ea_row_map`: Precomputed mapping from child contribution row index to
 ///   parent frontal local row index. Length equals the child's pattern size.
+///
+/// Only children that are not assembled in the fused zeroing pass get here:
+/// with no delays on either side, that means a row map that is not strictly
+/// increasing, so writes can land in either triangle and the scatter stays
+/// sequential.
 fn extend_add_mapped<T: Scalar>(
     parent: &mut FrontalMatrix<'_, T>,
     child: ContributionBlock<T>,
     ea_row_map: &[u32],
-    par: Par,
 ) {
     let cb_size = child.row_indices.len();
     debug_assert!(
@@ -3334,16 +3338,6 @@ fn extend_add_mapped<T: Scalar>(
         ea_row_map.len(),
         cb_size
     );
-
-    // Parallel path: when the child→parent row map is strictly increasing
-    // (the usual case), child column j writes only to parent column map[j]
-    // and only at rows map[j..] >= map[j], so contiguous ranges of child
-    // columns write to disjoint ranges of parent columns.
-    let map = &ea_row_map[..cb_size];
-    if copy_par_split(par, cb_size, cb_size * cb_size / 2) && map.windows(2).all(|w| w[0] < w[1]) {
-        extend_add_mapped_par(parent.data.as_mut(), 0, &child.data, map, 0, cb_size, par);
-        return;
-    }
 
     // Column-oriented scatter.
     // For each child column j, scatter lower-triangle entries (rows j..cb_size)
@@ -3369,53 +3363,6 @@ fn extend_add_mapped<T: Scalar>(
         while k < n {
             ea_scatter_one(&mut parent.data, row_map[k] as usize, lj, src[k]);
             k += 1;
-        }
-    }
-}
-
-/// Column-parallel extend-add for a strictly increasing row map.
-///
-/// `parent` views parent columns `pcol0..pcol0 + parent.ncols()` (all rows);
-/// child columns `j0..j1` are scattered into it. Splitting child columns at
-/// `mid` splits the parent at column `map[mid]`: every column before `mid`
-/// maps below it and every column from `mid` on maps at or above it.
-fn extend_add_mapped_par<T: Scalar>(
-    parent: MatMut<'_, T>,
-    pcol0: usize,
-    child: &PackedLower<T>,
-    map: &[u32],
-    j0: usize,
-    j1: usize,
-    par: Par,
-) {
-    let cb_size = map.len();
-    if copy_par_split(par, j1 - j0, (j1 - j0) * (cb_size - j0)) {
-        let mid = (j0 + j1) / 2;
-        let split = map[mid] as usize - pcol0;
-        let (left, right) = parent.split_at_col_mut(split);
-        rayon::join(
-            || extend_add_mapped_par(left, pcol0, child, map, j0, mid, par),
-            || extend_add_mapped_par(right, pcol0 + split, child, map, mid, j1, par),
-        );
-        return;
-    }
-    let mut parent = parent;
-    for j in j0..j1 {
-        let lj = map[j] as usize - pcol0;
-        let rows = &map[j..cb_size];
-        let src = child.col(j);
-        match parent.as_mut().col_mut(lj).try_as_col_major_mut() {
-            Some(col) => {
-                let col = col.as_slice_mut();
-                for (&li, &v) in rows.iter().zip(src) {
-                    col[li as usize] += v;
-                }
-            }
-            None => {
-                for (&li, &v) in rows.iter().zip(src) {
-                    parent[(li as usize, lj)] += v;
-                }
-            }
         }
     }
 }
@@ -4512,7 +4459,7 @@ mod tests {
         // so extend_add_mapped must handle the li < lj swap case.
         let ea_row_map: Vec<u32> = vec![2, 0, 3];
 
-        extend_add_mapped(&mut parent, child, &ea_row_map, Par::Seq);
+        extend_add_mapped(&mut parent, child, &ea_row_map);
 
         // Expected scatter (lower triangle of parent):
         //
@@ -4581,7 +4528,7 @@ mod tests {
             num_fully_summed: 5,
         };
         let child = ContributionBlock::from_dense_lower(&child_data, (0..cb_size).collect(), 0);
-        extend_add_mapped(&mut parent, child, &ea_row_map, Par::Seq);
+        extend_add_mapped(&mut parent, child, &ea_row_map);
 
         // Compare every element
         for j in 0..parent_size {
@@ -4639,7 +4586,7 @@ mod tests {
             num_fully_summed: 4,
         };
         let child = ContributionBlock::from_dense_lower(&child_data, (0..cb_size).collect(), 0);
-        extend_add_mapped(&mut parent, child, &ea_row_map, Par::Seq);
+        extend_add_mapped(&mut parent, child, &ea_row_map);
 
         // Compare every element
         for j in 0..parent_size {
@@ -4675,7 +4622,7 @@ mod tests {
         let child1 = ContributionBlock::from_dense_lower(&c1_data, vec![1, 3], 0);
         let map1: Vec<u32> = vec![1, 3];
 
-        extend_add_mapped(&mut parent, child1, &map1, Par::Seq);
+        extend_add_mapped(&mut parent, child1, &map1);
 
         // Second child: 2×2, also maps to parent rows [1, 3]
         let mut c2_data = Mat::<f64>::zeros(2, 2);
@@ -4685,7 +4632,7 @@ mod tests {
         let child2 = ContributionBlock::from_dense_lower(&c2_data, vec![1, 3], 0);
         let map2: Vec<u32> = vec![1, 3];
 
-        extend_add_mapped(&mut parent, child2, &map2, Par::Seq);
+        extend_add_mapped(&mut parent, child2, &map2);
 
         let p = parent.data.as_ref();
         assert_eq!(p[(1, 1)], 15.0, "10 + 5 accumulated");
