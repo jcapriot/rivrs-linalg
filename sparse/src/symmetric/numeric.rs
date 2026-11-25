@@ -2033,22 +2033,9 @@ fn factor_small_leaf_subtree<T: Scalar>(
         #[cfg(feature = "diagnostic")]
         let mut extract_contrib_time = std::time::Duration::ZERO;
         let contribution = if sn.parent.is_some() && ne < m {
-            // Ensure contrib_buffer is large enough for extract_contribution_rect
-            // which may need to assemble delayed + NFS into a single buffer
-            if contrib_buffer.nrows() < m || contrib_buffer.ncols() < m {
-                // Grow if delayed columns expanded the need
-                let new_size = m.max(contrib_buffer.nrows());
-                let mut new_buf = Mat::<T>::zeros(new_size, new_size);
-                // Preserve NFS×NFS data already assembled
-                if nfs > 0 {
-                    for j in 0..nfs {
-                        let col_len = nfs - j;
-                        let src = &contrib_buffer.col_as_slice(j)[j..j + col_len];
-                        new_buf.col_as_slice_mut(j)[j..j + col_len].copy_from_slice(src);
-                    }
-                }
-                contrib_buffer = new_buf;
-            }
+            // contrib_buffer is already at least nfs × nfs (step 5), which is
+            // all the GEMM writes and extract_contribution_rect reads: delayed
+            // columns come straight from l_storage.
 
             // Apply contribution GEMM: updates NFS×NFS with -L21_NFS * D * L21_NFS^T
             #[cfg(feature = "diagnostic")]
