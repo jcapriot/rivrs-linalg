@@ -73,13 +73,33 @@ fn kind<T: ComplexField>() -> Option<Kind> {
     }
 }
 
-/// Column-major `f64` view: `len` covers every column, `ld` >= rows.
+/// Column-major `f64` view with column stride `ld >= rows`.
+///
+/// Holds a pointer rather than one slice over all columns: the gap between
+/// `rows` and `ld` is padding that the padded workspaces never initialize, so
+/// only each column's own `rows` entries may be viewed as `&[f64]`.
 #[derive(Clone, Copy)]
 struct RealRef<'a> {
-    data: &'a [f64],
+    ptr: *const f64,
     rows: usize,
     cols: usize,
     ld: usize,
+    _borrow: core::marker::PhantomData<&'a [f64]>,
+}
+
+// SAFETY: a shared, read-only view of `f64` data, like `&[f64]`.
+unsafe impl Send for RealRef<'_> {}
+unsafe impl Sync for RealRef<'_> {}
+
+impl<'a> RealRef<'a> {
+    /// The `rows` initialized entries of column `c`.
+    #[inline(always)]
+    fn col(&self, c: usize) -> &'a [f64] {
+        assert!(c < self.cols);
+        // SAFETY: column `c` starts at `c * ld` and its first `rows` entries
+        // are entries of the source matrix, which `'a` keeps alive.
+        unsafe { core::slice::from_raw_parts(self.ptr.add(c * self.ld), self.rows) }
+    }
 }
 
 /// Reinterpret a column-major (row stride 1) `f64` or `c64` matrix as `f64`
@@ -99,17 +119,15 @@ fn real_view<T>(m: MatRef<'_, T>, kind: Kind) -> Option<RealRef<'_>> {
     if ld < m.nrows() {
         return None;
     }
-    let len = (m.ncols() - 1) * ld + m.nrows();
     let f = if kind == Kind::Complex { 2 } else { 1 };
-    // SAFETY: `T` is `f64` or `c64` (checked by `kind`, which also checks
-    // the size), `c64` is two `f64` (`repr(C)`), and the view covers only
-    // entries of `m`, which outlives the returned borrow.
-    let data = unsafe { core::slice::from_raw_parts(m.as_ptr().cast::<f64>(), len * f) };
+    // `T` is `f64` or `c64` (checked by `kind`, which also checks the size),
+    // and `c64` is two `f64` (`repr(C)`).
     Some(RealRef {
-        data,
+        ptr: m.as_ptr().cast::<f64>(),
         rows: m.nrows() * f,
         cols: m.ncols(),
         ld: ld * f,
+        _borrow: core::marker::PhantomData,
     })
 }
 
@@ -305,7 +323,7 @@ fn tr_block<const FMA: bool, const JB: usize>(
     y: &[f64],
     m: usize,
 ) {
-    let lcol = |c: usize| &l.data[c * l.ld..][..m];
+    let lcol = |c: usize| &l.col(c)[..m];
     let ys: [&[f64]; JB] = core::array::from_fn(|jj| &y[(j0 + jj) * m..][..m]);
     let m4 = m - m % 4;
     let mut c = 0;
@@ -389,9 +407,9 @@ fn tr_rows_avx2(
     i1: usize,
 ) {
     assert!(z.len() >= cb * n && y.len() >= n * m);
-    assert!(c0 + cb <= l.cols && m <= l.rows && (c0 + cb - 1) * l.ld + m <= l.data.len());
+    assert!(c0 + cb <= l.cols && m <= l.rows);
     assert!(i0 <= i1 && i1 <= m);
-    let col = |c: usize| &l.data[(c0 + c) * l.ld + i0..(c0 + c) * l.ld + i1];
+    let col = |c: usize| &l.col(c0 + c)[i0..i1];
     let mut c = 0;
     while c < cb {
         let two = c + 1 < cb;
