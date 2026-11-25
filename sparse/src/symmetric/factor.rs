@@ -2835,17 +2835,23 @@ fn two_level_factor<T: Scalar>(
     let p = num_fully_summed;
     #[cfg(feature = "diagnostic")]
     let _big = {
-        struct Big(std::time::Instant);
+        // Only the front that turned the flag on turns it off, so a smaller
+        // front finishing on another thread cannot end a large front's
+        // timing early.
+        struct Big(std::time::Instant, bool);
         impl Drop for Big {
             fn drop(&mut self) {
                 kernel_profile::add_big(18, self.0, 0.0);
-                kernel_profile::BIG.store(false, std::sync::atomic::Ordering::Relaxed);
+                if self.1 {
+                    kernel_profile::BIG.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
-        if m >= 4096 && options.par.degree() > 1 {
+        let owns = m >= 4096 && options.par.degree() > 1;
+        if owns {
             kernel_profile::BIG.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        Big(std::time::Instant::now())
+        Big(std::time::Instant::now(), owns)
     };
 
     let mut col_order: Vec<usize> = (0..m).collect();
