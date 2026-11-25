@@ -266,6 +266,28 @@ fn c64_parallel_matches_sequential() {
     assert!(be_seq < 1e-13, "sequential backward error {be_seq:e}");
 }
 
+/// Single precision through the parallel paths (intra-node TRSM/GEMM on
+/// fronts above 256, tree-level parallelism), real and complex.
+#[test]
+fn single_precision_parallel_matches_sequential() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .expect("pool");
+    fn check<T: FromParts>(pool: &rayon::ThreadPool, tol: f64, name: &str) {
+        let a = helmholtz_3d::<T>(22, 11);
+        let (be_par, _, solver) =
+            pool.install(|| solve_ones(&a, OrderingStrategy::Metis, Par::rayon(4)));
+        let (be_seq, _, _) = solve_ones(&a, OrderingStrategy::Metis, Par::Seq);
+        assert!(solver.stats().expect("stats").max_front_size > 256);
+        assert!(be_par < tol, "{name} parallel backward error {be_par:e}");
+        assert!(be_seq < tol, "{name} sequential backward error {be_seq:e}");
+    }
+    check::<c32>(&pool, 1e-5, "c32");
+    // The real (undamped) Helmholtz operator is the harder indefinite case.
+    check::<f32>(&pool, 1e-4, "f32");
+}
+
 #[test]
 fn complex_inertia_is_none() {
     let a = helmholtz_3d::<c64>(5, 2);

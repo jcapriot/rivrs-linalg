@@ -6062,6 +6062,82 @@ mod tests {
         }
     }
 
+    /// `test_tpp_fallback_after_aptp` for a complex symmetric matrix: TPP
+    /// recovers columns that block-scoped APTP delays, and the factorization
+    /// reconstructs `PᵀAP = L·D·Lᵀ` with plain transposes (no conjugation).
+    #[test]
+    fn test_tpp_fallback_complex_symmetric() {
+        use faer::c64;
+        // The targeted delay matrix used for the real APTP tests, with
+        // complex phases: block-scoped complete pivoting on the first 4×4
+        // block takes the 0.005 pivots, which makes |L| ≈ 400 in the panel
+        // below, past 1/u = 100, so APTP alone has to delay them.
+        let n = 8;
+        let phase = |i: usize, j: usize| c64::new(1.0, 0.3 * ((i + 2 * j) % 5) as f64 - 0.6);
+        let entry = |i: usize, j: usize| -> c64 {
+            let (i, j) = if i >= j { (i, j) } else { (j, i) };
+            let mag = match (i, j) {
+                (0, 0) | (1, 1) => 10.0,
+                (2, 2) | (3, 3) => 0.005,
+                (i, j) if i < 4 && j < 4 && i != j => 0.001,
+                (_, j) if j < 4 => 2.0,
+                (i, j) if i == j => 20.0,
+                _ => 0.5,
+            };
+            phase(i, j) * mag
+        };
+        let a = Mat::<c64>::from_fn(n, n, entry);
+        assert_eq!(a[(6, 2)], a[(2, 6)]);
+        let opts = |method| AptpOptions {
+            inner_block_size: 4,
+            outer_block_size: 256,
+            threshold: 0.01,
+            failed_pivot_method: method,
+            ..AptpOptions::default()
+        };
+        let pass = aptp_factor(a.as_ref(), &opts(FailedPivotMethod::Pass)).unwrap();
+        let tpp = aptp_factor(a.as_ref(), &opts(FailedPivotMethod::Tpp)).unwrap();
+        assert!(
+            pass.stats.num_delayed > 0,
+            "APTP alone should delay columns"
+        );
+        assert!(
+            tpp.stats.num_delayed < pass.stats.num_delayed,
+            "TPP should recover delays: {} vs {}",
+            tpp.stats.num_delayed,
+            pass.stats.num_delayed
+        );
+        assert_eq!(tpp.stats.num_delayed, 0);
+
+        let mut d = Mat::<c64>::zeros(n, n);
+        let mut col = 0;
+        while col < n {
+            match tpp.d.pivot_type(col) {
+                PivotType::TwoByTwo { partner } if partner > col => {
+                    let b = tpp.d.diagonal_2x2(col);
+                    d[(col, col)] = b.a;
+                    d[(col + 1, col)] = b.b;
+                    d[(col, col + 1)] = b.b;
+                    d[(col + 1, col + 1)] = b.c;
+                    col += 2;
+                }
+                _ => {
+                    d[(col, col)] = tpp.d.diagonal_1x1(col);
+                    col += 1;
+                }
+            }
+        }
+        let ldlt = &tpp.l * &d * tpp.l.transpose();
+        let perm = tpp.perm.as_ref().arrays().0;
+        let mut err: f64 = 0.0;
+        for i in 0..n {
+            for j in 0..n {
+                err = err.max((a[(perm[i], perm[j])] - ldlt[(i, j)]).mag());
+            }
+        }
+        assert!(err < 1e-12, "complex TPP reconstruction error {err:e}");
+    }
+
     #[test]
     fn test_tpp_reconstruction_stress() {
         // 256x256 random indefinite matrix. Factor with TPP and verify reconstruction.
