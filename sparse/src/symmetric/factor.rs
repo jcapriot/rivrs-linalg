@@ -142,14 +142,28 @@ pub(crate) fn advise_huge_pages(_ptr: *const u8, _bytes: usize) {}
 /// Returns the number of leading elements of `s` that are now covered by
 /// released (or skipped partial) pages, so callers can release a growing
 /// prefix in steps without revisiting it.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(test)))]
 pub(crate) fn release_pages<T: Scalar>(s: &mut [T]) -> usize {
-    const PAGE: usize = 4096;
+    // The kernel's page size, not 4 KiB: madvise rounds the length up to a
+    // whole page, so on 16 or 64 KiB page kernels (some aarch64 and ppc64le
+    // systems) a 4 KiB-aligned range would release data past its end.
+    static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let page = *PAGE_SIZE.get_or_init(|| {
+        // SAFETY: sysconf has no preconditions.
+        let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(p)
+            .ok()
+            .filter(|&p| p.is_power_of_two())
+            .unwrap_or(0)
+    });
+    if page == 0 {
+        return 0;
+    }
     let size = core::mem::size_of::<T>().max(1);
     let addr = s.as_mut_ptr() as usize;
     let end_addr = addr + s.len() * size;
-    let start = addr.next_multiple_of(PAGE);
-    let end = end_addr / PAGE * PAGE;
+    let start = addr.next_multiple_of(page);
+    let end = end_addr / page * page;
     if end > start {
         // SAFETY: `[start, end)` lies inside `s`, which we borrow mutably, and
         // MADV_DONTNEED only replaces the pages' contents (with zeros, or the
@@ -163,10 +177,31 @@ pub(crate) fn release_pages<T: Scalar>(s: &mut [T]) -> usize {
 }
 
 /// No-op off Linux.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(test)))]
 #[inline(always)]
 pub(crate) fn release_pages<T: Scalar>(_s: &mut [T]) -> usize {
     0
+}
+
+/// Unit-test stand-in on every platform: overwrite the same whole 4 KiB
+/// pages with NaN instead of releasing them (every element that overlaps
+/// them, to be conservative). A read of released data then fails the tests
+/// loudly, where real `MADV_DONTNEED` would only give zeros, and only on
+/// Linux.
+#[cfg(test)]
+pub(crate) fn release_pages<T: Scalar>(s: &mut [T]) -> usize {
+    const PAGE: usize = 4096;
+    let size = core::mem::size_of::<T>().max(1);
+    let addr = s.as_mut_ptr() as usize;
+    let end_addr = addr + s.len() * size;
+    let start = addr.next_multiple_of(PAGE);
+    let end = end_addr / PAGE * PAGE;
+    if end > start {
+        let lo = (start - addr) / size;
+        let hi = (end - addr).div_ceil(size).min(s.len());
+        s[lo..hi].fill(T::from_f64(f64::NAN));
+    }
+    if end > addr { (end - addr) / size } else { 0 }
 }
 
 use crate::scalar::{Scalar, inv_det_2x2, real, to_f64};
