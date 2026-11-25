@@ -2235,9 +2235,12 @@ fn factor_single_supernode<T: Scalar>(
             })
             .collect();
         let release = releases_children(&children);
+        let index = ChildIndex::new(m, children.iter().map(|c| c.1));
+        let index = index.as_ref();
         zero_and_extend_add(
             workspace.frontal_data.as_mut().submatrix_mut(0, 0, m, k),
             &mut children,
+            index,
             release,
             effective_par,
         );
@@ -2256,7 +2259,7 @@ fn factor_single_supernode<T: Scalar>(
                 width,
                 par,
                 &mut children,
-                &|ch, jc, col| add_children_col(k + jc, col, ch),
+                &|ch, jc, col| add_children_col(k + jc, col, ch, index),
                 &mut |ch, jc_end| {
                     if release {
                         release_consumed(ch, k + jc_end);
@@ -3877,13 +3880,15 @@ fn extend_add_mapped_seq<T: Scalar>(
 ///
 /// Each child's row map must be strictly increasing, so child column `j`
 /// lands in parent column `map[j]` at rows `map[j..] >= map[j]`, and a parent
-/// column receives at most one column from each child (found by binary
-/// search). Zeroing and assembling a column while it is in cache saves one
-/// trip of the front through memory compared with zeroing the whole front
-/// first; on the large fronts both steps are DRAM-bandwidth bound.
+/// column receives at most one column from each child (see
+/// [`add_children_col`] for how it is found). Zeroing and assembling a column
+/// while it is in cache saves one trip of the front through memory compared
+/// with zeroing the whole front first; on the large fronts both steps are
+/// DRAM-bandwidth bound.
 fn zero_and_extend_add<T: Scalar>(
     mut front: MatMut<'_, T>,
     children: &mut [(&mut BlockedLower<T>, &[u32])],
+    index: Option<&ChildIndex>,
     release: bool,
     par: Par,
 ) {
@@ -3905,7 +3910,7 @@ fn zero_and_extend_add<T: Scalar>(
                 &|c, col: &mut [T]| {
                     let col = &mut col[c..];
                     col.fill(T::zero());
-                    add_children_col(c, col, ch);
+                    add_children_col(c, col, ch, index);
                 },
             );
         }
@@ -3941,18 +3946,90 @@ fn release_consumed<T: Scalar>(children: &mut [(&mut BlockedLower<T>, &[u32])], 
 /// Add each child's column that maps to parent column `c` into `col`, which
 /// holds rows `c..` of that column (`col[0]` is the diagonal). Row maps must
 /// be strictly increasing.
+///
+/// The child columns come from `index` when there is one (many children),
+/// and otherwise from a binary search of each child's map. Both visit the
+/// children in order, so the sums are the same.
 #[inline]
 fn add_children_col<T: Scalar>(
     c: usize,
     col: &mut [T],
     children: &[(&mut BlockedLower<T>, &[u32])],
+    index: Option<&ChildIndex>,
 ) {
-    for (cb, map) in children {
-        if let Ok(j) = map.binary_search(&(c as u32)) {
-            for (&li, &v) in map[j..].iter().zip(cb.col(j)) {
-                col[li as usize - c] += v;
+    let mut add = |ci: usize, j: usize| {
+        let (cb, map) = &children[ci];
+        for (&li, &v) in map[j..].iter().zip(cb.col(j)) {
+            col[li as usize - c] += v;
+        }
+    };
+    match index {
+        Some(idx) => {
+            for &(ci, j) in idx.cols(c) {
+                add(ci as usize, j as usize);
             }
         }
+        None => {
+            for (ci, (_, map)) in children.iter().enumerate() {
+                if let Ok(j) = map.binary_search(&(c as u32)) {
+                    add(ci, j);
+                }
+            }
+        }
+    }
+}
+
+/// Child count from which assembly indexes the children's columns by parent
+/// column ([`ChildIndex`]) instead of binary-searching each child's map.
+const EA_INDEX_MIN_CHILDREN: usize = 5;
+
+/// For each parent column, the `(child, child column)` pairs that map to it,
+/// in CSR form, children in order.
+///
+/// Binary-searching every child's map for every parent column is
+/// `O(m · children · log)` work in a step that should be memory bound; on a
+/// front with thousands of small children that adds up. This index costs
+/// `O(m + Σ cb)` to build.
+struct ChildIndex {
+    start: Vec<u32>,
+    src: Vec<(u32, u32)>,
+}
+
+impl ChildIndex {
+    /// The index over `m` parent columns, or `None` below
+    /// [`EA_INDEX_MIN_CHILDREN`] children, where the search is cheaper.
+    fn new<'a>(m: usize, maps: impl Iterator<Item = &'a [u32]> + Clone) -> Option<Self> {
+        if maps.clone().count() < EA_INDEX_MIN_CHILDREN {
+            return None;
+        }
+        let mut start = vec![0u32; m + 1];
+        for map in maps.clone() {
+            for &c in map {
+                if (c as usize) < m {
+                    start[c as usize + 1] += 1;
+                }
+            }
+        }
+        for c in 0..m {
+            start[c + 1] += start[c];
+        }
+        let mut fill = start.clone();
+        let mut src = vec![(0u32, 0u32); start[m] as usize];
+        for (ci, map) in maps.enumerate() {
+            for (j, &c) in map.iter().enumerate() {
+                if (c as usize) < m {
+                    let slot = &mut fill[c as usize];
+                    src[*slot as usize] = (ci as u32, j as u32);
+                    *slot += 1;
+                }
+            }
+        }
+        Some(Self { start, src })
+    }
+
+    /// The `(child, child column)` pairs that land in parent column `c`.
+    fn cols(&self, c: usize) -> &[(u32, u32)] {
+        &self.src[self.start[c] as usize..self.start[c + 1] as usize]
     }
 }
 
@@ -4231,6 +4308,63 @@ mod tests {
         assert!((expected.transpose() * &y - &b).norm_max() < 1e-10);
     }
 
+    /// The fused zero + extend-add, with few children (binary search) and
+    /// many (column index), matches zeroing then scattering each child.
+    #[test]
+    fn zero_and_extend_add_matches_scatter() {
+        let m = 400;
+        for n_children in [2usize, 3, 9, 40] {
+            let blocks: Vec<(Mat<f64>, Vec<u32>)> = (0..n_children)
+                .map(|ci| {
+                    let n = 7 + (ci * 37) % 90;
+                    // Strictly increasing map into 0..m.
+                    let map: Vec<u32> = (0..m as u32)
+                        .filter(|r| (r * 7 + ci as u32 * 3).is_multiple_of(2 + ci as u32 % 5))
+                        .take(n)
+                        .collect();
+                    let n = map.len();
+                    let dense =
+                        Mat::<f64>::from_fn(n, n, |i, j| ((i * 3 + j * 5 + ci) % 17) as f64 - 8.0);
+                    (dense, map)
+                })
+                .collect();
+            let mut want = Mat::<f64>::zeros(m, m);
+            for (dense, map) in &blocks {
+                for j in 0..map.len() {
+                    for i in j..map.len() {
+                        want[(map[i] as usize, map[j] as usize)] += dense[(i, j)];
+                    }
+                }
+            }
+            for par in [Par::Seq, Par::rayon(4)] {
+                let mut cbs: Vec<BlockedLower<f64>> = blocks
+                    .iter()
+                    .map(|(d, map)| {
+                        BlockedLower::from_columns(map.len(), |j| &d.col_as_slice(j)[j..])
+                    })
+                    .collect();
+                let mut children: Vec<(&mut BlockedLower<f64>, &[u32])> = cbs
+                    .iter_mut()
+                    .zip(&blocks)
+                    .map(|(cb, (_, map))| (cb, &map[..]))
+                    .collect();
+                let index = ChildIndex::new(m, children.iter().map(|c| c.1));
+                assert_eq!(index.is_some(), n_children >= EA_INDEX_MIN_CHILDREN);
+                let mut got = Mat::<f64>::from_fn(m, m, |_, _| 99.0);
+                zero_and_extend_add(got.as_mut(), &mut children, index.as_ref(), false, par);
+                for j in 0..m {
+                    for i in j..m {
+                        assert_eq!(
+                            got[(i, j)],
+                            want[(i, j)],
+                            "{n_children} children {par:?} ({i}, {j})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Released assembly (batches of parent columns, consumed child columns
     /// handed back to the OS in between) gives the same front as one pass,
     /// and releasing a child's leading columns leaves the rest intact.
@@ -4254,7 +4388,7 @@ mod tests {
             let (mut c1, mut c2) = make();
             let mut front = Mat::<f64>::from_fn(m, m, |_, _| 99.0);
             let mut children = vec![(&mut c1, &map1[..]), (&mut c2, &map2[..])];
-            zero_and_extend_add(front.as_mut(), &mut children, release, par);
+            zero_and_extend_add(front.as_mut(), &mut children, None, release, par);
             front
         };
         let want = run(false, Par::Seq);
