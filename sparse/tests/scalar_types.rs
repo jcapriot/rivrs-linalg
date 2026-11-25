@@ -67,11 +67,21 @@ fn backward_error<T: Scalar>(a: &SparseColMat<usize, T>, x: &Col<T>, b: &Col<T>)
             row_sum[ri[k]] += mag64(a.val()[k]);
         }
     }
-    let a_norm = row_sum.iter().cloned().fold(0.0, f64::max);
-    let x_norm = (0..n).map(|i| mag64(x[i])).fold(0.0, f64::max);
-    let b_norm = (0..n).map(|i| mag64(b[i])).fold(0.0, f64::max);
-    let r_norm = (0..n).map(|i| mag64(ax[i] - b[i])).fold(0.0, f64::max);
+    let a_norm = row_sum.iter().cloned().fold(0.0, nan_max);
+    let x_norm = (0..n).map(|i| mag64(x[i])).fold(0.0, nan_max);
+    let b_norm = (0..n).map(|i| mag64(b[i])).fold(0.0, nan_max);
+    let r_norm = (0..n).map(|i| mag64(ax[i] - b[i])).fold(0.0, nan_max);
     r_norm / (a_norm * x_norm + b_norm)
+}
+
+/// `max` that keeps NaN, so a non-finite residual or solution fails the
+/// tolerance checks instead of being dropped by `f64::max`.
+fn nan_max(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.max(b)
+    }
 }
 
 /// |x| widened to f64 for error measurements.
@@ -182,7 +192,7 @@ fn solve_ones<T: Scalar>(
     let x = solver
         .solve(&b, MemStack::new(&mut mem), par)
         .expect("solve");
-    let fe = (0..n).map(|i| mag64(x[i] - T::one())).fold(0.0, f64::max);
+    let fe = (0..n).map(|i| mag64(x[i] - T::one())).fold(0.0, nan_max);
     (backward_error(a, &x, &b), fe, solver)
 }
 
