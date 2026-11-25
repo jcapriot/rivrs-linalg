@@ -88,9 +88,10 @@ pub(crate) struct FactorizationWorkspace<T: Scalar = f64> {
     delayed_cols_buf: Vec<usize>,
     /// Global-to-local row index mapping, length n (matrix dimension).
     global_to_local: Vec<usize>,
-    /// Pre-allocated L·D product workspace for `compute_contribution_gemm_in_place`.
-    /// Sized nfs × ne (grows on demand). Eliminates per-supernode allocation
-    /// in the hot loop.
+    /// Pre-allocated L·D product workspace for the deferred Schur update.
+    /// Sized nfs × at most `SCHUR_LD_CHUNK + 1` columns (grows on demand), since
+    /// L·D is formed a chunk of pivot columns at a time. Eliminates
+    /// per-supernode allocation in the hot loop.
     ld_workspace: Mat<T>,
 }
 
