@@ -595,14 +595,16 @@ pub(crate) struct SmallLeafSubtree {
 /// References workspace buffers during the factorization loop, or owns its
 /// data in diagnostic contexts (`export_assembled_frontal`).
 ///
-/// The matrix is partitioned into:
+/// The workspace holds only the `k` fully-summed columns of the front:
 /// - `F11 = data[0..k, 0..k]` — fully-summed block (factored by APTP)
 /// - `F21 = data[k..m, 0..k]` — subdiagonal block
-/// - `F22 = data[k..m, k..m]` — contribution block (Schur complement)
 ///
-/// where `k = num_fully_summed` and `m = data.nrows()`.
+/// where `k = num_fully_summed` and `m = data.nrows()`. The trailing block
+/// `F22` (the Schur complement) is assembled straight into the contribution
+/// block's panels instead.
 pub(crate) struct FrontalMatrix<'a, T: Scalar = f64> {
-    /// Dense m × m storage (lower triangle used). Borrows from workspace.
+    /// Dense m × k storage (lower triangle of `F11` used). Borrows from
+    /// workspace.
     pub data: MatMut<'a, T>,
     /// Global permuted column indices for each local row (length m).
     /// Used by callers that need index mapping (e.g., scatter maps).
@@ -915,7 +917,7 @@ impl<T: Scalar> BlockedUnitLower<T> {
         let nb = L11_PANEL_WIDTH;
         // Columns per group: enough panels to keep every thread busy.
         let group = nb * (4 * par.degree()).max(8);
-        let stride = src.col_stride() as usize;
+        let stride = src.col_stride();
         let mut panels: Vec<Mat<T>> = Vec::with_capacity(ne.div_ceil(nb));
         let mut released = 0;
         let mut c0 = 0;
@@ -1358,13 +1360,11 @@ impl<T: Scalar> BlockedLower<T> {
     }
 
     /// Dimension `n`.
-    #[allow(dead_code)]
     pub(crate) fn dim(&self) -> usize {
         self.n
     }
 
     /// Entries allocated, padding included (for memory accounting).
-    #[allow(dead_code)]
     pub(crate) fn allocated(&self) -> usize {
         self.data.capacity()
     }
@@ -2167,12 +2167,14 @@ fn factor_single_supernode<T: Scalar>(
     // 3. Ensure workspace capacity and zero frontal data for this supernode
     // If delayed columns make this front larger than estimated, grow the workspace
     if m > workspace.frontal_data.nrows() || k > workspace.frontal_data.ncols() {
+        // Grow in both dimensions, never shrink: read the old size first.
+        let (old_m, old_k) = (
+            workspace.frontal_data.nrows(),
+            workspace.frontal_data.ncols(),
+        );
         // Free the old buffer first so the two never coexist.
         workspace.frontal_data = ZeroedMat::empty();
-        workspace.frontal_data = ZeroedMat::new(
-            m.max(workspace.frontal_data.nrows()),
-            k.max(workspace.frontal_data.ncols()),
-        );
+        workspace.frontal_data = ZeroedMat::new(m.max(old_m), k.max(old_k));
     }
 
     // Children assembled in the same pass as the zeroing: no delays on either
