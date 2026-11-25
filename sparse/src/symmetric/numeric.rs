@@ -2318,22 +2318,9 @@ fn factor_small_leaf_subtree<T: Scalar>(
         #[cfg(feature = "diagnostic")]
         let mut extract_contrib_time = std::time::Duration::ZERO;
         let contribution = if sn.parent.is_some() && ne < m {
-            // Ensure contrib_buffer is large enough for extract_contribution_rect
-            // which may need to assemble delayed + NFS into a single buffer
-            if contrib_buffer.nrows() < m || contrib_buffer.ncols() < m {
-                // Grow if delayed columns expanded the need
-                let new_size = m.max(contrib_buffer.nrows());
-                let mut new_buf = zeros_padded::<T>(new_size, new_size);
-                // Preserve NFS×NFS data already assembled
-                if nfs > 0 {
-                    for j in 0..nfs {
-                        let col_len = nfs - j;
-                        let src = &contrib_buffer.col_as_slice(j)[j..j + col_len];
-                        new_buf.col_as_slice_mut(j)[j..j + col_len].copy_from_slice(src);
-                    }
-                }
-                contrib_buffer = new_buf;
-            }
+            // contrib_buffer is already at least nfs × nfs (step 5), which is
+            // all the GEMM writes and extract_contribution_rect reads: delayed
+            // columns come straight from l_storage.
 
             // Apply contribution GEMM: updates NFS×NFS with -L21_NFS * D * L21_NFS^T
             #[cfg(feature = "diagnostic")]
@@ -3439,25 +3426,80 @@ fn extend_add_mapped_par<T: Scalar>(
 ///
 /// Each child's row map must be strictly increasing, so child column `j`
 /// lands in parent column `map[j]` at rows `map[j..] >= map[j]`, and a parent
-/// column receives at most one column from each child (found by binary
-/// search). Zeroing and assembling a column while it is in cache saves one
-/// trip of the front through memory compared with zeroing the whole front
-/// first; on the large fronts both steps are DRAM-bandwidth bound.
+/// column receives at most one column from each child. Zeroing and
+/// assembling a column while it is in cache saves one trip of the front
+/// through memory compared with zeroing the whole front first; on the large
+/// fronts both steps are DRAM-bandwidth bound.
+///
+/// With a few children, each parent column binary-searches every child's
+/// map. Past [`EA_INDEX_MIN_CHILDREN`] children that is
+/// `O(m · children · log)` work, so the (child, column) pairs are indexed
+/// by parent column first instead, in `O(m + Σ cb)`. Both visit the children
+/// in order, so the sums are the same.
 fn zero_and_extend_add<T: Scalar>(
     front: MatMut<'_, T>,
     children: &[(&PackedLower<T>, &[u32])],
     par: Par,
 ) {
-    for_each_col_mut(front, 0, par, &|c, col: &mut [T]| {
-        col[c..].fill(T::zero());
-        for &(cb, map) in children {
-            if let Ok(j) = map.binary_search(&(c as u32)) {
-                for (&li, &v) in map[j..].iter().zip(cb.col(j)) {
-                    col[li as usize] += v;
+    let add_col = |col: &mut [T], ci: usize, j: usize| {
+        let (cb, map) = children[ci];
+        for (&li, &v) in map[j..].iter().zip(cb.col(j)) {
+            col[li as usize] += v;
+        }
+    };
+    if children.len() < EA_INDEX_MIN_CHILDREN {
+        for_each_col_mut(front, 0, par, &|c, col: &mut [T]| {
+            col[c..].fill(T::zero());
+            for (ci, &(_, map)) in children.iter().enumerate() {
+                if let Ok(j) = map.binary_search(&(c as u32)) {
+                    add_col(col, ci, j);
                 }
             }
+        });
+    } else {
+        let (start, src) = child_cols_by_parent_col(front.ncols(), children.iter().map(|c| c.1));
+        for_each_col_mut(front, 0, par, &|c, col: &mut [T]| {
+            col[c..].fill(T::zero());
+            for &(ci, j) in &src[start[c] as usize..start[c + 1] as usize] {
+                add_col(col, ci as usize, j as usize);
+            }
+        });
+    }
+}
+
+/// Child count from which [`zero_and_extend_add`] indexes the children's
+/// columns by parent column instead of binary-searching each child's map.
+const EA_INDEX_MIN_CHILDREN: usize = 5;
+
+/// For each of `ncols` parent columns, the `(child, child column)` pairs that
+/// map to it, in CSR form (`src[start[c]..start[c + 1]]`), children in order.
+fn child_cols_by_parent_col<'a>(
+    ncols: usize,
+    maps: impl Iterator<Item = &'a [u32]> + Clone,
+) -> (Vec<u32>, Vec<(u32, u32)>) {
+    let mut start = vec![0u32; ncols + 1];
+    for map in maps.clone() {
+        for &c in map {
+            if (c as usize) < ncols {
+                start[c as usize + 1] += 1;
+            }
         }
-    });
+    }
+    for c in 0..ncols {
+        start[c + 1] += start[c];
+    }
+    let mut fill = start.clone();
+    let mut src = vec![(0u32, 0u32); start[ncols] as usize];
+    for (ci, map) in maps.enumerate() {
+        for (j, &c) in map.iter().enumerate() {
+            if (c as usize) < ncols {
+                let slot = &mut fill[c as usize];
+                src[*slot as usize] = (ci as u32, j as u32);
+                *slot += 1;
+            }
+        }
+    }
+    (start, src)
 }
 
 /// Scatter a single extend-add value into the parent's lower triangle.
@@ -3707,6 +3749,56 @@ mod tests {
         let mut y = b.clone();
         l.solve_transpose_in_place(y.as_mut(), Par::Seq);
         assert!((expected.transpose() * &y - &b).norm_max() < 1e-10);
+    }
+
+    /// The fused zero + extend-add, with few children (binary search) and
+    /// many (column index), matches zeroing then scattering each child.
+    #[test]
+    fn zero_and_extend_add_matches_scatter() {
+        let m = 400;
+        for n_children in [2usize, 3, 9, 40] {
+            let blocks: Vec<(PackedLower<f64>, Vec<u32>)> = (0..n_children)
+                .map(|ci| {
+                    let n = 7 + (ci * 37) % 90;
+                    // Strictly increasing map into 0..m.
+                    let mut map: Vec<u32> = (0..m as u32)
+                        .filter(|r| (r * 7 + ci as u32 * 3).is_multiple_of(2 + ci as u32 % 5))
+                        .take(n)
+                        .collect();
+                    map.truncate(n);
+                    let n = map.len();
+                    let dense =
+                        Mat::<f64>::from_fn(n, n, |i, j| ((i * 3 + j * 5 + ci) % 17) as f64 - 8.0);
+                    (
+                        PackedLower::from_columns(n, |j| &dense.col_as_slice(j)[j..n]),
+                        map,
+                    )
+                })
+                .collect();
+            let children: Vec<(&PackedLower<f64>, &[u32])> =
+                blocks.iter().map(|(cb, map)| (cb, &map[..])).collect();
+            let mut want = Mat::<f64>::zeros(m, m);
+            for (cb, map) in &blocks {
+                for j in 0..map.len() {
+                    for (r, &v) in cb.col(j).iter().enumerate() {
+                        want[(map[j + r] as usize, map[j] as usize)] += v;
+                    }
+                }
+            }
+            for par in [Par::Seq, Par::rayon(4)] {
+                let mut got = Mat::<f64>::from_fn(m, m, |_, _| 99.0);
+                zero_and_extend_add(got.as_mut(), &children, par);
+                for j in 0..m {
+                    for i in j..m {
+                        assert_eq!(
+                            got[(i, j)],
+                            want[(i, j)],
+                            "{n_children} children {par:?} ({i}, {j})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
