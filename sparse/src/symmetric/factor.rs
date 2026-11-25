@@ -2901,6 +2901,9 @@ fn two_level_factor<T: Scalar>(
         kernel_profile::add_big(10, t_tile, (block_cols as f64).powi(3) / 3.0);
         let tile_nelim = block_result.num_eliminated;
         let mut block_nelim = tile_nelim;
+        // Largest |L| in the rows below over the columns that pass, kept to
+        // rebuild the statistics if a rollback drops columns.
+        let mut below_max = 0.0f64;
 
         // ROWS BELOW THE TILE (fully-summed rows of later tiles and NFS rows),
         // once per tile instead of once per inner block:
@@ -2949,11 +2952,9 @@ fn two_level_factor<T: Scalar>(
                     &block_result.d,
                 );
                 for &v in &col_max[..block_nelim] {
-                    let v = to_f64(v);
-                    if v > block_result.stats.max_l_entry {
-                        block_result.stats.max_l_entry = v;
-                    }
+                    below_max = below_max.max(to_f64(v));
                 }
+                block_result.stats.max_l_entry = block_result.stats.max_l_entry.max(below_max);
             }
 
             // Columns that failed inside the tile (block_nelim == tile_nelim)
@@ -3039,6 +3040,23 @@ fn two_level_factor<T: Scalar>(
                 );
             }
             rollback_block_result(&mut block_result, block_nelim, tile_nelim);
+            // The tile's statistics covered every tile column; keep only the
+            // columns that passed, whose L in the tile rows is still in place.
+            let mut tile_max = 0.0f64;
+            let mut c = 0;
+            while c < block_nelim {
+                let step = match block_result.d.pivot_type(c) {
+                    PivotType::TwoByTwo { partner } if partner > c => 2,
+                    _ => 1,
+                };
+                for cc in c..c + step {
+                    for i in c + step..block_cols {
+                        tile_max = tile_max.max(to_f64(a[(col_start + i, col_start + cc)].mag()));
+                    }
+                }
+                c += step;
+            }
+            block_result.stats.max_l_entry = tile_max.max(below_max);
             #[cfg(feature = "diagnostic")]
             kernel_profile::add(9, t);
         }
@@ -6888,6 +6906,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `stats.max_l_entry` is the largest |L| actually stored, over every
+    /// eliminated column and every row below it (a 2x2 pivot's off-diagonal
+    /// is D, not L), including fronts where a column that passed inside its
+    /// tile is rolled back after failing in the rows below.
+    #[test]
+    fn test_max_l_entry_matches_stored_factor() {
+        let mut checked = 0;
+        for seed in 0..60u64 {
+            let (m, p) = (40, 28);
+            let mut a = deterministic_indefinite_matrix(m, seed, 0.05 + 0.1 * (seed % 4) as f64);
+            cause_delays(&mut a, seed + 1, 1e-3);
+            let opts = AptpOptions {
+                inner_block_size: 4,
+                outer_block_size: 8,
+                threshold: 0.1,
+                failed_pivot_method: FailedPivotMethod::Pass,
+                ..AptpOptions::default()
+            };
+            let mut f = a.clone();
+            let Ok(result) = aptp_factor_in_place(f.as_mut(), p, &opts) else {
+                continue;
+            };
+            let ne = result.num_eliminated;
+            let mut want = 0.0f64;
+            let mut c = 0;
+            while c < ne {
+                let step = match result.d.pivot_type(c) {
+                    PivotType::TwoByTwo { partner } if partner > c => 2,
+                    _ => 1,
+                };
+                for cc in c..c + step {
+                    for i in c + step..m {
+                        want = want.max(f[(i, cc)].abs());
+                    }
+                }
+                c += step;
+            }
+            assert_eq!(result.stats.max_l_entry, want, "seed {seed}");
+            checked += 1;
+        }
+        assert!(checked > 40, "only {checked} fronts factored");
     }
 
     /// The kernel never reads or writes the NFS×NFS block (`a[k.., k..]`),
