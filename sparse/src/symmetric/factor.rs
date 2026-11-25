@@ -2900,17 +2900,23 @@ fn two_level_factor<T: Scalar>(
     let p = num_fully_summed;
     #[cfg(feature = "diagnostic")]
     let _big = {
-        struct Big(std::time::Instant);
+        // Only the front that turned the flag on turns it off, so a smaller
+        // front finishing on another thread cannot end a large front's
+        // timing early.
+        struct Big(std::time::Instant, bool);
         impl Drop for Big {
             fn drop(&mut self) {
                 kernel_profile::add_big(18, self.0, 0.0);
-                kernel_profile::BIG.store(false, std::sync::atomic::Ordering::Relaxed);
+                if self.1 {
+                    kernel_profile::BIG.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
-        if m >= 4096 && options.par.degree() > 1 {
+        let owns = m >= 4096 && options.par.degree() > 1;
+        if owns {
             kernel_profile::BIG.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        Big(std::time::Instant::now())
+        Big(std::time::Instant::now(), owns)
     };
 
     let mut col_order: Vec<usize> = (0..m).collect();
@@ -2966,6 +2972,9 @@ fn two_level_factor<T: Scalar>(
         kernel_profile::add_big(10, t_tile, (block_cols as f64).powi(3) / 3.0);
         let tile_nelim = block_result.num_eliminated;
         let mut block_nelim = tile_nelim;
+        // Largest |L| in the rows below over the columns that pass, kept to
+        // rebuild the statistics if a rollback drops columns.
+        let mut below_max = 0.0f64;
 
         // ROWS BELOW THE TILE (fully-summed rows of later tiles and NFS rows),
         // once per tile instead of once per inner block:
@@ -3014,11 +3023,9 @@ fn two_level_factor<T: Scalar>(
                     &block_result.d,
                 );
                 for &v in &col_max[..block_nelim] {
-                    let v = to_f64(v);
-                    if v > block_result.stats.max_l_entry {
-                        block_result.stats.max_l_entry = v;
-                    }
+                    below_max = below_max.max(to_f64(v));
                 }
+                block_result.stats.max_l_entry = block_result.stats.max_l_entry.max(below_max);
             }
 
             // Columns that failed inside the tile (block_nelim == tile_nelim)
@@ -3104,6 +3111,23 @@ fn two_level_factor<T: Scalar>(
                 );
             }
             rollback_block_result(&mut block_result, block_nelim, tile_nelim);
+            // The tile's statistics covered every tile column; keep only the
+            // columns that passed, whose L in the tile rows is still in place.
+            let mut tile_max = 0.0f64;
+            let mut c = 0;
+            while c < block_nelim {
+                let step = match block_result.d.pivot_type(c) {
+                    PivotType::TwoByTwo { partner } if partner > c => 2,
+                    _ => 1,
+                };
+                for cc in c..c + step {
+                    for i in c + step..block_cols {
+                        tile_max = tile_max.max(to_f64(a[(col_start + i, col_start + cc)].mag()));
+                    }
+                }
+                c += step;
+            }
+            block_result.stats.max_l_entry = tile_max.max(below_max);
             #[cfg(feature = "diagnostic")]
             kernel_profile::add(9, t);
         }
@@ -7215,6 +7239,49 @@ mod tests {
         }
     }
 
+    /// `stats.max_l_entry` is the largest |L| actually stored, over every
+    /// eliminated column and every row below it (a 2x2 pivot's off-diagonal
+    /// is D, not L), including fronts where a column that passed inside its
+    /// tile is rolled back after failing in the rows below.
+    #[test]
+    fn test_max_l_entry_matches_stored_factor() {
+        let mut checked = 0;
+        for seed in 0..60u64 {
+            let (m, p) = (40, 28);
+            let mut a = deterministic_indefinite_matrix(m, seed, 0.05 + 0.1 * (seed % 4) as f64);
+            cause_delays(&mut a, seed + 1, 1e-3);
+            let opts = AptpOptions {
+                inner_block_size: 4,
+                outer_block_size: 8,
+                threshold: 0.1,
+                failed_pivot_method: FailedPivotMethod::Pass,
+                ..AptpOptions::default()
+            };
+            let mut f = a.clone();
+            let Ok(result) = aptp_factor_in_place(f.as_mut(), p, &opts) else {
+                continue;
+            };
+            let ne = result.num_eliminated;
+            let mut want = 0.0f64;
+            let mut c = 0;
+            while c < ne {
+                let step = match result.d.pivot_type(c) {
+                    PivotType::TwoByTwo { partner } if partner > c => 2,
+                    _ => 1,
+                };
+                for cc in c..c + step {
+                    for i in c + step..m {
+                        want = want.max(f[(i, cc)].abs());
+                    }
+                }
+                c += step;
+            }
+            assert_eq!(result.stats.max_l_entry, want, "seed {seed}");
+            checked += 1;
+        }
+        assert!(checked > 40, "only {checked} fronts factored");
+    }
+
     /// The kernel never reads or writes the NFS×NFS block (`a[k.., k..]`),
     /// which the multifrontal code leaves to `compute_contribution_gemm_in_place`.
     /// Covers TPP, `factor_inner`, `two_level_factor`, delays with both
@@ -7625,6 +7692,82 @@ mod tests {
                 error
             );
         }
+    }
+
+    /// `test_tpp_fallback_after_aptp` for a complex symmetric matrix: TPP
+    /// recovers columns that block-scoped APTP delays, and the factorization
+    /// reconstructs `PᵀAP = L·D·Lᵀ` with plain transposes (no conjugation).
+    #[test]
+    fn test_tpp_fallback_complex_symmetric() {
+        use faer::c64;
+        // The targeted delay matrix used for the real APTP tests, with
+        // complex phases: block-scoped complete pivoting on the first 4×4
+        // block takes the 0.005 pivots, which makes |L| ≈ 400 in the panel
+        // below, past 1/u = 100, so APTP alone has to delay them.
+        let n = 8;
+        let phase = |i: usize, j: usize| c64::new(1.0, 0.3 * ((i + 2 * j) % 5) as f64 - 0.6);
+        let entry = |i: usize, j: usize| -> c64 {
+            let (i, j) = if i >= j { (i, j) } else { (j, i) };
+            let mag = match (i, j) {
+                (0, 0) | (1, 1) => 10.0,
+                (2, 2) | (3, 3) => 0.005,
+                (i, j) if i < 4 && j < 4 && i != j => 0.001,
+                (_, j) if j < 4 => 2.0,
+                (i, j) if i == j => 20.0,
+                _ => 0.5,
+            };
+            phase(i, j) * mag
+        };
+        let a = Mat::<c64>::from_fn(n, n, entry);
+        assert_eq!(a[(6, 2)], a[(2, 6)]);
+        let opts = |method| AptpOptions {
+            inner_block_size: 4,
+            outer_block_size: 256,
+            threshold: 0.01,
+            failed_pivot_method: method,
+            ..AptpOptions::default()
+        };
+        let pass = aptp_factor(a.as_ref(), &opts(FailedPivotMethod::Pass)).unwrap();
+        let tpp = aptp_factor(a.as_ref(), &opts(FailedPivotMethod::Tpp)).unwrap();
+        assert!(
+            pass.stats.num_delayed > 0,
+            "APTP alone should delay columns"
+        );
+        assert!(
+            tpp.stats.num_delayed < pass.stats.num_delayed,
+            "TPP should recover delays: {} vs {}",
+            tpp.stats.num_delayed,
+            pass.stats.num_delayed
+        );
+        assert_eq!(tpp.stats.num_delayed, 0);
+
+        let mut d = Mat::<c64>::zeros(n, n);
+        let mut col = 0;
+        while col < n {
+            match tpp.d.pivot_type(col) {
+                PivotType::TwoByTwo { partner } if partner > col => {
+                    let b = tpp.d.diagonal_2x2(col);
+                    d[(col, col)] = b.a;
+                    d[(col + 1, col)] = b.b;
+                    d[(col, col + 1)] = b.b;
+                    d[(col + 1, col + 1)] = b.c;
+                    col += 2;
+                }
+                _ => {
+                    d[(col, col)] = tpp.d.diagonal_1x1(col);
+                    col += 1;
+                }
+            }
+        }
+        let ldlt = &tpp.l * &d * tpp.l.transpose();
+        let perm = tpp.perm.as_ref().arrays().0;
+        let mut err: f64 = 0.0;
+        for i in 0..n {
+            for j in 0..n {
+                err = err.max((a[(perm[i], perm[j])] - ldlt[(i, j)]).mag());
+            }
+        }
+        assert!(err < 1e-12, "complex TPP reconstruction error {err:e}");
     }
 
     #[test]

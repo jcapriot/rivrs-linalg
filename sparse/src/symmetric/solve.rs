@@ -1553,7 +1553,11 @@ mod tests {
         let a = sparse_from_lower(n, &lower);
         let (symbolic, numeric) = factor_amd(&a);
         let mut mem = MemBuffer::new(aptp_solve_scratch(&numeric, SOLVE_RHS_BLOCK));
+        // The threaded solves below go through concurrent subtree tasks.
+        let plan = SolvePlan::build(&numeric, 4).expect("subtree plan for 4 threads");
+        assert!(plan.tasks.len() >= 2, "{} subtree tasks", plan.tasks.len());
 
+        // k past SOLVE_RHS_BLOCK solves in more than one block of columns.
         for k in [1, 3, SOLVE_RHS_BLOCK, SOLVE_RHS_BLOCK + 7] {
             let b = faer::Mat::<f64>::from_fn(n, k, |i, j| {
                 ((i * 31 + j * 17) % 97) as f64 / 48.0 - 1.0
