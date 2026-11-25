@@ -67,11 +67,21 @@ fn backward_error<T: Scalar>(a: &SparseColMat<usize, T>, x: &Col<T>, b: &Col<T>)
             row_sum[ri[k]] += mag64(a.val()[k]);
         }
     }
-    let a_norm = row_sum.iter().cloned().fold(0.0, f64::max);
-    let x_norm = (0..n).map(|i| mag64(x[i])).fold(0.0, f64::max);
-    let b_norm = (0..n).map(|i| mag64(b[i])).fold(0.0, f64::max);
-    let r_norm = (0..n).map(|i| mag64(ax[i] - b[i])).fold(0.0, f64::max);
+    let a_norm = row_sum.iter().cloned().fold(0.0, nan_max);
+    let x_norm = (0..n).map(|i| mag64(x[i])).fold(0.0, nan_max);
+    let b_norm = (0..n).map(|i| mag64(b[i])).fold(0.0, nan_max);
+    let r_norm = (0..n).map(|i| mag64(ax[i] - b[i])).fold(0.0, nan_max);
     r_norm / (a_norm * x_norm + b_norm)
+}
+
+/// `max` that keeps NaN, so a non-finite residual or solution fails the
+/// tolerance checks instead of being dropped by `f64::max`.
+fn nan_max(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.max(b)
+    }
 }
 
 /// |x| widened to f64 for error measurements.
@@ -182,7 +192,7 @@ fn solve_ones<T: Scalar>(
     let x = solver
         .solve(&b, MemStack::new(&mut mem), par)
         .expect("solve");
-    let fe = (0..n).map(|i| mag64(x[i] - T::one())).fold(0.0, f64::max);
+    let fe = (0..n).map(|i| mag64(x[i] - T::one())).fold(0.0, nan_max);
     (backward_error(a, &x, &b), fe, solver)
 }
 
@@ -276,6 +286,32 @@ fn c32_helmholtz_and_kkt() {
         assert!(be < 1e-5, "c32 helmholtz {name}: backward error {be:e}");
         let (be, _, _) = solve_ones(&kkt::<c32>(300, 80, 9), ord, Par::Seq);
         assert!(be < 1e-5, "c32 kkt {name}: backward error {be:e}");
+    }
+}
+
+/// Badly scaled c32 KKT matrices without MC64 scaling. The 2×2 pivots used to
+/// divide by an unscaled determinant (order `|a|²`), and complex division
+/// squares it again, so every solution entry overflowed to NaN/Inf for a
+/// matrix scale of `1e±10`.
+#[test]
+fn c32_kkt_badly_scaled() {
+    for scale in [1e10f32, 1e-10, 1e15] {
+        let mut a = kkt::<c32>(300, 80, 9);
+        for v in a.val_mut() {
+            *v *= scale;
+        }
+        for ord in [OrderingStrategy::Amd, OrderingStrategy::Metis] {
+            let name = format!("{ord:?}");
+            let (be, _, solver) = solve_ones(&a, ord, Par::Seq);
+            let n2x2 = solver.stats().expect("stats").total_2x2_pivots;
+            assert!(n2x2 > 0, "c32 kkt x{scale:e} {name}: expected 2x2 pivots");
+            // Without MC64 scaling, single precision on this KKT matrix lands
+            // around 1e-5, so the bound only needs to catch NaN/Inf blow-up.
+            assert!(
+                be < 1e-4,
+                "c32 kkt x{scale:e} {name}: backward error {be:e}"
+            );
+        }
     }
 }
 

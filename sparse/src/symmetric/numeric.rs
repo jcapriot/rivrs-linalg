@@ -238,9 +238,10 @@ pub(crate) struct FactorizationWorkspace<T: Scalar = f64> {
     delayed_cols_buf: Vec<usize>,
     /// Global-to-local row index mapping, length n (matrix dimension).
     global_to_local: Vec<usize>,
-    /// Pre-allocated L·D product workspace for `compute_contribution_gemm_blocked`.
-    /// Sized nfs × ne (grows on demand). Eliminates per-supernode allocation
-    /// in the hot loop.
+    /// Pre-allocated L·D product workspace for the deferred Schur update.
+    /// Sized nfs × at most `SCHUR_LD_CHUNK + 1` columns (grows on demand), since
+    /// L·D is formed a chunk of pivot columns at a time. Eliminates
+    /// per-supernode allocation in the hot loop.
     ld_workspace: Mat<T>,
 }
 
@@ -2983,8 +2984,10 @@ struct SubtreeOutput<T: Scalar> {
 ///
 /// - **Phase A** (parallel only): L0 subtrees are factored concurrently, one
 ///   subtree per task, each traversed depth-first by one worker with its own
-///   workspace. No L0 subtree contains a front of `options.l0_max_front` or more,
-///   which bounds every worker's frontal buffer.
+///   workspace. No L0 subtree contains a front of `options.l0_max_front` or
+///   more by its symbolic size, which bounds every worker's frontal buffer
+///   unless delayed pivots grow a front past it (small-leaf subtrees are also
+///   exempt, see [`select_l0_layer`]).
 /// - **Phase B**: the top part is factored depth-first, one supernode at a
 ///   time, with intra-node (BLAS-level) parallelism inside each front, in a
 ///   single workspace.
@@ -3369,7 +3372,10 @@ impl Ord for OrdF64 {
 ///
 /// Starting from the tree roots, any node whose subtree contains a front of
 /// `l0_max_front` or more is moved to the top part (replaced by its
-/// children). Then, Geist–Ng style, the most expensive subtree is split while
+/// children). Front sizes are symbolic (delayed columns are not known yet),
+/// and small-leaf subtrees are kept whole, so with `l0_max_front` below
+/// `small_leaf_threshold` a front of `l0_max_front` or more can still enter
+/// the layer. Then, Geist–Ng style, the most expensive subtree is split while
 /// it exceeds `1/threads` of the layer's total cost, so the greedy (largest
 /// first) assignment of subtrees to threads stays balanced. Small-leaf
 /// subtrees are never split. Cost is approximated by `k·m²` per front.

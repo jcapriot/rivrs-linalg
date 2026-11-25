@@ -169,7 +169,7 @@ pub(crate) fn release_pages<T: Scalar>(_s: &mut [T]) -> usize {
     0
 }
 
-use crate::scalar::{Scalar, real, to_f64};
+use crate::scalar::{Scalar, inv_det_2x2, real, to_f64};
 
 /// Bunch-Kaufman α parameter for 2×2 determinant condition: |det| ≥ α × |a₂₁|².
 const BUNCH_KAUFMAN_ALPHA: f64 = 0.5;
@@ -904,8 +904,7 @@ fn complete_pivoting_factor<T: Scalar>(
                 let a11 = a[(k, k)];
                 let a22 = a[(k + 1, k + 1)];
                 let a21 = a[(k + 1, k)];
-                let det = a11 * a22 - a21 * a21;
-                let inv_det = T::one() / det;
+                let inv_det = inv_det_2x2(a11, a21, a22);
 
                 let block = Block2x2 {
                     first_col: k,
@@ -1190,8 +1189,7 @@ fn factor_block_diagonal<T: Scalar>(
                 let a11 = a[(cur, cur)];
                 let a22 = a[(cur + 1, cur + 1)];
                 let a21 = a[(cur + 1, cur)];
-                let det = a11 * a22 - a21 * a21;
-                let inv_det = T::one() / det;
+                let inv_det = inv_det_2x2(a11, a21, a22);
 
                 let block = Block2x2 {
                     first_col: k,
@@ -1576,7 +1574,7 @@ fn scale_rows_col_max<T: Scalar>(
                     "2x2 pivot at {col} straddles nelim {nelim}"
                 );
                 let block = d.diagonal_2x2(col);
-                let inv_det = T::one() / (block.a * block.c - block.b * block.b);
+                let inv_det = inv_det_2x2(block.a, block.b, block.c);
                 for i in 0..rows {
                     let x1 = panel[(i, col)];
                     let x2 = panel[(i, col + 1)];
@@ -3716,8 +3714,7 @@ fn tpp_apply_2x2<T: Scalar>(
     let a11 = a[(nelim, nelim)];
     let a21 = a[(nelim + 1, nelim)];
     let a22 = a[(nelim + 1, nelim + 1)];
-    let det = a11 * a22 - a21 * a21;
-    let inv_det = T::one() / det;
+    let inv_det = inv_det_2x2(a11, a21, a22);
     let p = num_fully_summed;
 
     // Compute L entries for ALL rows (FS + NFS)
@@ -7196,6 +7193,152 @@ mod tests {
                         (c[(ii, jj)] - want).abs() < 1e-10,
                         "({ii}, {jj}): {} vs {want}",
                         c[(ii, jj)]
+                    );
+                }
+            }
+        }
+    }
+
+    /// `D` with a 2×2 pivot starting at every column in `pairs` (and at
+    /// columns `≡ 3 mod 7` that don't collide with them), 1×1 elsewhere.
+    fn chunk_test_d<T: Scalar>(
+        ne: usize,
+        pairs: &[usize],
+        mk: impl Fn(f64, f64) -> T,
+    ) -> MixedDiagonal<T> {
+        let mut d = MixedDiagonal::<T>::new(ne);
+        let mut j = 0;
+        while j < ne {
+            let pair = pairs.contains(&j) || (j % 7 == 3 && !pairs.contains(&(j + 1)));
+            if pair && j + 1 < ne {
+                d.set_2x2(Block2x2 {
+                    first_col: j,
+                    a: mk(1.5, 0.25),
+                    b: mk(-0.75 + (j % 5) as f64 * 0.1, 0.5),
+                    c: mk(-2.0, -0.125),
+                });
+                j += 2;
+            } else {
+                d.set_1x1(
+                    j,
+                    mk(
+                        if j % 3 == 0 {
+                            -1.25
+                        } else {
+                            0.5 + (j % 4) as f64
+                        },
+                        0.3,
+                    ),
+                );
+                j += 1;
+            }
+        }
+        for &p in pairs {
+            assert!(
+                matches!(d.pivot_type(p), PivotType::TwoByTwo { partner } if partner == p + 1),
+                "expected a 2x2 pivot at {p}"
+            );
+        }
+        d
+    }
+
+    /// `deferred_schur_update` (chunked) against `C − L21·D·L21ᵀ` formed
+    /// with the unchunked `compute_ld_into`, lower triangle only.
+    fn check_deferred_chunks<T: Scalar<Real = f64>>(
+        nfs: usize,
+        ne: usize,
+        pairs: &[usize],
+        mk: impl Fn(f64, f64) -> T + Copy,
+    ) {
+        let l21 = Mat::<T>::from_fn(nfs, ne, |i, j| {
+            mk(
+                ((i * 31 + j * 17) % 23) as f64 / 23.0 - 0.4,
+                ((i + 3 * j) % 5) as f64 * 0.1,
+            )
+        });
+        let d = chunk_test_d(ne, pairs, mk);
+        let c0 = Mat::<T>::from_fn(nfs, nfs, |i, j| mk((i + 2 * j) as f64, (i % 3) as f64));
+        let mut w = Mat::<T>::zeros(nfs, ne);
+        compute_ld_into(l21.as_ref(), &d, ne, w.as_mut(), Par::Seq);
+        let expected = &c0 - &w * l21.transpose();
+        for par in [Par::Seq, Par::rayon(4)] {
+            let mut c = c0.clone();
+            let mut ws = Mat::<T>::new();
+            deferred_schur_update(c.as_mut(), l21.as_ref(), &d, &mut ws, par);
+            assert!(
+                ws.ncols() <= SCHUR_LD_CHUNK + 1,
+                "workspace {} columns",
+                ws.ncols()
+            );
+            for jj in 0..nfs {
+                for ii in jj..nfs {
+                    let err = (c[(ii, jj)] - expected[(ii, jj)]).mag();
+                    assert!(
+                        err < 1e-10 * (1.0 + expected[(ii, jj)].mag()),
+                        "nfs {nfs} ne {ne} ({ii}, {jj}): error {err:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_deferred_schur_update_chunk_edges() {
+        use faer::c64;
+        let ch = SCHUR_LD_CHUNK;
+        let re = |x: f64, _: f64| x;
+        let cx = |x: f64, y: f64| c64::new(x, y);
+        // Complex symmetric D with pivots straddling both chunk boundaries.
+        check_deferred_chunks(37, 2 * ch + 90, &[ch - 1, 2 * ch], cx);
+        // ne an exact multiple of the chunk.
+        check_deferred_chunks(29, ch, &[], re);
+        check_deferred_chunks(29, 2 * ch, &[ch - 1], cx);
+        // The extended chunk ends exactly at ne.
+        check_deferred_chunks(29, ch + 1, &[ch - 1], re);
+        check_deferred_chunks(29, ch + 1, &[ch - 1], cx);
+        // A 2x2 pivot ending at the boundary must not extend the chunk.
+        check_deferred_chunks(29, ch + 88, &[ch - 2], cx);
+    }
+
+    /// `compute_ld_cols` on a later chunk (`col0 > 0`) of a block tall enough
+    /// to split its rows across threads, against the unchunked product.
+    #[test]
+    fn test_compute_ld_cols_parallel_chunks() {
+        use faer::c64;
+        let (nrows, ne) = (2 * LD_PAR_MIN_ROWS + 3, 300);
+        let mk = |x: f64, y: f64| c64::new(x, y);
+        let l = Mat::<c64>::from_fn(nrows, ne, |i, j| {
+            mk(
+                ((i * 13 + j * 7) % 19) as f64 / 19.0 - 0.5,
+                ((i + j) % 3) as f64 * 0.2,
+            )
+        });
+        let d = chunk_test_d(ne, &[99, 199], mk);
+        let mut full = Mat::<c64>::zeros(nrows, ne);
+        compute_ld_into(l.as_ref(), &d, ne, full.as_mut(), Par::Seq);
+        // Chunk starts on pivot boundaries; 99/100 and 199/200 are 2x2 pivots
+        // kept inside a chunk.
+        for (c0, c1) in [(0, 99), (99, 199), (101, 199), (199, 300)] {
+            let width = c1 - c0;
+            assert!(
+                nrows * width >= LD_PAR_MIN_ENTRIES,
+                "chunk too small to split"
+            );
+            let mut dst = Mat::<c64>::zeros(nrows, width);
+            compute_ld_cols(
+                l.as_ref().subcols(c0, width),
+                &d,
+                c0,
+                width,
+                dst.as_mut(),
+                Par::rayon(4),
+            );
+            for j in 0..width {
+                for i in 0..nrows {
+                    assert_eq!(
+                        dst[(i, j)],
+                        full[(i, c0 + j)],
+                        "chunk {c0}..{c1} ({i}, {j})"
                     );
                 }
             }
