@@ -234,9 +234,10 @@ pub fn aptp_solve_mat<T: Scalar>(
     if n == 0 || rhs.ncols() == 0 {
         return Ok(());
     }
-    // The per-front kernels index rows directly; work on a contiguous copy
-    // if the caller's columns are strided.
-    if rhs.row_stride() != 1 {
+    // The per-front kernels index rows directly and step through columns with
+    // a positive stride; work on a contiguous copy if the caller's view has
+    // strided rows or reversed columns.
+    if rhs.row_stride() != 1 || (rhs.ncols() > 1 && rhs.col_stride() <= 0) {
         let mut tmp = rhs.to_owned();
         aptp_solve_mat(symbolic, numeric, tmp.as_mut(), _stack, par)?;
         rhs.copy_from(&tmp);
@@ -1555,6 +1556,25 @@ mod tests {
         for j in 0..k {
             for i in 0..n {
                 assert!((xt[(j, i)] - x[(i, j)]).abs() <= 1e-11 * (1.0 + x[(i, j)].abs()));
+            }
+        }
+
+        // Reversed columns (negative column stride) also go through a copy
+        // instead of panicking.
+        let mut xr = x.clone();
+        xr.as_mut().reverse_cols_mut().copy_from(bt.transpose());
+        aptp_solve_mat(
+            &symbolic,
+            &numeric,
+            xr.as_mut().reverse_cols_mut(),
+            MemStack::new(&mut mem),
+            Par::rayon(3),
+        )
+        .expect("solve");
+        for j in 0..k {
+            for i in 0..n {
+                let got = xr[(i, k - 1 - j)];
+                assert!((got - x[(i, j)]).abs() <= 1e-11 * (1.0 + x[(i, j)].abs()));
             }
         }
     }
